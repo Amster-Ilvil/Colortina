@@ -38,11 +38,11 @@
 
    macOS:
    ```bash
-   cd ~/ComicColorerAI     # 改成你的实际路径
+   cd ~/ # 改成你的实际路径
    ```
    Windows (CMD 或 PowerShell):
    ```powershell
-   cd C:\Users\你的用户名\ComicColorerAI
+   cd C:\Users\你的用户名\你的实际路径
    ```
 
 2. 创建并激活虚拟环境
