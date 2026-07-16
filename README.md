@@ -24,18 +24,59 @@
 - **中英文界面**，可随时切换
 ## 效果展示
 
-| 原图 | 上色结果 1 | 上色结果 2 |
+| 原图 | 自动上色 | 手动干预 |
 |:---:|:---:|:---:|
 | <img width="260" src="https://github.com/user-attachments/assets/818eae63-ad50-41a8-a487-a22eb5728441" /> | <img width="260" src="https://github.com/user-attachments/assets/3a10885f-bdc9-497e-9286-34ae8b94fb3d" /> | <img width="260" src="https://github.com/user-attachments/assets/09f4cfa7-2b2f-4f8e-a7fb-719e70d1a8b2" /> |
 
-## 安装
+## 🚀 安装与启动
 
-需要 Python 3.10+。
+### 🍎 macOS / 🪟 Windows
+
+以下步骤在 macOS 与 Windows 上的说明结构一致，针对各系统给出对应命令：
+
+1. 进入项目目录
+
+   macOS:
+   ```bash
+   cd ~/ComicColorerAI     # 改成你的实际路径
+   ```
+   Windows (CMD 或 PowerShell):
+   ```powershell
+   cd C:\Users\你的用户名\ComicColorerAI
+   ```
+
+2. 创建并激活虚拟环境
+
+   macOS:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+   Windows (CMD):
+   ```cmd
+   python -m venv venv
+   venv\Scripts\activate
+   ```
+   Windows (PowerShell):
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\Activate.ps1
+   ```
+
+3. 安装依赖（可选：使用国内镜像加速）
 
 ```bash
-git clone https://github.com/Amster-Ilvil/Colortina.git
-cd Colortina
-pip install -r requirements.txt
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+4. 启动程序
+
+macOS:
+```bash
+python3 main.py
+```
+Windows:
+```cmd
 python main.py
 ```
 
