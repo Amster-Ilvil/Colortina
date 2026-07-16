@@ -1,0 +1,35 @@
+# Core
+numpy>=1.26
+opencv-contrib-python>=4.9
+Pillow>=10.0
+
+# PyTorch — on Mac this installs the MPS-enabled build automatically,
+# no special index-url needed (unlike CUDA on Linux/Windows).
+torch>=2.3
+torchvision>=0.15
+
+# Auto color-hint generation (CLIP zero-shot region labeling)
+transformers>=4.40
+
+# Weight download (Google Drive)
+gdown>=5.0
+
+# PDF page extraction (for later: batch chapter import)
+pymupdf>=1.24
+
+# Pydantic schemas (carried over from ColorComic's models/schemas.py)
+pydantic>=2.5
+
+# Used by color_director.py's optional LLM-palette-refinement path
+# (module-level import even though it's unused when LLM_DIRECTOR=False)
+requests>=2.31
+
+# Phase 2 — desktop editor UI
+PySide6>=6.6
+
+# Optional — only used by core/upscaler.py for the "Ultra" quality
+# preset's 4x upscale pass. Without these installed (or without the
+# weights downloaded), upscaling silently falls back to a Lanczos
+# resize, so these are NOT required for the app to run.
+# realesrgan>=0.3
+# basicsr>=1.4
