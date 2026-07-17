@@ -642,7 +642,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(tr("imported_n_pages").format(n=len(page_paths)), 5000)
 
     def _add_page(self, path: str):
-        image_bgr = cv2.imread(path)
+        from core.imageio import imread as _uimread
+        image_bgr = _uimread(path)
         if image_bgr is None:
             QMessageBox.warning(self, tr("warning_title"), tr("cannot_read_image").format(path=path))
             return
@@ -839,7 +840,8 @@ class MainWindow(QMainWindow):
 
         images = []
         for p in paths:
-            img = cv2.imread(p)
+            from core.imageio import imread as _uimread
+            img = _uimread(p)
             if img is not None:
                 images.append(img)
         if not images:
@@ -1191,7 +1193,8 @@ class MainWindow(QMainWindow):
                                                    "PNG (*.png);;JPEG (*.jpg)")
         if not out_path:
             return
-        cv2.imwrite(out_path, state.result_bgr)
+        from core.imageio import imwrite as _uimwrite
+        _uimwrite(out_path, state.result_bgr)
         self.statusBar().showMessage(tr("exported_to").format(path=out_path), 5000)
 
     def _export_all_pages(self):
@@ -1204,7 +1207,8 @@ class MainWindow(QMainWindow):
             return
         for state in done:
             name = os.path.splitext(os.path.basename(state.path))[0] + "_colorized.png"
-            cv2.imwrite(os.path.join(out_dir, name), state.result_bgr)
+            from core.imageio import imwrite as _uimwrite
+            _uimwrite(os.path.join(out_dir, name), state.result_bgr)
         self.statusBar().showMessage(
             tr("exported_n_pages").format(n=len(done), dir=out_dir), 5000)
 

@@ -43,7 +43,8 @@ def main():
     ensure_models_downloaded(Config.WEIGHTS_DIR, callback=print)
 
     print("[2/3] Loading image...")
-    image_bgr = cv2.imread(args.image)
+    from core.imageio import imread as _uimread
+    image_bgr = _uimread(args.image)
     if image_bgr is None:
         print(f"ERROR: could not read image: {args.image}")
         sys.exit(1)
@@ -56,7 +57,8 @@ def main():
     print(f"    done in {dt:.2f}s")
 
     out_path = args.out or (os.path.splitext(args.image)[0] + "_colorized.png")
-    cv2.imwrite(out_path, result)
+    from core.imageio import imwrite as _uimwrite
+    _uimwrite(out_path, result)
     print(f"Saved: {out_path}")
 
 
