@@ -20,9 +20,6 @@ pymupdf>=1.24
 # Pydantic schemas (carried over from ColorComic's models/schemas.py)
 pydantic>=2.5
 
-# Used by color_director.py's optional LLM-palette-refinement path
-# (module-level import even though it's unused when LLM_DIRECTOR=False)
-requests>=2.31
 
 # Phase 2 — desktop editor UI
 PySide6>=6.6

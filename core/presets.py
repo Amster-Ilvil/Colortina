@@ -62,6 +62,23 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         denoise_sigma=15,
         diffusion_steps=16,
     ),
+    "light": StylePreset(
+        key="light",
+        label="\u6de1\u5f69\u6c34\u58a8 (Light Wash)",
+        description=("Pale watercolor / ink-wash rendering: chroma pulled "
+                     "well below mc-v2's saturated defaults, lightness "
+                     "lifted, edges soft - colors read as translucent "
+                     "washes over the ink lines rather than solid fills."),
+        saturation_boost=0.42,
+        l_blend_alpha=0.0,
+        l_gamma=0.88,
+        guided_filter_radius=4,
+        guided_filter_eps=0.03,
+        cel_flatten=0.0,
+        neutral_fade_floor=0.12,
+        denoise_sigma=20,
+        diffusion_steps=16,
+    ),
 }
 
 

@@ -111,12 +111,45 @@ class HintCanvas(QGraphicsView):
 
     # ── Mouse handling ────────────────────────────────────────────────
 
+    def set_eyedropper_mode(self, mode: str) -> None:
+        """'point' samples the single pixel under the cursor; 'region'
+        samples the median color of the enclosed area around the click
+        (tolerance flood fill) — much more robust on screentone,
+        gradients and JPEG noise."""
+        self._eyedropper_mode = mode if mode in ("point", "region") else "point"
+
     def _sample_color_at(self, ix: int, iy: int) -> tuple[int, int, int] | None:
         if self._current_bgr is None:
             return None
         if not (0 <= ix < self._image_w and 0 <= iy < self._image_h):
             return None
+        if getattr(self, "_eyedropper_mode", "point") == "region":
+            color = self._sample_region_color(ix, iy)
+            if color is not None:
+                return color
         b, g, r = self._current_bgr[iy, ix]
+        return (int(r), int(g), int(b))
+
+    def _sample_region_color(self, ix: int, iy: int) -> tuple[int, int, int] | None:
+        """Median color of the tolerance-flood-filled area at (ix, iy)."""
+        import numpy as np
+        import cv2
+        img = self._current_bgr
+        h, w = img.shape[:2]
+        # Median-blur the flood source so a single noisy pixel under the
+        # cursor can't isolate itself into a 1-px "region".
+        smooth = cv2.medianBlur(img, 3)
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+        flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+        try:
+            cv2.floodFill(smooth, mask, (ix, iy), 0,
+                          loDiff=(14, 14, 14), upDiff=(14, 14, 14), flags=flags)
+        except cv2.error:
+            return None
+        m = mask[1:-1, 1:-1] > 0
+        if m.sum() < 4:
+            return None
+        b, g, r = np.median(img[m].astype(np.float32), axis=0)
         return (int(r), int(g), int(b))
 
     def _drop_dab(self, ix: int, iy: int) -> None:

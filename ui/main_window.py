@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(tr("window_title"))
         self.resize(1400, 900)
+        self.setMinimumSize(760, 520)   # window freely resizable down to small screens
 
         icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                  "assets", "icon.png")
@@ -86,6 +87,9 @@ class MainWindow(QMainWindow):
         # needs multi-character consistency.
         self._style_profile = None
         self._character_memories: dict = {}
+        # Character-aware Color Assignment: one CharacterLibrary per book,
+        # built from color reference pages (角色决定颜色).
+        self._character_library = None
 
         from core.style_engine import StyleEngine
         self._style_engine = StyleEngine(styles_dir=Config.STYLES_DIR)
@@ -216,6 +220,8 @@ class MainWindow(QMainWindow):
         prev_char_mem = prev_char_mem.isChecked() if prev_char_mem is not None else Config.USE_CHARACTER_MEMORY
         prev_skip_colored = getattr(self, "_chk_skip_colored", None)
         prev_skip_colored = prev_skip_colored.isChecked() if prev_skip_colored is not None else True
+        prev_picker_mode = getattr(self, "_eyedropper_mode_combo", None)
+        prev_picker_mode = prev_picker_mode.currentData() if prev_picker_mode is not None else "point"
         prev_brush_pct = getattr(self, "_brush_slider", None)
         prev_brush_pct = prev_brush_pct.value() if prev_brush_pct is not None else self._brush_percent_from_px(12)
         prev_gap_pct = getattr(self, "_gap_close_slider", None)
@@ -230,6 +236,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
+        splitter.setChildrenCollapsible(True)
         splitter.setSizes([220, 900, 280])
         self.setCentralWidget(splitter)
         if old_central is not None:
@@ -241,6 +248,10 @@ class MainWindow(QMainWindow):
                 self._style_combo.setCurrentIndex(idx)
         self._chk_character_memory.setChecked(prev_char_mem)
         self._chk_skip_colored.setChecked(prev_skip_colored)
+        idx = self._eyedropper_mode_combo.findData(prev_picker_mode)
+        if idx >= 0:
+            self._eyedropper_mode_combo.setCurrentIndex(idx)
+        self._canvas.set_eyedropper_mode(prev_picker_mode)
         self._brush_slider.setValue(prev_brush_pct)
         self._gap_close_slider.setValue(prev_gap_pct)
         self._canvas.set_brush_color(self._brush_color)
@@ -427,6 +438,20 @@ class MainWindow(QMainWindow):
         tool_row.addWidget(self._radio_eyedropper)
         tool_row.addWidget(self._radio_bucket)
         edit_layout.addLayout(tool_row)
+
+        # Eyedropper sampling mode: point (single pixel) or region
+        # (median of the enclosed area — robust on screentone/noise).
+        picker_row = QHBoxLayout()
+        picker_row.addWidget(QLabel(tr("eyedropper_mode_label")))
+        self._eyedropper_mode_combo = QComboBox()
+        self._eyedropper_mode_combo.addItem(tr("eyedropper_mode_point"), "point")
+        self._eyedropper_mode_combo.addItem(tr("eyedropper_mode_region"), "region")
+        self._eyedropper_mode_combo.currentIndexChanged.connect(
+            lambda _: self._canvas.set_eyedropper_mode(
+                self._eyedropper_mode_combo.currentData()))
+        picker_row.addWidget(self._eyedropper_mode_combo, stretch=1)
+        edit_layout.addLayout(picker_row)
+
         bucket_hint = QLabel(tr("bucket_hint"))
         bucket_hint.setWordWrap(True)
         bucket_hint.setStyleSheet("color: #888; font-size: 11px;")
@@ -752,6 +777,8 @@ class MainWindow(QMainWindow):
             quality_key=Config.DEFAULT_QUALITY_KEY,
             style_profile=self._style_profile,
             character_memories=character_memories,
+            character_library=(self._character_library
+                               if self._chk_character_memory.isChecked() else None),
             skip_colored=self._chk_skip_colored.isChecked(),
         )
         self._batch_worker.page_done.connect(self._on_batch_page_done)
@@ -850,6 +877,18 @@ class MainWindow(QMainWindow):
             if memories["hair"].seed_from_reference(img, classifier=classifier):
                 break  # first reference with usable hair regions wins the seeding
 
+        # Character-aware Color Assignment: extract full per-character
+        # attribute palettes (hair/skin/eyes/clothes) from the references.
+        from core.character_library import CharacterLibrary
+        if self._character_library is None:
+            self._character_library = CharacterLibrary()
+        n_chars = 0
+        for img in images:
+            n_chars += self._character_library.extract_from_reference(img, classifier=classifier)
+        if n_chars:
+            self.statusBar().showMessage(
+                tr("characters_extracted").format(n=n_chars), 5000)
+
         self._update_style_profile_label()
         self._refresh_custom_style_combo()
         idx = self._custom_style_combo.findData(f"{name.lower().replace(' ', '_')}.ccstyle")
@@ -941,7 +980,23 @@ class MainWindow(QMainWindow):
         name = path.split("/")[-1]
         self.statusBar().showMessage(tr("page_colorize_failed").format(name=name, message=message), 8000)
 
+    @staticmethod
+    def _release_compute_memory():
+        """Free accelerator caches after a batch so the app doesn't sit
+        on GPU/unified memory between jobs."""
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+
     def _on_batch_finished(self):
+        self._release_compute_memory()
         self._set_busy(False, tr("colorize_done"))
         self._update_device_label()
 

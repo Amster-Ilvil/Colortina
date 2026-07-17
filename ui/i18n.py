@@ -38,6 +38,7 @@ _STRINGS: dict = {
         # Style / quality group
         "style_quality_group": "风格",
         "skip_colored_checkbox": "跳过已上色页面",
+        "characters_extracted": "已从参考图提取 {n} 个角色配色",
         "skip_colored_tooltip": "检测到页面已包含彩色内容时直接跳过，不重新上色（借鉴 Manga-Colorization-FJ）",
         "style_label": "风格",
         "quality_label": "质量",
@@ -89,6 +90,9 @@ _STRINGS: dict = {
         "edit_group": "编辑（手动颜色提示）",
         "tool_brush": "画笔",
         "tool_eyedropper": "吸管",
+        "eyedropper_mode_label": "吸管模式",
+        "eyedropper_mode_point": "点采集（单像素）",
+        "eyedropper_mode_region": "区域采集（区域中值）",
         "tool_bucket": "区域上色",
         "bucket_hint": ("区域上色：点一下，按线稿/颜色边界整片重新上色\n"
                        "（直接在当前结果上编辑，秒出效果，不用重新跑模型）"),
@@ -180,6 +184,7 @@ _STRINGS: dict = {
 
         "style_quality_group": "Style",
         "skip_colored_checkbox": "Skip already-colored pages",
+        "characters_extracted": "Extracted color profiles for {n} characters",
         "skip_colored_tooltip": "Skip pages that already contain color instead of re-colorizing them (from Manga-Colorization-FJ)",
         "style_label": "Style",
         "quality_label": "Quality",
@@ -231,6 +236,9 @@ _STRINGS: dict = {
         "edit_group": "Edit (Manual Color Hints)",
         "tool_brush": "Brush",
         "tool_eyedropper": "Eyedropper",
+        "eyedropper_mode_label": "Picker mode",
+        "eyedropper_mode_point": "Point (single pixel)",
+        "eyedropper_mode_region": "Region (area median)",
         "tool_bucket": "Region Fill",
         "bucket_hint": ("Region fill: click once to recolor the whole lineart/color-\n"
                        "bounded area (edits the current result directly — instant, no re-run)"),

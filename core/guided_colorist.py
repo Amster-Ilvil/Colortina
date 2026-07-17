@@ -81,12 +81,13 @@ class GuidedColorist:
         {label: CharacterMemory} for book-level per-character color slots.
     """
 
-    def __init__(self, config, use_llm: bool | None = None,
+    def __init__(self, config,
                  style_descriptor=None,
                  style_profile=None,
-                 character_memories: dict | None = None):
+                 character_memories: dict | None = None,
+                 character_library=None):
         self._cfg = config
-        self._use_llm = use_llm
+        self._character_library = character_library
         self._classifier = _get_classifier()
         self._director_plain = ColorDirector(config)
         self._script: dict | None = None
@@ -143,8 +144,7 @@ class GuidedColorist:
         summary = {"pages_sampled": len(sample_pages_bgr),
                    "region_counts": counts,
                    "content_hint": "black-and-white manga/manhwa chapter"}
-        self._script = self._director_plain.build_script(
-            summary, use_llm=self._use_llm)
+        self._script = self._director_plain.build_script(summary)
 
     def hints_for_page(self, image_bgr: np.ndarray) -> list[HintPoint]:
         """Segment + label one page and return its color hint points.
@@ -186,12 +186,19 @@ class GuidedColorist:
 
         palette = self._script["palette"]
 
-        # Character Memory per-instance overrides
+        # Character-aware Color Assignment: the CharacterLibrary decides
+        # colors per CHARACTER (hair + that character's skin/clothes),
+        # taking priority over per-label CharacterMemory slots.
         instance_rgb: dict[int, tuple[int, int, int]] = {}
+        if self._character_library is not None:
+            instance_rgb.update(
+                self._character_library.assign_page(seg.regions, labels))
         for label_key, memory in self._character_memories.items():
             same_label = [r for r, (lab, conf) in zip(seg.regions, labels)
                          if lab == label_key and conf >= _MIN_CONF]
             for region_id, hex_color in memory.assign(same_label, gray).items():
+                if region_id in instance_rgb:
+                    continue  # CharacterLibrary already decided this one
                 b, g, r = hex_to_bgr(hex_color)
                 instance_rgb[region_id] = (r, g, b)
 

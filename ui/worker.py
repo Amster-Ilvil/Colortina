@@ -28,8 +28,10 @@ class ColorizeWorker(QThread):
     def __init__(self, image_bgr: np.ndarray, hint_manager: HintManager,
                  regenerate_auto: bool, parent=None,
                  style_key: str | None = None, quality_key: str | None = None,
-                 style_profile=None, character_memories: dict | None = None):
+                 style_profile=None, character_memories: dict | None = None,
+                 character_library=None):
         super().__init__(parent)
+        self._character_library = character_library
         self._image_bgr = image_bgr
         self._hint_manager = hint_manager
         self._regenerate_auto = regenerate_auto
@@ -53,6 +55,7 @@ class ColorizeWorker(QThread):
                 quality_key=self._quality_key,
                 style_profile=self._style_profile,
                 character_memories=self._character_memories,
+                character_library=self._character_library,
             )
             self.finished_ok.emit(result)
         except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
@@ -79,12 +82,13 @@ class BatchColorizeWorker(QThread):
                  regenerate_auto: bool, parent=None,
                  style_key: str | None = None, quality_key: str | None = None,
                  style_profile=None, character_memories: dict | None = None,
-                 skip_colored: bool = True):
+                 character_library=None, skip_colored: bool = True):
         super().__init__(parent)
         self._pages = pages
         self._regenerate_auto = regenerate_auto
         # Manga-Colorization-FJ style: skip pages that are already in color.
         self._skip_colored = skip_colored
+        self._character_library = character_library
         self._style_key = style_key
         self._quality_key = quality_key
         self._style_profile = style_profile
@@ -125,6 +129,7 @@ class BatchColorizeWorker(QThread):
                     quality_key=self._quality_key,
                     style_profile=self._style_profile,
                     character_memories=self._character_memories,
+                    character_library=self._character_library,
                 )
                 self.page_done.emit(path, result)
             except Exception as exc:  # noqa: BLE001 — keep going on per-page failure

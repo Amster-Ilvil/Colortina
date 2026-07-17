@@ -47,9 +47,9 @@ _guided = None
 _job_guided_cache: dict = {}
 
 
-def _guided_cache_key(style_profile, character_memories):
+def _guided_cache_key(style_profile, character_memories, character_library=None):
     cm_key = tuple(sorted((k, id(v)) for k, v in (character_memories or {}).items()))
-    return (id(style_profile), cm_key)
+    return (id(style_profile), cm_key, id(character_library))
 
 
 def get_colorizer(cfg: Config = Config) -> MangaColorizer:
@@ -68,16 +68,17 @@ def get_colorizer(cfg: Config = Config) -> MangaColorizer:
 
 
 def get_guided_colorist(cfg: Config = Config, style_profile=None,
-                        character_memories: dict | None = None):
+                        character_memories: dict | None = None,
+                        character_library=None):
     """Return a GuidedColorist for this job.
 
     If style_profile has an attached StyleDescriptor (v2 extraction or
     built-in descriptor injection), it drives layered hint generation.
     """
     global _guided
-    key = _guided_cache_key(style_profile, character_memories)
+    key = _guided_cache_key(style_profile, character_memories, character_library)
 
-    if style_profile is None and not character_memories:
+    if style_profile is None and not character_memories and character_library is None:
         # Pure singleton: no style, no character memory
         if _guided is None:
             from core.guided_colorist import GuidedColorist
@@ -92,17 +93,20 @@ def get_guided_colorist(cfg: Config = Config, style_profile=None,
             cfg,
             style_descriptor=descriptor,
             style_profile=style_profile,
-            character_memories=character_memories)
+            character_memories=character_memories,
+            character_library=character_library)
         _job_guided_cache[key] = guided
     return guided
 
 
 def build_auto_hints(image_bgr: np.ndarray, cfg: Config = Config,
-                     style_profile=None, character_memories: dict | None = None) -> list:
+                     style_profile=None, character_memories: dict | None = None,
+                     character_library=None) -> list:
     if not cfg.USE_GUIDED_HINTS:
         return []
     guided = get_guided_colorist(cfg, style_profile=style_profile,
-                                 character_memories=character_memories)
+                                 character_memories=character_memories,
+                                 character_library=character_library)
     if not guided.available:
         print("[pipeline] CLIP classifier unavailable — falling back to "
               "plain mc-v2 auto-colorize (no guided hints)")
@@ -117,7 +121,8 @@ def colorize_page(image_bgr: np.ndarray,
                    style_key: str | None = None,
                    quality_key: str | None = None,
                    style_profile=None,
-                   character_memories: dict | None = None) -> np.ndarray:
+                   character_memories: dict | None = None,
+                   character_library=None) -> np.ndarray:
     """Run the full Auto pipeline on one page.
 
     `style_profile` may be a legacy StyleProfile OR a new v2 profile that
@@ -151,7 +156,8 @@ def colorize_page(image_bgr: np.ndarray,
             auto_points = build_auto_hints(
                 image_bgr, cfg,
                 style_profile=effective_profile,
-                character_memories=character_memories)
+                character_memories=character_memories,
+                character_library=character_library)
         hint_manager.set_auto_hints(auto_points)
 
     merged_points = hint_manager.merge()

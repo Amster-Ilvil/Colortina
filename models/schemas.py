@@ -54,7 +54,6 @@ class JobState(BaseModel):
     reference_image_path: Optional[str] = None
     reference_image_paths: list[str] = []  # multi-reference list
     anchor_page_index: int = 0
-    # Per-job override for the text-LLM color director (guided coloring)
     llm_director: bool = False
     page_quality: list[PageQualityRecord] = []
     character_summary: list[dict] = Field(default_factory=list)

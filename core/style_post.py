@@ -90,12 +90,22 @@ def apply_style_grade(colorized_bgr: np.ndarray, source_bw_bgr: np.ndarray,
     a = lab[..., 1] - 128.0        # centered at 0
     b = lab[..., 2] - 128.0
 
-    # 1. Saturation boost — stronger on already-low-chroma pixels so it
-    #    reads as "more colorful" without blowing out saturated areas.
+    # 1. Saturation — boost (>1) is vibrance-style: stronger on
+    #    already-low-chroma pixels so it reads "more colorful" without
+    #    blowing out saturated areas.  A value BELOW 1 means a pale /
+    #    ink-wash style: scale ALL chroma down uniformly, and softly
+    #    diffuse it so colors read as translucent washes.
     chroma = np.sqrt(a * a + b * b)
-    boost = 1.0 + (style.saturation_boost - 1.0) * np.clip(1.0 - chroma / 40.0, 0.0, 1.0)
-    a = a * boost
-    b = b * boost
+    if style.saturation_boost < 1.0:
+        a = a * style.saturation_boost
+        b = b * style.saturation_boost
+        k = max(3, (min(a.shape) // 200) | 1)   # odd kernel, scale-aware
+        a = cv2.GaussianBlur(a, (k, k), 0)
+        b = cv2.GaussianBlur(b, (k, k), 0)
+    else:
+        boost = 1.0 + (style.saturation_boost - 1.0) * np.clip(1.0 - chroma / 40.0, 0.0, 1.0)
+        a = a * boost
+        b = b * boost
 
     # 2. Global chroma shifts (warm/cool via b, red/green via a).
     b = b + style.chroma_warm_shift
