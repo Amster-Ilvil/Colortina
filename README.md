@@ -98,7 +98,8 @@ macOS（Apple Silicon）无需额外配置，自动使用 MPS GPU 加速；NVIDI
 本项目基于以下开源工作构建：
 
 - [qweasdd/manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2) — 上色核心模型
-- [vikast908/ColorComic](https://github.com/vikast908/ColorComic)（MIT）— 提示点 API、引导式自动提示、分格/分块推理逻辑
+- [qweasdd/manga-colorization](https://github.com/qweasdd/manga-colorization) — 手动上色提示
+- [vikast908/ColorComic](https://github.com/vikast908/ColorComic) — 提示点 API、引导式自动提示、分格/分块推理逻辑
 - [xiaogdgenuine/Manga-Colorization-FJ](https://github.com/xiaogdgenuine/Manga-Colorization-FJ) — 跳过已上色页面、权重格式兼容等思路
 
 
