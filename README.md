@@ -5,8 +5,8 @@
 <h1 align="center">Colortina</h1>
 
 <p align="center">
-  本地运行的黑白漫画 AI 自动上色桌面工具（无云端、无 API）<br>
-  A fully-local desktop app for AI manga colorization — no cloud, no API keys.
+  本地运行的黑白漫画 AI 自动上色桌面工具<br>
+  A fully-local desktop app for AI manga colorization
 </p>
 
 ---
