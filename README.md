@@ -42,7 +42,7 @@
    ```
    Windows (CMD 或 PowerShell):
    ```powershell
-   cd C:\Users\你的用户名\你的实际路径
+   cd C:\Users\你的用户名\你的实际路径或者直接Start_Colortina.bat
    ```
 
 2. 创建并激活虚拟环境
@@ -77,7 +77,7 @@ python3 main.py
 ```
 Windows:
 ```cmd
-python main.py
+python main.py或者直接Start_Colortina.bat
 ```
 
 首次上色时会自动下载模型权重（约 400 MB，来自 mc-v2 官方发布），存放在 `models/weights/`。
