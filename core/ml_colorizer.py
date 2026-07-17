@@ -36,7 +36,8 @@ from core.lineart_fill import clip_stamp_to_region
 
 
 def build_hint_arrays(h: int, w: int, size: int,
-                      hint_points, label_map=None) -> tuple[np.ndarray, np.ndarray]:
+                      hint_points, label_map=None,
+                      page_gray=None) -> tuple[np.ndarray, np.ndarray]:
     """Rasterize normalized hint points into mc-v2's hint + mask planes.
 
     Replicates ``resize_pad``'s geometry (resize then pad to /32) so the
@@ -71,7 +72,15 @@ def build_hint_arrays(h: int, w: int, size: int,
     min_radius_px = 3  # floor so a hint never disappears entirely at small sizes
 
     resized_labels = None
-    if label_map is not None:
+    if page_gray is not None:
+        # Recompute regions AT MODEL RESOLUTION from an area-resized gray:
+        # nearest-neighbor downscaling of a full-res label map erases thin
+        # ink lines, silently merging adjacent regions — the main reason
+        # brush hints used to leak across lines.  INTER_AREA keeps lines.
+        from core.lineart_fill import label_regions
+        small_gray = cv2.resize(page_gray, (rw, rh), interpolation=cv2.INTER_AREA)
+        resized_labels = label_regions(small_gray)
+    elif label_map is not None:
         resized_labels = cv2.resize(label_map.astype(np.int32), (rw, rh),
                                     interpolation=cv2.INTER_NEAREST)
 
@@ -90,18 +99,45 @@ def build_hint_arrays(h: int, w: int, size: int,
 
         stamped = False
         if resized_labels is not None:
-            clipped = clip_stamp_to_region(resized_labels, px, py, radius)
+            cpx, cpy = px, py
+            if resized_labels[cpy, cpx] == 0:
+                # Center landed on an ink line — re-center on the nearest
+                # non-ink pixel within the brush radius instead of falling
+                # back to a line-crossing full circle.
+                y1s, y2s = max(0, cpy - radius), min(rh, cpy + radius + 1)
+                x1s, x2s = max(0, cpx - radius), min(rw, cpx + radius + 1)
+                win = resized_labels[y1s:y2s, x1s:x2s]
+                ys, xs = np.nonzero(win > 0)
+                if ys.size:
+                    d2 = (ys - (cpy - y1s)) ** 2 + (xs - (cpx - x1s)) ** 2
+                    k = int(np.argmin(d2))
+                    cpy, cpx = y1s + int(ys[k]), x1s + int(xs[k])
+            clipped = clip_stamp_to_region(resized_labels, cpx, cpy, radius)
             if clipped is not None:
                 stamp, x1, y1 = clipped
+                # Pull the stamp a couple of pixels back from the region
+                # boundary so the hint mass sits INSIDE the region — mc-v2
+                # diffuses hints outward, and a hint touching the line was
+                # bleeding color into the neighboring region.
+                margin = max(1, radius // 5)
+                kern = np.ones((2 * margin + 1, 2 * margin + 1), np.uint8)
+                eroded = cv2.erode(stamp, kern)
+                if eroded.any():
+                    stamp = eroded
                 sh, sw = stamp.shape
                 region = stamp > 0
                 hint[y1:y1 + sh, x1:x1 + sw][region] = (int(r), int(g), int(b))
                 mask[y1:y1 + sh, x1:x1 + sw][region] = 255
                 stamped = True
+            else:
+                # Fully surrounded by ink even after re-centering: place a
+                # minimal dot rather than a big line-crossing circle.
+                cv2.circle(hint, (px, py), min_radius_px, (int(r), int(g), int(b)), -1)
+                cv2.circle(mask, (px, py), min_radius_px, 255, -1)
+                stamped = True
 
         if not stamped:
-            # No label map (panel/tiled paths), or the point landed on ink
-            # at this resolution — fall back to a plain filled circle.
+            # No region info at all (panel/tiled paths) — plain circle.
             cv2.circle(hint, (px, py), radius, (int(r), int(g), int(b)), -1)
             cv2.circle(mask, (px, py), radius, 255, -1)
 
@@ -194,7 +230,8 @@ class MangaColorizer:
 
     def _colorize_at_size(self, rgb: np.ndarray, size: int,
                           denoise_sigma: int,
-                          hint_points=None, label_map=None) -> np.ndarray:
+                          hint_points=None, label_map=None,
+                          page_gray=None) -> np.ndarray:
         """Run mc-v2 once at *size*, returning float32 RGB [0,1]."""
         # fp16 autocast on CUDA: ~1.5-2x faster on tensor-core GPUs, half VRAM
         with torch.inference_mode(), torch.autocast(
@@ -209,13 +246,13 @@ class MangaColorizer:
                 # learned shading instead of inventing a global wash
                 hint, mask = build_hint_arrays(
                     rgb.shape[0], rgb.shape[1], size, hint_points,
-                    label_map=label_map)
+                    label_map=label_map, page_gray=page_gray)
                 self._model.update_hint(hint, mask)
             return self._model.colorize()
 
     def _safe_colorize(self, rgb: np.ndarray, size: int,
                        denoise_sigma: int, hint_points=None,
-                       label_map=None) -> np.ndarray:
+                       label_map=None, page_gray=None) -> np.ndarray:
         """Robust single-pass colorize with shrink-then-CPU OOM fallback."""
         attempts = [size, max(384, size // 2)]
         last_err: RuntimeError | None = None
@@ -223,7 +260,8 @@ class MangaColorizer:
             try:
                 return self._colorize_at_size(rgb, try_size, denoise_sigma,
                                               hint_points=hint_points,
-                                              label_map=label_map)
+                                              label_map=label_map,
+                                              page_gray=page_gray)
             except RuntimeError as exc:
                 last_err = exc
                 msg = str(exc).lower()
@@ -345,10 +383,15 @@ class MangaColorizer:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = rgb.shape[:2]
 
+        # Gray page at full res: build_hint_arrays re-derives region labels
+        # at model resolution from this, so brush hints clip to real lines.
+        page_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if hint_points else None
+
         with self._lock:
             result = self._safe_colorize(rgb, size, denoise_sigma,
                                          hint_points=hint_points,
-                                         label_map=label_map)
+                                         label_map=label_map,
+                                         page_gray=page_gray)
 
         result_uint8 = np.clip(result * 255.0, 0, 255).astype(np.uint8)
         result_bgr = cv2.cvtColor(result_uint8, cv2.COLOR_RGB2BGR)
