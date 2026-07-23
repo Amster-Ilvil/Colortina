@@ -2,224 +2,109 @@
   <img src="assets/icon.png" width="128" alt="Colortina icon">
 </p>
 
-<h1 align="center">Colortina v5</h1>
+<h1 align="center">Colortina</h1>
 
 <p align="center">
-  本地运行的黑白漫画 AI 自动上色、角色一致性与交互修色工具<br>
-  Local manga colorization with confidence-gated character identity control
+  本地运行的黑白漫画 AI 自动上色桌面工具<br>
+  A fully-local desktop app for AI manga colorization
 </p>
 
 ---
 
-## v5 的核心变化
+## 功能特性
 
-旧版本把“参考画风”“人物颜色”和“环境颜色”放在同一条链路中，容易造成整图单色化、不同人物颜色趋同，以及识别错误后被强制锁错色。v5 将它们彻底拆开：
+- **一键自动上色**：基于 [manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2)（U-Net + SEResNeXt），首次运行自动下载权重
+- **智能自动提示**：CLIP 零样本区域识别 → 按高光/中间调/阴影分层生成颜色提示，上色结果更自然
+- **手动引导**：画布上直接涂抹颜色提示，局部重新生成；支持吸色、区域填充、撤销/重做
+- **批量处理**：导入整个文件夹（自然排序）、PDF 自动拆页、拖拽导入图片/PDF/文件夹
+- **跳过已上色页面**：自动检测彩页并跳过，混合黑白/彩色的整本漫画可直接批量处理
+- **跨页颜色一致性**：CharacterMemory 让同一角色在整本书中保持发色等一致
+- **自定义风格**：从参考图提取风格档案（.ccstyle），保存/加载/复用
+- **硬件友好**：支持 CUDA / Apple Silicon (MPS) / CPU，显存不足自动降级；CUDA 上 fp16 加速
+- **中英文界面**，可随时切换
+## 效果展示
 
-- **`.ccstyle` 画风**：只控制冷暖、明暗、阴影、高光、饱和度关系、平涂和渐变。参考图主色仅用于预览，不再把整张图吸向同一种颜色。
-- **`.ccpalette` 角色身份配色**：保存角色的发色、肤色、瞳色和服装色。只有高置信度人物匹配或人工绑定才允许锁色。
-- **`.ccscene` 场景配色**：只保存天空、植被、建筑、水面、火焰等环境色，不会覆盖人物。
+| 原图 | 自动上色 | 手动干预 |
+|:---:|:---:|:---:|
+| <img width="260" src="https://github.com/user-attachments/assets/818eae63-ad50-41a8-a487-a22eb5728441" /> | <img width="260" src="https://github.com/user-attachments/assets/3a10885f-bdc9-497e-9286-34ae8b94fb3d" /> | <img width="260" src="https://github.com/user-attachments/assets/09f4cfa7-2b2f-4f8e-a7fb-719e70d1a8b2" /> |
 
-## 本轮样本驱动改进
+## 🚀 安装与启动
 
-本版使用两张彩色参考图和三张黑白目标页建立了可重复的回归流程，重点解决复杂封面误识别和右侧按钮不可见：
+### 🍎 macOS / 🪟 Windows
 
-- 右侧控制区取消整列滚动，改为“上色 / 参考 / 编辑 / 查看导出”四个自适应标签页。
-- 窗口缩放时，右侧字体、按钮高度、组间距和面板宽度会自动调整；按钮文本改为短标签，完整功能仍通过标签分组呈现。
-- 普通 OpenCV 正脸分类器默认禁用，因为它会把漫画封面的手部、身体高光和文字误判成人脸。
-- 自动人物检测改用专门的 MIT 动漫脸 LBP 分类器，并支持 0°、90°、180°、270° 四个方向；首次需要时自动下载并缓存。
-- 新增“手动添加参考角色”：拖框选择完整头部，再点击采样发色、肤色、瞳色和服装色。复杂封面、倒置人物或遮挡场景优先使用该功能。
-- 同名角色可从多张参考图重复录入并合并；不同名称不会仅因外形相近而自动合并。
-- 无 CLIP 的线稿匹配安全门进一步收紧，只给出非常高置信度自动锁色；其余交由当前页人物绑定，避免误锁色污染整页。
-- 新增 `tools/reference_sample_regression.py`，可生成参考画风、角色配色库、选框覆盖图、目标页分割统计和候选匹配报告，并明确标注是否真的具备 mc-v2 权重。
+以下步骤在 macOS 与 Windows 上的说明结构一致，针对各系统给出对应命令：
 
-## 主要功能
+1. 进入项目目录
 
-### 自动提示与点色块抑制
+   macOS:
+   ```bash
+   cd ~/ # 改成你的实际路径
+   ```
+   Windows (CMD 或 PowerShell):
+   ```powershell
+   cd C:\Users\你的用户名\你的实际路径或者直接Start_Colortina.bat
+   ```
 
-- 提示点使用带来源、置信度、强度、角色和语义信息的 `HintSpec`，不再过早压成无来源四元组。
-- 自动提示、角色身份提示和手动画笔使用不同半径与强度。
-- 模型 mask 使用区域内裁剪的软高斯权重，不再使用硬边实心圆。
-- 小区域最多 1 个自动点，中区域最多 2 个，大区域最多 3 个，单页自动点默认不超过 120 个。
-- 生成后检测提示中心附近的规则色块；风险过高时自动降级提示并最多重跑一次。
+2. 创建并激活虚拟环境
 
-### 角色跨页一致性
+   macOS:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+   Windows (CMD):
+   ```cmd
+   python -m venv venv
+   venv\Scripts\activate
+   ```
+   Windows (PowerShell):
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\Activate.ps1
+   ```
 
-- 参考角色使用头部灰度视觉嵌入、发型灰度直方图、轮廓比例和面积联合匹配。
-- 匹配同时计算 Top-1、Top-2 和 margin；低分、低 margin 或低语义置信度时宁可不锁色。
-- 同一人物可在同页多个分格中重复匹配同一个角色档案。
-- 参考人物合并同时检查 LAB 身份色兼容性，避免相似发型但不同发色的人物被错误合并。
-- 生成后的发色、肤色、瞳色和服装色只在通过安全门的区域内锁定，并保留线稿亮度、网点和纹理。
-- 眼睛锁色向内腐蚀，排除眼白、睫毛和黑色瞳孔；肤色排除强高光和强阴影。
-
-### 人工纠错
-
-- “当前页人物绑定与禁用锁色”可为每个检测人物选择：
-  - 自动判断；
-  - 不锁色，保留模型结果；
-  - 强制绑定到某个角色档案。
-- 页面绑定随 `.ccproject` 保存。
-- 角色覆盖层显示实例框、自动匹配、Top-1 分数、margin 和锁色状态：绿色可锁、黄色歧义、红色未匹配。
-- 参考图—目标页对应点可直接把精确参考颜色写入目标区域。
-- 手动画笔按连通区域覆盖自动提示，并自动生成高光、中间调和阴影层级。
-
-### 高质量与批量处理
-
-- 分格和分块推理完整保留结构化提示元数据。
-- tiled 模式先运行整页低分辨率颜色先验，再只把 LAB 色度轻度注入高分辨率 tile，减少跨 tile 色漂移，同时保留高分辨率线条。
-- 支持图片、文件夹、PDF、拖拽导入、批量上色、跳过已上色页面和自然排序。
-- 左侧页面列表无横向滚动条，文件名自动扩宽或换行完整显示。
-
-### 项目、诊断与评估
-
-- `.ccproject` 保存页面顺序、结果、结构化提示、画风、角色库、场景色、当前页强制绑定和界面参数。
-- 每个已处理页面在项目资产目录中保存 `page_XXXX.diagnostics.json`。
-- 页面诊断记录人物匹配数、歧义数、锁色区域数、提示来源和数量、色块风险以及是否自动重跑。
-- `tools/evaluate_golden.py` 可在用户自备的授权漫画页面上计算同角色 Delta-E、不同角色最小 Delta-E、线稿染色率和匹配覆盖率。
-
-## 安装
-
-### macOS / Apple Silicon
+3. 安装依赖（可选：使用国内镜像加速）
 
 ```bash
-cd /你的/Colortina-optimized-v5
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python main.py
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-Apple Silicon 会自动优先使用 MPS。部分 PyTorch 尚未实现的算子会自动回退到 CPU。
+4. 启动程序
 
-### Windows
-
-```powershell
-cd C:\你的\Colortina-optimized-v5
-python -m venv venv
-venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python main.py
-```
-
-首次上色会下载 mc-v2 权重；首次使用语义识别或角色参考提取时会下载 CLIP 权重。
-
-## 推荐工作流
-
-1. 导入黑白页面。
-2. 在“画风与渲染”中选择内置画风，或从彩页提取 `.ccstyle`。
-3. 在“角色身份配色”中单独从清晰彩色人物参考图提取 `.ccpalette`。
-4. 需要固定环境颜色时，再单独提取或加载 `.ccscene`。
-5. 执行“自动上色”。
-6. 打开人物/区域覆盖层检查匹配状态。黄色人物默认不会锁色。
-7. 对歧义人物使用“当前页人物绑定与禁用锁色”，然后重新自动上色。
-8. 对局部错色使用对应点、画笔提示或区域填色。
-9. 保存 `.ccproject`，或导出页面。
-
-**重要：**“提取画风”不会再自动创建、覆盖或加载角色配色；加载或删除 `.ccstyle` 也不会改变 `.ccpalette`。
-
-## 旧文件迁移
-
-- v1-v4 `.ccstyle` 加载时升级为当前格式；旧绝对主色保留作预览，不参与人物全局吸色。
-- v1-v4 `.ccpalette` 加载时增加匹配分数、Top-2 margin 和语义置信度安全门。
-- v1 `.ccproject` 升级为 v2 项目结构，增加场景配色、逐页诊断和页面人物绑定。
-
-重新从参考图独立提取一次 v5 画风和角色身份配色，效果通常比直接沿用旧文件更可靠。
-
-## 测试
-
+macOS:
 ```bash
-python -m compileall -q .
-python -m unittest discover -s tests -v
+python3 main.py
+```
+Windows:
+```cmd
+python main.py或者直接Start_Colortina.bat
 ```
 
-当前包含 **38 项自动化测试**，覆盖软提示 mask、提示密度、色块检测和降级重跑策略、分块坐标重映射、风格色差保护、角色去重、Top-2 歧义安全门、人工强制绑定/禁用锁色、眼睛和肤色锁定保护、项目迁移、逐页诊断、真实样本评估指标等。
+首次上色时会自动下载模型权重（约 400 MB，来自 mc-v2 官方发布），存放在 `models/weights/`。
 
-真实漫画回归测试说明见 `tests/golden/README.md`。仓库不会附带未经授权的漫画页面。
-
-## 文件格式
-
-- `.ccstyle`：相对画风语言，不保存强制人物身份色。
-- `.ccpalette`：角色绝对身份颜色和匹配特征。
-- `.ccscene`：环境绝对颜色。
-- `.ccproject`：完整编辑会话和页面人工绑定。
-
-## 硬件与重型参考模型
-
-默认后端仍为 mc-v2，适合 16GB Apple Silicon。MangaNinja、Cobra、Control-Color 等扩散式参考模型需要更高内存、更多权重并受不同许可证约束，因此没有直接打包。v5 保留 mc-v2 主线，并吸收了精确对应、稀疏交互、全局先验和置信度安全门等适合本地运行的设计思想。
-
-## 许可
-
-请遵守项目内许可证、上游代码许可证、模型权重条款以及所处理漫画内容的版权与授权要求。
+macOS（Apple Silicon）无需额外配置，自动使用 MPS GPU 加速；NVIDIA 显卡请按 [PyTorch 官网](https://pytorch.org/get-started/locally/) 安装对应 CUDA 版本的 torch。
 
 
-## 参考图与目标页回归工具
 
-复制 `tests/sample_reference_manifest.example.json`，填写参考图、角色头部选框、颜色采样点和目标页头部选框：
+## 使用
 
-```bash
-python tools/reference_sample_regression.py your_manifest.json \
-  --output sample_regression
-```
+1. 导入图片 / PDF / 文件夹（或直接拖入窗口）
+2. 点击「自动上色」
+3. 对不满意的区域涂抹颜色提示后「重新生成」
+4. 导出单页或全部页面
 
-输出包含：
+## 致谢与许可
 
-- `sample_reference.ccstyle`
-- `sample_characters.ccpalette`
-- `report.json`
-- 参考图与目标页选框覆盖图
+本项目基于以下开源工作构建：
 
-若 mc-v2 权重不完整，报告会明确写入 `analysis_only: true`，不会把参考分析误称为完成上色。
+- [qweasdd/manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2) — 上色核心模型
+- [qweasdd/manga-colorization](https://github.com/qweasdd/manga-colorization) — 手动上色提示
+- [vikast908/ColorComic](https://github.com/vikast908/ColorComic) — 提示点 API、引导式自动提示、分格/分块推理逻辑
+- [xiaogdgenuine/Manga-Colorization-FJ](https://github.com/xiaogdgenuine/Manga-Colorization-FJ) — 跳过已上色页面、权重格式兼容等思路
 
-## v5.1 自动上色状态说明
 
-点击“自动上色”后，右侧会依次显示模型检查、首次下载、模型加载、页面分析和上色状态。首次运行缺少 mc-v2 权重时，需要下载约 400 MB 的 generator 权重和约 7 MB 的 denoiser 权重。
 
-普通自动上色不会再自动下载 CLIP。只有本地已经缓存 CLIP 时才启用语义区域识别；允许首次联网下载 CLIP可在启动前设置：
 
-```bash
-export COLORTINA_ALLOW_CLIP_DOWNLOAD=1
-```
+## 免责声明
 
-模型或网络失败会弹出错误窗口，不会再让按钮一直停留在无响应状态。
-
-## v5.9：服装部位槽与漂色诊断
-
-### 服装颜色按部位分配
-
-角色配色库现在会把服装区域按几何位置分成：
-
-- 上衣
-- 下装
-- 配饰
-
-若角色档案保存了多个服装颜色槽，系统会优先使用：
-
-- 上衣 → 第 1 个槽
-- 下装 → 第 2 个槽
-- 配饰 → 第 3 个槽
-
-槽位不足时会自动退回可用的最近槽位。这样同一角色的上衣、裙子、领带或饰品不会被强制压成一种颜色。
-
-### 角色锁色诊断
-
-右侧“参考”页签的“角色锁色诊断”现在会显示：
-
-- 发色、瞳色、肤色、服装主色的色块
-- 最多 3 个服装槽色块
-- 当前页上衣、下装、配饰区域数量
-- 锁定区域数
-- 实际结果与身份目标色的 Delta-E 偏差
-- 瞳色或服装色漂移过大时的红色告警
-
-发生漂色告警的页面也会在左侧页面列表显示警告标记。
-
-### 编辑服装槽
-
-在“管理角色配色”中新增“服装槽（逗号分隔）”列，可直接输入最多 3 个 `#RRGGBB` 颜色，例如：
-
-```text
-#334477, #772244, #d0a030
-```
-
-旧版 `.ccpalette` 会自动迁移到 v5，并将原有服装主色写入第一个服装槽。
+本工具仅供个人学习与研究使用。请勿将上色结果用于侵犯原作者版权的用途。
