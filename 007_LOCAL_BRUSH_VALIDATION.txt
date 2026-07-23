@@ -1,0 +1,3 @@
+changed_bbox=128,268-162,302
+max_dx=17, max_dy=17
+changed_pixels=974

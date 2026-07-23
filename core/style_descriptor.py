@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-_VERSION = 2
+_VERSION = 4
 
 
 @dataclass
@@ -81,8 +81,29 @@ class StyleDescriptor:
     global_shadow_lift: float = 0.0  # lift shadows (0=none, +=cinematic)
     cel_flatten: float = 0.3         # 0 = full gradient, 1 = flat fills
 
+    # Reference-wide chroma signature.  Unlike the relative per-region
+    # language above, these fields preserve the visible atmosphere of the
+    # supplied colour pages even when semantic CLIP labelling is imperfect.
+    # Values are OpenCV LAB [L, A, B] statistics and dominant RGB hex colours.
+    reference_lab_mean: list[float] = field(default_factory=list)
+    reference_lab_std: list[float] = field(default_factory=list)
+    # Preview-only palette.  v4 deliberately never uses these absolute colours
+    # to recolour character regions.
+    reference_palette: list[str] = field(default_factory=list)
+
+    # Which parts of the page may receive relative style treatment.  Absolute
+    # identity colours are never stored here.
+    style_scope: dict = field(default_factory=lambda: {
+        "character_rendering": True,
+        "background_rendering": True,
+        "global_ambience": 0.20,
+    })
+    revision: int = 0
+
     # ── Per-region descriptors ────────────────────────────────────────
     hair:       RegionDescriptor = field(default_factory=RegionDescriptor)
+    eyes:       RegionDescriptor = field(default_factory=lambda: RegionDescriptor(
+                    contrast=1.2, saturation_scale=1.05, gradient=0.35))
     skin:       RegionDescriptor = field(default_factory=lambda: RegionDescriptor(
                     warm_bias=3.0, shadow_bias=-1.0, shadow_hue_rotate=2.0,
                     highlight_bias=1.0, saturation_scale=0.9))
@@ -105,6 +126,11 @@ class StyleDescriptor:
                     saturation_scale=0.4, gradient=0.5))
     wood:       RegionDescriptor = field(default_factory=lambda: RegionDescriptor(
                     warm_bias=4.0, saturation_scale=0.8))
+
+    # Number of pixels/references that actually contributed to each region.
+    # Missing semantic classes are excluded when several references are merged
+    # instead of blending in a neutral default and diluting the real style.
+    region_samples: dict = field(default_factory=dict)
 
     # ── Backwards-compat palette (kept for old .ccstyle files) ───────
     # Not used for Hint generation; only as a fallback seed colour when
@@ -140,7 +166,11 @@ class StyleDescriptor:
 
     @classmethod
     def _from_dict(cls, data: dict) -> "StyleDescriptor":
-        region_keys = {"hair", "skin", "sky", "foliage", "background",
+        # v1-v3 files are upgraded conservatively.  Old absolute palettes remain
+        # available for UI preview but are not used as character identity colours.
+        from core.schema_migration import migrate_ccstyle
+        data, _notes = migrate_ccstyle(data)
+        region_keys = {"hair", "eyes", "skin", "sky", "foliage", "background",
                        "metal", "water", "fire", "stone", "wood",
                        "clothing_primary", "clothing_secondary", "clothing_accent"}
         kwargs: dict = {}
@@ -179,18 +209,20 @@ class StyleDescriptor:
     def to_style_preset(self, key: str | None = None):
         """Map descriptor global stats onto a StylePreset for style_post."""
         from core.presets import StylePreset
+        ambience = float((self.style_scope or {}).get("global_ambience", 0.20))
         warm_shift = {"warm": 3.0, "cool": -3.0, "neutral": 0.0}.get(
             self.temperature, 0.0)
         import numpy as np
+        ambience = float(np.clip(ambience, 0.0, 1.0))
         return StylePreset(
             key=key or f"descriptor_{self.name.lower().replace(' ', '_')}",
             label=f"{self.name} (descriptor)",
             description=self.description or self.name,
-            saturation_boost=float(np.clip(0.9 + self.saturation * 0.9, 1.0, 1.9)),
+            saturation_boost=float(np.clip(1.0 + (self.saturation - 0.7) * 0.45, 0.85, 1.35)),
             white_threshold=int(np.clip(210 + self.contrast * 25, 205, 238)),
             black_threshold=int(np.clip(20 + self.shadow_strength * 25, 15, 45)),
             l_gamma=float(np.clip(1.15 - self.contrast * 0.3, 0.85, 1.15)),
-            chroma_warm_shift=warm_shift + self.global_warm_cool * 0.5,
+            chroma_warm_shift=(warm_shift + self.global_warm_cool * 0.25) * ambience,
             cel_flatten=float(np.clip(self.cel_flatten, 0.0, 0.85)),
             neutral_fade_floor=float(np.clip(0.25 + self.gradient * 0.3, 0.25, 0.6)),
             denoise_sigma=15,

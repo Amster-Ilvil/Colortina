@@ -61,7 +61,8 @@ def _lab_px_to_bgr(lab: np.ndarray) -> tuple[int, int, int]:
 def _apply_regional_style(seed_bgr: tuple[int, int, int],
                           rd: RegionDescriptor,
                           global_warm_cool: float = 0.0,
-                          global_saturation: float = 1.0) -> TieredColor:
+                          global_saturation: float = 1.0,
+                          strength: float = 1.0) -> TieredColor:
     """Apply a RegionDescriptor's language onto a seed BGR color.
 
     Returns three tiers (highlight / mid / shadow) in BGR.
@@ -71,6 +72,7 @@ def _apply_regional_style(seed_bgr: tuple[int, int, int],
     """
     lab = _bgr_to_lab_px(seed_bgr)
     L0, A0, B0 = float(lab[0]), float(lab[1]), float(lab[2])
+    strength = float(np.clip(strength, 0.0, 1.0))
 
     # Global saturation applied as chroma scale around gray axis (A=B=128)
     def sat_scale(A, B, scale):
@@ -78,26 +80,27 @@ def _apply_regional_style(seed_bgr: tuple[int, int, int],
         b = (B - 128.0) * scale + 128.0
         return a, b
 
-    total_warm = B0 + rd.warm_bias + global_warm_cool
-    A_mid, B_mid = sat_scale(A0, total_warm, rd.saturation_scale * global_saturation)
+    total_warm = B0 + (rd.warm_bias + global_warm_cool) * strength
+    saturation = 1.0 + (rd.saturation_scale * global_saturation - 1.0) * strength
+    A_mid, B_mid = sat_scale(A0, total_warm, saturation)
 
     # --- Mid-tone ---
     mid_lab = np.array([L0, A_mid, B_mid])
 
     # --- Highlight ---  brighter, style's hi_bias on top of mid
     L_hi = float(np.clip(L0 + 30.0, 0, 255))
-    A_hi = A_mid + rd.highlight_hue_rotate
-    B_hi = B_mid + rd.highlight_bias
+    A_hi = A_mid + rd.highlight_hue_rotate * strength
+    B_hi = B_mid + rd.highlight_bias * strength
     if rd.highlight_desat > 0:
-        A_hi, B_hi = sat_scale(A_hi, B_hi, 1.0 - rd.highlight_desat)
+        A_hi, B_hi = sat_scale(A_hi, B_hi, 1.0 - rd.highlight_desat * strength)
     hi_lab = np.array([L_hi, np.clip(A_hi, 0, 255), np.clip(B_hi, 0, 255)])
 
     # --- Shadow ---  darker, style's shadow shifts
     L_sh = float(np.clip(L0 - 35.0, 0, 255))
-    A_sh = A_mid + rd.shadow_hue_rotate
-    B_sh = B_mid + rd.shadow_bias
+    A_sh = A_mid + rd.shadow_hue_rotate * strength
+    B_sh = B_mid + rd.shadow_bias * strength
     if rd.shadow_desat > 0:
-        A_sh, B_sh = sat_scale(A_sh, B_sh, 1.0 - rd.shadow_desat)
+        A_sh, B_sh = sat_scale(A_sh, B_sh, 1.0 - rd.shadow_desat * strength)
     sh_lab = np.array([L_sh, np.clip(A_sh, 0, 255), np.clip(B_sh, 0, 255)])
 
     return TieredColor(
@@ -119,29 +122,52 @@ class StyleDirector:
     palette_key) pair so we don't recompute every page.
     """
 
-    def __init__(self, descriptor: StyleDescriptor, palette: dict | None = None):
-        self._desc    = descriptor
+    def __init__(self, descriptor: StyleDescriptor, palette: dict | None = None,
+                 strength: float = 1.0):
+        self._desc = descriptor
         self._palette = {**DEFAULT_PALETTE, **(palette or {})}
-        self._cache: dict[str, TieredColor] = {}
+        self._strength = float(np.clip(strength, 0.0, 1.0))
+        self._cache: dict[tuple, TieredColor] = {}
 
-    def get_tiered(self, palette_key: str) -> TieredColor:
+    def get_tiered(self, palette_key: str,
+                   base_rgb: tuple[int, int, int] | None = None) -> TieredColor:
         """Return the TieredColor for a palette key.
 
         The seed color comes from the palette (DEFAULT or overridden).
         We then apply the StyleDescriptor's language for that region.
         """
-        if palette_key in self._cache:
-            return self._cache[palette_key]
+        cache_key = (palette_key, tuple(base_rgb) if base_rgb is not None else None)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
-        seed_hex = self._palette.get(palette_key) or DEFAULT_PALETTE.get(
-            palette_key, "#888888")
-        seed_bgr = hex_to_bgr(seed_hex)   # (b, g, r)
+        if base_rgb is None:
+            seed_hex = self._palette.get(palette_key) or DEFAULT_PALETTE.get(
+                palette_key, "#888888")
+            seed_bgr = hex_to_bgr(seed_hex)   # (b, g, r)
+        else:
+            r, g, b = (int(np.clip(v, 0, 255)) for v in base_rgb)
+            seed_bgr = (b, g, r)
 
         rd = self._desc.region(palette_key)
         tc = _apply_regional_style(
             seed_bgr, rd,
             global_warm_cool=self._desc.global_warm_cool,
             global_saturation=self._desc.global_saturation,
+            strength=self._strength,
         )
-        self._cache[palette_key] = tc
+        self._cache[cache_key] = tc
         return tc
+
+
+def tiered_from_rgb(base_rgb: tuple[int, int, int], descriptor=None,
+                    region_key: str = "manual", strength: float = 1.0) -> TieredColor:
+    """Create highlight/mid/shadow colours around a user/reference base RGB.
+
+    This keeps identity colour (the user's chosen red, or a character's hair
+    colour) separate from rendering style.  With no descriptor it still
+    produces neutral luminance tiers rather than a flat colour wash.
+    """
+    if descriptor is None:
+        descriptor = StyleDescriptor(name="Neutral manual", source="manual")
+    return StyleDirector(descriptor, strength=strength).get_tiered(
+        region_key, base_rgb=base_rgb)

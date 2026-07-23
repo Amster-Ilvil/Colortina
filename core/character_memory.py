@@ -73,25 +73,30 @@ class CharacterMemory:
 
     # ── Persistence ──────────────────────────────────────────────────
 
-    def save(self, path: str) -> str:
-        out_dir = os.path.dirname(os.path.abspath(path))
-        os.makedirs(out_dir, exist_ok=True)
-        data = {"label": self.label, "max_slots": self.max_slots,
-               "tone_tolerance": self.tone_tolerance,
-               "slots": [asdict(s) for s in self.slots]}
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return path
+    def to_dict(self) -> dict:
+        return {"label": self.label, "max_slots": self.max_slots,
+                "tone_tolerance": self.tone_tolerance,
+                "slots": [asdict(s) for s in self.slots]}
 
     @classmethod
-    def load(cls, path: str) -> "CharacterMemory":
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    def from_dict(cls, data: dict) -> "CharacterMemory":
         mem = cls(label=data.get("label", "hair"),
                   max_slots=data.get("max_slots", 8),
                   tone_tolerance=data.get("tone_tolerance", 28.0))
         mem.slots = [CharacterSlot(**s) for s in data.get("slots", [])]
         return mem
+
+    def save(self, path: str) -> str:
+        out_dir = os.path.dirname(os.path.abspath(path))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "CharacterMemory":
+        with open(path, "r", encoding="utf-8") as f:
+            return cls.from_dict(json.load(f))
 
     # ── Seeding from a color reference ────────────────────────────────
 

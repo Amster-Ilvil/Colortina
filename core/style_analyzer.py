@@ -47,8 +47,14 @@ def _lab_tier_stats(lab_pixels: np.ndarray) -> dict:
     A = lab_pixels[:, 1] - 128.0
     B = lab_pixels[:, 2] - 128.0
 
-    hi_mask  = L > _L_HI_MIN
-    sh_mask  = L < _L_SH_MAX
+    # Region-relative quantiles are robust to a dark night scene or a very
+    # bright pastel reference.  Fixed global thresholds often left one tier
+    # empty and made unrelated references look identical.
+    q_lo, q_hi = np.quantile(L, [0.25, 0.75]) if len(L) >= 8 else (_L_SH_MAX, _L_HI_MIN)
+    if q_hi - q_lo < 12:
+        q_lo, q_hi = float(np.min(L)), float(np.max(L))
+    hi_mask = L >= q_hi
+    sh_mask = L <= q_lo
     mid_mask = ~hi_mask & ~sh_mask
 
     # Fall back: if a tier is empty, use whole region
@@ -82,6 +88,7 @@ def _lab_tier_stats(lab_pixels: np.ndarray) -> dict:
         "gradient":   gradient,
         "sh_desat":   sh_desat,
         "hi_desat":   hi_desat,
+        "count": int(len(lab_pixels)),
     }
 
 
@@ -123,6 +130,32 @@ def _region_descriptor_from_stats(stats: dict, global_mid_B: float = 0.0,
     )
 
 
+def _dominant_palette_hex(color_bgr: np.ndarray, max_colors: int = 8) -> list[str]:
+    """Extract visible dominant colours while ignoring paper, ink and gray pixels."""
+    hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+    valid = ((hsv[..., 1] > 28) & (hsv[..., 2] > 24) & (hsv[..., 2] < 248))
+    pixels = color_bgr[valid]
+    if len(pixels) < 16:
+        return []
+    # Bound K-Means cost for large reference pages.
+    if len(pixels) > 30000:
+        idx = np.linspace(0, len(pixels) - 1, 30000).astype(int)
+        pixels = pixels[idx]
+    k = max(1, min(max_colors, len(pixels) // 64))
+    data = pixels.astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 25, 0.5)
+    _compactness, labels, centers = cv2.kmeans(
+        data, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+    counts = np.bincount(labels.ravel(), minlength=k)
+    out = []
+    for i in np.argsort(-counts):
+        b, g, r = np.clip(centers[i], 0, 255).astype(np.uint8)
+        value = f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+        if value not in out:
+            out.append(value)
+    return out
+
+
 class StyleAnalyzer:
     """Analyzes color reference images and produces a StyleDescriptor.
 
@@ -162,13 +195,24 @@ class StyleAnalyzer:
 
         def wblend_region(key: str) -> RegionDescriptor:
             fields_sum: dict = {}
-            for d, w in zip(descriptors, weights):
+            effective_total = 0.0
+            for d, user_w in zip(descriptors, weights):
+                samples = float(getattr(d, "region_samples", {}).get(key, 0))
+                if samples <= 0:
+                    continue
+                # Pixel count contributes sub-linearly so one large background
+                # does not overwhelm several clean close-up references.
+                w = float(user_w) * max(1.0, np.sqrt(samples / 500.0))
+                effective_total += w
                 r = d.region(key)
                 for f in RegionDescriptor.__dataclass_fields__:
                     v = getattr(r, f)
                     if isinstance(v, (int, float)):
                         fields_sum[f] = fields_sum.get(f, 0.0) + v * w
-            return RegionDescriptor(**{f: round(v / total_w, 3) for f, v in fields_sum.items()})
+            if effective_total <= 0:
+                return RegionDescriptor()
+            return RegionDescriptor(**{
+                f: round(v / effective_total, 3) for f, v in fields_sum.items()})
 
         def wmean(attr: str) -> float:
             return sum(getattr(d, attr, 0.0) * w
@@ -188,7 +232,16 @@ class StyleAnalyzer:
             global_contrast=round(wmean("global_contrast"), 3),
             global_shadow_lift=round(wmean("global_shadow_lift"), 3),
             cel_flatten=round(wmean("cel_flatten"), 3),
+            reference_lab_mean=[round(sum(
+                (getattr(d, "reference_lab_mean", []) or [0.0, 128.0, 128.0])[i] * w
+                for d, w in zip(descriptors, weights)) / total_w, 3) for i in range(3)],
+            reference_lab_std=[round(sum(
+                (getattr(d, "reference_lab_std", []) or [1.0, 12.0, 12.0])[i] * w
+                for d, w in zip(descriptors, weights)) / total_w, 3) for i in range(3)],
+            reference_palette=list(dict.fromkeys(
+                color for d in descriptors for color in getattr(d, "reference_palette", [])))[:12],
             hair=wblend_region("hair"),
+            eyes=wblend_region("eyes"),
             skin=wblend_region("skin"),
             sky=wblend_region("sky"),
             foliage=wblend_region("foliage"),
@@ -201,6 +254,14 @@ class StyleAnalyzer:
             fire=wblend_region("fire"),
             stone=wblend_region("stone"),
             wood=wblend_region("wood"),
+            region_samples={
+                key: int(sum(getattr(d, "region_samples", {}).get(key, 0)
+                             for d in descriptors))
+                for key in ("hair", "eyes", "skin", "sky", "foliage",
+                            "clothing_primary", "clothing_secondary",
+                            "clothing_accent", "background", "metal",
+                            "water", "fire", "stone", "wood")
+            },
             saturation=round(wmean("saturation"), 3),
             contrast=round(wmean("contrast"), 3),
             temperature=temperature,
@@ -215,13 +276,19 @@ class StyleAnalyzer:
         gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
         lab  = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-        saturation = float(np.clip(hsv[..., 1].mean() / 255.0, 0.0, 1.0))
-        contrast   = float(np.clip(gray.std() / 80.0, 0.0, 1.0))
-
-        hue = hsv[..., 0]
-        warm_frac  = float(np.mean((hue < 30) | (hue > 150)))
-        temperature = ("warm" if warm_frac > 0.55 else
-                       "cool" if warm_frac < 0.45 else "neutral")
+        chromatic = ((hsv[..., 1] > 30) & (hsv[..., 2] > 25) &
+                     (hsv[..., 2] < 245))
+        if np.any(chromatic):
+            saturation = float(np.clip(
+                hsv[..., 1][chromatic].mean() / 255.0, 0.0, 1.0))
+            hue = hsv[..., 0][chromatic]
+            warm_frac = float(np.mean((hue < 30) | (hue > 150)))
+            temperature = ("warm" if warm_frac > 0.58 else
+                           "cool" if warm_frac < 0.42 else "neutral")
+        else:
+            saturation = 0.0
+            temperature = "neutral"
+        contrast = float(np.clip(gray.std() / 80.0, 0.0, 1.0))
 
         shadow_strength = float(np.clip(np.mean(gray < 90), 0.0, 1.0))
 
@@ -242,6 +309,18 @@ class StyleAnalyzer:
         # Cel-flatness: low gradient -> flat fills
         cel_flatten = float(np.clip(1.0 - gradient * 1.5, 0.0, 0.85))
 
+        # Reference-wide LAB signature, measured only on actual colour pixels.
+        # This makes a saved reference style visibly effective even when the
+        # semantic region classifier cannot reliably identify a cover image.
+        if np.any(chromatic):
+            ref_lab = lab[chromatic]
+        else:
+            nonpaper = (gray > 20) & (gray < 245)
+            ref_lab = lab[nonpaper] if np.any(nonpaper) else lab.reshape(-1, 3)
+        reference_lab_mean = ref_lab.mean(axis=0).astype(float).tolist()
+        reference_lab_std = np.maximum(ref_lab.std(axis=0), [1.0, 4.0, 4.0]).astype(float).tolist()
+        reference_palette = _dominant_palette_hex(color_bgr)
+
         return {
             "saturation": saturation, "contrast": contrast,
             "temperature": temperature, "shadow_strength": shadow_strength,
@@ -250,6 +329,9 @@ class StyleAnalyzer:
             "global_saturation": float(np.clip(saturation * 1.5, 0.4, 2.0)),
             "global_contrast":   float(np.clip(contrast   * 1.4, 0.5, 1.8)),
             "global_warm_cool":  round(global_mid_B * 0.3, 2),
+            "reference_lab_mean": reference_lab_mean,
+            "reference_lab_std": reference_lab_std,
+            "reference_palette": reference_palette,
         }
 
     def _semantic_region_stats(self, color_bgr: np.ndarray, classifier) -> dict:
@@ -262,7 +344,8 @@ class StyleAnalyzer:
         seg  = segment_regions(gray)
         if not seg.regions:
             return {}
-        labels = classifier.classify(color_bgr, [r.bbox for r in seg.regions])
+        semantic_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        labels = classifier.classify(semantic_bgr, [r.bbox for r in seg.regions])
         if not labels:
             return {}
 
@@ -298,28 +381,15 @@ class StyleAnalyzer:
         return result
 
     def _kmeans_region_stats(self, color_bgr: np.ndarray, k: int = 6) -> dict:
-        """No-CLIP fallback: K-Means dominant colors, ranked by area,
-        mapped to generic palette keys.  Less accurate but always works."""
-        small = cv2.resize(color_bgr, (128, 128), interpolation=cv2.INTER_AREA)
-        lab   = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype(np.float32)
-        pix   = lab.reshape(-1, 3)
+        """No-CLIP fallback: do not invent semantic labels from colour clusters.
 
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 15, 1.0)
-        _, cluster_ids, centers = cv2.kmeans(
-            pix, k, None, criteria, 4, cv2.KMEANS_PP_CENTERS)
-
-        counts = np.bincount(cluster_ids.flatten(), minlength=k)
-        order  = np.argsort(-counts)
-
-        key_order = list(DEFAULT_PALETTE.keys())
-        result: dict = {}
-        for rank, idx in enumerate(order):
-            if rank >= len(key_order):
-                break
-            # Reconstruct a virtual bucket: pixels in this cluster
-            mask = cluster_ids.flatten() == idx
-            result[key_order[rank]] = _lab_tier_stats(pix[mask])
-        return result
+        K-Means can describe a palette but cannot know whether a cluster is hair,
+        skin, sky or clothing.  Global statistics and ``reference_palette`` are
+        already extracted by ``_global_stats``; returning an empty mapping keeps
+        every semantic RegionDescriptor neutral instead of assigning arbitrary
+        absolute colours to character parts.
+        """
+        return {}
 
     def _build_descriptor(self, name: str, global_stats: dict,
                           per_region: dict) -> StyleDescriptor:
@@ -339,7 +409,11 @@ class StyleAnalyzer:
             global_contrast=global_stats.get("global_contrast", 1.0),
             global_shadow_lift=global_stats.get("shadow_lift", 0.0),
             cel_flatten=global_stats.get("cel_flatten", 0.3),
+            reference_lab_mean=global_stats.get("reference_lab_mean", []),
+            reference_lab_std=global_stats.get("reference_lab_std", []),
+            reference_palette=global_stats.get("reference_palette", []),
             hair=rd("hair"),
+            eyes=rd("eyes"),
             skin=rd("skin"),
             sky=rd("sky"),
             foliage=rd("foliage"),
@@ -352,6 +426,8 @@ class StyleAnalyzer:
             fire=rd("fire"),
             stone=rd("stone"),
             wood=rd("wood"),
+            region_samples={key: int(stats.get("count", 0))
+                            for key, stats in per_region.items()},
             saturation=global_stats.get("saturation", 0.85),
             contrast=global_stats.get("contrast", 0.75),
             temperature=global_stats.get("temperature", "neutral"),

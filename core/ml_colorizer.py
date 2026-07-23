@@ -38,110 +38,10 @@ from core.lineart_fill import clip_stamp_to_region
 def build_hint_arrays(h: int, w: int, size: int,
                       hint_points, label_map=None,
                       page_gray=None) -> tuple[np.ndarray, np.ndarray]:
-    """Rasterize normalized hint points into mc-v2's hint + mask planes.
-
-    Replicates ``resize_pad``'s geometry (resize then pad to /32) so the
-    hint image lines up pixel-for-pixel with the model input. Points are
-    (x_norm, y_norm, (r, g, b), radius_norm).
-
-    `label_map`, if given, is a connected-component region-id array at
-    the ORIGINAL page's (h, w) resolution (see
-    ``core.lineart_fill.label_regions``). When present, each hint's stamp
-    is clipped to the *shape* of the region it's centered in (circle ∩
-    region), not just radius-shrunk toward the nearest line — a thin
-    sliver of hair keeps a thin sliver, it doesn't become a smaller
-    circle that still pokes out both sides.
-    """
-    if h < w:  # landscape — resize_pad fixes height at size*1.5, pads width
-        ratio = h / (size * 1.5)
-        rh = int(size * 1.5)
-        rw = int(np.ceil(w / ratio))
-        ph, pw = rh, rw + ((-rw) % 32)
-    else:      # portrait — fixes width at size, pads height
-        ratio = w / size
-        rw = size
-        rh = int(np.ceil(h / ratio))
-        ph, pw = rh + ((-rh) % 32), rw
-
-    # Background MUST be mid-gray: update_hint normalizes with
-    # (x/255 - 0.5) / 0.5, and the model's trained "no hint here" value is
-    # 0 in that space (= 128 raw). A zero background normalizes to -1 —
-    # a page-wide black hint — which collapses the output to grayscale.
-    hint = np.full((ph, pw, 3), 128, dtype=np.uint8)
-    mask = np.zeros((ph, pw), dtype=np.uint8)
-    min_radius_px = 3  # floor so a hint never disappears entirely at small sizes
-
-    resized_labels = None
-    if page_gray is not None:
-        # Recompute regions AT MODEL RESOLUTION from an area-resized gray:
-        # nearest-neighbor downscaling of a full-res label map erases thin
-        # ink lines, silently merging adjacent regions — the main reason
-        # brush hints used to leak across lines.  INTER_AREA keeps lines.
-        from core.lineart_fill import label_regions
-        small_gray = cv2.resize(page_gray, (rw, rh), interpolation=cv2.INTER_AREA)
-        resized_labels = label_regions(small_gray)
-    elif label_map is not None:
-        resized_labels = cv2.resize(label_map.astype(np.int32), (rw, rh),
-                                    interpolation=cv2.INTER_NEAREST)
-
-    for point in hint_points:
-        if len(point) == 4:
-            xn, yn, (r, g, b), radius_norm = point
-        else:  # legacy 3-tuple support
-            xn, yn, (r, g, b) = point
-            radius_norm = 0.006
-        px = min(rw - 1, max(0, int(xn * rw)))
-        py = min(rh - 1, max(0, int(yn * rh)))
-        # radius_norm is a fraction of image width — scale into this
-        # function's model-resolution working width (rw), NOT a fixed
-        # constant, so a big on-screen brush actually stays big here.
-        radius = max(min_radius_px, int(round(radius_norm * rw)))
-
-        stamped = False
-        if resized_labels is not None:
-            cpx, cpy = px, py
-            if resized_labels[cpy, cpx] == 0:
-                # Center landed on an ink line — re-center on the nearest
-                # non-ink pixel within the brush radius instead of falling
-                # back to a line-crossing full circle.
-                y1s, y2s = max(0, cpy - radius), min(rh, cpy + radius + 1)
-                x1s, x2s = max(0, cpx - radius), min(rw, cpx + radius + 1)
-                win = resized_labels[y1s:y2s, x1s:x2s]
-                ys, xs = np.nonzero(win > 0)
-                if ys.size:
-                    d2 = (ys - (cpy - y1s)) ** 2 + (xs - (cpx - x1s)) ** 2
-                    k = int(np.argmin(d2))
-                    cpy, cpx = y1s + int(ys[k]), x1s + int(xs[k])
-            clipped = clip_stamp_to_region(resized_labels, cpx, cpy, radius)
-            if clipped is not None:
-                stamp, x1, y1 = clipped
-                # Pull the stamp a couple of pixels back from the region
-                # boundary so the hint mass sits INSIDE the region — mc-v2
-                # diffuses hints outward, and a hint touching the line was
-                # bleeding color into the neighboring region.
-                margin = max(1, radius // 5)
-                kern = np.ones((2 * margin + 1, 2 * margin + 1), np.uint8)
-                eroded = cv2.erode(stamp, kern)
-                if eroded.any():
-                    stamp = eroded
-                sh, sw = stamp.shape
-                region = stamp > 0
-                hint[y1:y1 + sh, x1:x1 + sw][region] = (int(r), int(g), int(b))
-                mask[y1:y1 + sh, x1:x1 + sw][region] = 255
-                stamped = True
-            else:
-                # Fully surrounded by ink even after re-centering: place a
-                # minimal dot rather than a big line-crossing circle.
-                cv2.circle(hint, (px, py), min_radius_px, (int(r), int(g), int(b)), -1)
-                cv2.circle(mask, (px, py), min_radius_px, 255, -1)
-                stamped = True
-
-        if not stamped:
-            # No region info at all (panel/tiled paths) — plain circle.
-            cv2.circle(hint, (px, py), radius, (int(r), int(g), int(b)), -1)
-            cv2.circle(mask, (px, py), radius, 255, -1)
-
-    return hint, mask
+    """Rasterize legacy points or v4 HintSpecs using soft source-aware masks."""
+    from core.hint_rasterizer import rasterize_hint_specs
+    return rasterize_hint_specs(
+        h, w, size, hint_points, label_map=label_map, page_gray=page_gray)
 
 
 class MangaColorizer:
@@ -324,12 +224,9 @@ class MangaColorizer:
         deherron : bool
             If True, soften screentones before the model sees the page.
         label_map : np.ndarray, optional
-            Connected-component region-id array (see
-            ``core.lineart_fill.label_regions``) at this image's original
-            resolution. When given, hint dots are clipped to the shape of
-            the region they're centered in instead of just their radius —
-            stops a brush/auto hint from bleeding across a line. Only
-            used by the simple (non-tiled, non-per-panel) path.
+            Connected-component region-id array at the page resolution.
+            Simple, panel and tiled paths all preserve/remap hints; local
+            crops rebuild their region map from area-resized line art.
         """
         # Ensure 3 channels (mc-v2 expects RGB)
         if image.ndim == 2:
@@ -366,10 +263,10 @@ class MangaColorizer:
             )
 
         if tiled:
-            # Tiled path doesn't support hints yet (tile-local remap TBD)
             return self._colorize_tiled(
                 image, denoise_sigma=denoise_sigma,
                 tile_size=tile_size, overlap=tile_overlap,
+                hint_points=hint_points,
             )
 
         return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
@@ -405,29 +302,34 @@ class MangaColorizer:
     # ── Per-panel path ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _hints_for_panel(hint_points, panel, page_w: int, page_h: int):
-        """Remap page-normalized hint points into panel-normalized coords."""
-        if not hint_points:
+    def _hints_for_crop(hint_points, crop_x: int, crop_y: int,
+                        crop_w: int, crop_h: int,
+                        page_w: int, page_h: int,
+                        *, canvas_w: int | None = None,
+                        canvas_h: int | None = None):
+        """Remap page-normalized structured or legacy hints into a crop."""
+        if not hint_points or crop_w <= 0 or crop_h <= 0:
             return None
+        from core.hint_spec import HintSpec
+        canvas_w = int(canvas_w or crop_w)
+        canvas_h = int(canvas_h or crop_h)
         remapped = []
         for point in hint_points:
-            if len(point) == 4:
-                xn, yn, rgb, radius_norm = point
-            else:
-                xn, yn, rgb = point
-                radius_norm = 0.006
-            px = xn * page_w
-            py = yn * page_h
-            if (panel.x <= px < panel.x + panel.width
-                    and panel.y <= py < panel.y + panel.height):
-                # radius was a fraction of the FULL page width — rescale to
-                # a fraction of this panel's (smaller) width so it still
-                # covers the same real-world area after the crop.
-                panel_radius_norm = radius_norm * page_w / panel.width
-                remapped.append(((px - panel.x) / panel.width,
-                                 (py - panel.y) / panel.height, rgb,
-                                 panel_radius_norm))
+            is_spec = isinstance(point, HintSpec)
+            spec = HintSpec.from_any(point)
+            local = spec.remap_to_crop(
+                crop_x, crop_y, crop_w, crop_h, page_w, page_h,
+                canvas_w=canvas_w, canvas_h=canvas_h)
+            if local is None:
+                continue
+            remapped.append(local if is_spec else local.as_legacy_point())
         return remapped or None
+
+    @classmethod
+    def _hints_for_panel(cls, hint_points, panel, page_w: int, page_h: int):
+        return cls._hints_for_crop(
+            hint_points, panel.x, panel.y, panel.width, panel.height,
+            page_w, page_h)
 
     def _colorize_per_panel(self, image: np.ndarray, *,
                             size: int, denoise_sigma: int,
@@ -444,8 +346,10 @@ class MangaColorizer:
         # If detection found nothing useful, fall back to tiled or simple
         if not panels or len(panels) <= 1:
             if tiled:
-                return self._colorize_tiled(image, denoise_sigma=denoise_sigma,
-                                            tile_size=tile_size, overlap=tile_overlap)
+                return self._colorize_tiled(
+                    image, denoise_sigma=denoise_sigma,
+                    tile_size=tile_size, overlap=tile_overlap,
+                    hint_points=hint_points)
             return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
                                          hint_points=hint_points)
 
@@ -465,6 +369,7 @@ class MangaColorizer:
                 colored = self._colorize_tiled(
                     crop, denoise_sigma=denoise_sigma,
                     tile_size=tile_size, overlap=tile_overlap,
+                    hint_points=panel_hints,
                 )
             else:
                 colored = self._colorize_simple(
@@ -501,7 +406,8 @@ class MangaColorizer:
     def _colorize_tiled(self, image: np.ndarray, *,
                         denoise_sigma: int,
                         tile_size: int = 768,
-                        overlap: int = 96) -> np.ndarray:
+                        overlap: int = 96,
+                        hint_points=None) -> np.ndarray:
         """Colorize at native resolution by tiling.
 
         Each tile is fed to mc-v2 at exactly *tile_size* (the model's
@@ -517,7 +423,20 @@ class MangaColorizer:
 
         # If the page already fits in one tile, just run the simple path
         if h <= tile_size and w <= tile_size:
-            return self._colorize_simple(image, size=tile_size, denoise_sigma=denoise_sigma)
+            return self._colorize_simple(
+                image, size=tile_size, denoise_sigma=denoise_sigma,
+                hint_points=hint_points)
+
+        # Whole-page low-resolution color prior.  It provides consistent hue
+        # context to every high-resolution tile without replacing tile linework.
+        global_prior = None
+        try:
+            prior_size = min(512, tile_size)
+            global_prior = self._colorize_simple(
+                image, size=prior_size, denoise_sigma=denoise_sigma,
+                hint_points=hint_points)
+        except Exception as exc:
+            print(f"[ml_colorizer] global prior unavailable: {exc}")
 
         # Stride: how far we move each step
         stride = tile_size - overlap
@@ -549,16 +468,29 @@ class MangaColorizer:
                     tile_bgr = cv2.copyMakeBorder(tile_bgr, 0, ph, 0, pw,
                                                   cv2.BORDER_REFLECT)
 
+                use_h = tile_size - ph
+                use_w = tile_size - pw
+                tile_hints = self._hints_for_crop(
+                    hint_points, x, y, use_w, use_h, w, h,
+                    canvas_w=tile_size, canvas_h=tile_size)
                 tile_rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
+                tile_gray = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2GRAY) \
+                    if tile_hints else None
                 with self._lock:
-                    out = self._safe_colorize(tile_rgb, tile_size, denoise_sigma)
+                    out = self._safe_colorize(
+                        tile_rgb, tile_size, denoise_sigma,
+                        hint_points=tile_hints, page_gray=tile_gray)
                 out_u8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
                 out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_RGB2BGR)
 
                 # Crop padding
-                use_h = tile_size - ph
-                use_w = tile_size - pw
                 out_bgr = out_bgr[:use_h, :use_w]
+                if global_prior is not None:
+                    prior_crop = global_prior[y:y + use_h, x:x + use_w]
+                    source_crop = image[y:y + use_h, x:x + use_w]
+                    if prior_crop.shape[:2] == out_bgr.shape[:2]:
+                        out_bgr = self._blend_chroma_prior(
+                            out_bgr, prior_crop, source_crop, strength=0.26)
                 tile_alpha = feather[:use_h, :use_w]
 
                 accum[y:y + use_h, x:x + use_w] += out_bgr.astype(np.float32) * tile_alpha
@@ -566,6 +498,32 @@ class MangaColorizer:
 
         weight = np.maximum(weight, 1e-6)
         return np.clip(accum / weight, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _blend_chroma_prior(tile_bgr: np.ndarray, prior_bgr: np.ndarray,
+                            source_bgr: np.ndarray, strength: float = 0.26) -> np.ndarray:
+        """Blend only LAB chroma from a whole-page prior into a tile.
+
+        Tile luminance and high-resolution line detail remain untouched.  Paper
+        and ink are protected using the original monochrome source.
+        """
+        strength = float(np.clip(strength, 0.0, 0.5))
+        if strength <= 0.0:
+            return tile_bgr
+        tile_lab = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        prior_lab = cv2.cvtColor(prior_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        gray = (cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY)
+                if source_bgr.ndim == 3 else source_bgr)
+        from core.masks import combined_neutral_mask
+        keep = combined_neutral_mask(gray, line_dilate=1, blur=3).astype(np.float32)
+        tile_chroma = np.linalg.norm(tile_lab[..., 1:3] - 128.0, axis=2)
+        # Low-chroma drift benefits most from the prior; already decisive local
+        # colours retain more of the tile model's choice.
+        gate = strength * keep * np.clip(1.15 - tile_chroma / 80.0, 0.35, 1.0)
+        tile_lab[..., 1:3] = (
+            tile_lab[..., 1:3] * (1.0 - gate[..., None]) +
+            prior_lab[..., 1:3] * gate[..., None])
+        return cv2.cvtColor(np.clip(tile_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
     @staticmethod
     def _tile_feather(h: int, w: int, overlap: int) -> np.ndarray:

@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "page_001",
+      "source": "bw_pages/page_001.png",
+      "result": "results/page_001.png",
+      "diagnostics": "results/page_001.diagnostics.json",
+      "samples": [
+        {
+          "character": "character_a",
+          "attribute": "hair",
+          "points": [[0.31, 0.24], [0.34, 0.27]],
+          "radius": 4
+        },
+        {
+          "character": "character_b",
+          "attribute": "hair",
+          "points": [[0.73, 0.22]],
+          "radius": 4
+        }
+      ]
+    }
+  ]
+}

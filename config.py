@@ -19,7 +19,7 @@ class Config:
 
     # Auto color-hint generation (GuidedColorist). False = plain mc-v2
     # auto-colorize with no CLIP-driven palette hints.
-    USE_GUIDED_HINTS = True
+    USE_GUIDED_HINTS = False
 
     # core/presets.py — pick with pipeline.colorize_page(style_key=...,
     # quality_key=...). A caller-supplied StyleProfile (see

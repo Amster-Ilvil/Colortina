@@ -27,7 +27,7 @@ from core.presets import StylePreset
 from core.style_descriptor import StyleDescriptor
 from core.style_analyzer import StyleAnalyzer
 
-_CCSTYLE_VERSION = 2
+_CCSTYLE_VERSION = 3
 
 
 # ── Legacy StyleProfile (kept for backwards compat) ───────────────────────────
@@ -73,6 +73,14 @@ class StyleProfile:
     def load(cls, path: str) -> "StyleProfile":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # External v2 files used to be silently truncated to the legacy scalar
+        # fields here.  Detect the full descriptor and retain every per-region
+        # shadow/highlight parameter.
+        if data.get("version", 1) >= 2 and "global_warm_cool" in data:
+            desc = StyleDescriptor._from_dict(data)
+            profile = _descriptor_to_profile(desc)
+            profile._descriptor = desc
+            return profile
         known = {k: v for k, v in data.items()
                  if k in cls.__dataclass_fields__ and k != "_descriptor"}
         return cls(**known)

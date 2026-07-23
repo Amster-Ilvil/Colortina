@@ -49,6 +49,23 @@ class StylePreset:
     # light hair) always keep at least this fraction of their chroma.  Only
     # the hard masks (bubbles / gutters / ink) may force true zero.
     neutral_fade_floor: float = 0.35
+    # Semantic chroma policy used by monochrome pastel modes.
+    semantic_mode: str = "all"
+    person_chroma_scale: float = 1.0
+    skin_chroma_scale: float = 1.0
+    hair_chroma_scale: float = 1.0
+    eye_chroma_scale: float = 1.0
+    clothing_chroma_scale: float = 1.0
+    environment_chroma_scale: float = 1.0
+    unknown_chroma_scale: float = 1.0
+    # Monochrome-pastel skin hue guard.  Pull low-chroma skin toward a warm
+    # ivory base while preserving high-chroma blush/lips.
+    skin_neutralize: float = 0.0
+    skin_target_a: float = 1.0   # centred OpenCV LAB a (0 = neutral)
+    skin_target_b: float = 9.0   # centred OpenCV LAB b (+ = warm/yellow)
+    # When true, all pixels outside the detected person mask are restored to
+    # the original page grayscale after grading. Used by character-only pastel.
+    force_environment_grayscale: bool = False
 
 
 STYLE_PRESETS: dict[str, StylePreset] = {
@@ -77,6 +94,100 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         cel_flatten=0.0,
         neutral_fade_floor=0.12,
         denoise_sigma=20,
+        diffusion_steps=16,
+    ),
+    "light2": StylePreset(
+        key="light2",
+        label="淡彩水墨2（参考风格）",
+        description=("Bundled reference style extracted from 10 color pages. "
+                     "Keeps a soft watercolor palette with stronger visible color "
+                     "than black-and-white pastel."),
+        saturation_boost=0.85,
+        white_threshold=221,
+        black_threshold=24,
+        neutral_transition=28,
+        l_blend_alpha=0.08,
+        l_gamma=1.02,
+        guided_filter_radius=3,
+        guided_filter_eps=0.025,
+        chroma_warm_shift=0.76,
+        cel_flatten=0.047,
+        neutral_fade_floor=0.45,
+        denoise_sigma=15,
+        diffusion_steps=16,
+    ),
+    "monochrome": StylePreset(
+        key="monochrome",
+        label="黑白淡彩（统一）",
+        description=("Unified monochrome pastel mode. Character colour, scene tint, "
+                     "highlight retention, warmth and flattening can be tuned in detail "
+                     "without switching between separate people/full-page presets."),
+        saturation_boost=1.05,
+        l_blend_alpha=0.0,
+        l_gamma=1.0,
+        cel_flatten=0.02,
+        neutral_fade_floor=0.13,
+        semantic_mode="page_pastel",
+        person_chroma_scale=0.36,
+        skin_chroma_scale=0.60,
+        hair_chroma_scale=0.86,
+        eye_chroma_scale=1.00,
+        clothing_chroma_scale=0.64,
+        environment_chroma_scale=0.08,
+        unknown_chroma_scale=0.04,
+        skin_neutralize=0.62,
+        skin_target_a=2.0,
+        skin_target_b=8.7,
+        denoise_sigma=12,
+        diffusion_steps=16,
+    ),
+    "monochrome_people": StylePreset(
+        key="monochrome_people",
+        label="黑白淡彩·人物 (人物轻着色)",
+        description=("Preserve original manga luminance; keep visibly coloured skin, "
+                     "hair, eyes and clothing while the environment stays almost monochrome."),
+        saturation_boost=1.06,
+        l_blend_alpha=0.0,
+        l_gamma=1.0,
+        cel_flatten=0.0,
+        neutral_fade_floor=0.10,
+        semantic_mode="people_pastel",
+        person_chroma_scale=0.34,
+        skin_chroma_scale=0.58,
+        hair_chroma_scale=0.84,
+        eye_chroma_scale=1.00,
+        clothing_chroma_scale=0.62,
+        environment_chroma_scale=0.0,
+        unknown_chroma_scale=0.0,
+        skin_neutralize=0.62,
+        skin_target_a=2.0,
+        skin_target_b=9.0,
+        force_environment_grayscale=True,
+        denoise_sigma=12,
+        diffusion_steps=16,
+    ),
+    "monochrome_page": StylePreset(
+        key="monochrome_page",
+        label="黑白淡彩·全页 (环境微着色)",
+        description=("Characters receive clear but restrained colour and the environment keeps "
+                     "a faint atmosphere over the black-and-white page."),
+        saturation_boost=1.04,
+        l_blend_alpha=0.0,
+        l_gamma=1.0,
+        cel_flatten=0.0,
+        neutral_fade_floor=0.11,
+        semantic_mode="page_pastel",
+        person_chroma_scale=0.38,
+        skin_chroma_scale=0.62,
+        hair_chroma_scale=0.88,
+        eye_chroma_scale=1.00,
+        clothing_chroma_scale=0.66,
+        environment_chroma_scale=0.13,
+        unknown_chroma_scale=0.08,
+        skin_neutralize=0.62,
+        skin_target_a=2.0,
+        skin_target_b=8.5,
+        denoise_sigma=12,
         diffusion_steps=16,
     ),
 }
@@ -123,8 +234,8 @@ class QualityPreset:
 QUALITY_PRESETS: dict[str, QualityPreset] = {
     "draft": QualityPreset(
         key="draft",
-        label="Draft",
-        description="Fast preview — lower internal resolution, JPEG output.",
+        label="Fast",
+        description="Fastest mode — low internal resolution, no tiling, no per-panel pass.",
         model_size=576,
         tiled_inference=False,
         per_panel=False,
@@ -134,45 +245,12 @@ QUALITY_PRESETS: dict[str, QualityPreset] = {
         jpeg_quality=85,
         seconds_per_page_estimate=2.0,
     ),
-    "standard": QualityPreset(
-        key="standard",
-        label="Standard",
-        description="Balanced — 768 internal, full post-processing.",
-        model_size=768,
-        tiled_inference=False,
-        per_panel=True,
-        diffusion_step_mult=1.0,
-        use_upscale=False,
-        output_format="jpg",
-        jpeg_quality=95,
-        seconds_per_page_estimate=5.0,
-    ),
-    "ultra": QualityPreset(
-        key="ultra",
-        label="Ultra",
-        description="Tiled native resolution + per-panel + 4x upscale + refine pass.",
-        model_size=768,
-        tiled_inference=True,
-        tile_size=768,
-        tile_overlap=128,
-        per_panel=True,
-        diffusion_step_mult=1.3,
-        use_upscale=True,
-        # JPEG q95 4:4:4 — lossless PNG of continuous-tone colorized art is
-        # 100-400 MB/page after 4x upscale and buys nothing visually
-        output_format="jpg",
-        jpeg_quality=95,
-        refine_pass=True,
-        seconds_per_page_estimate=30.0,
-    ),
 }
 
 
 def get_quality(key: Optional[str]) -> QualityPreset:
-    """Return a quality preset by key, falling back to standard."""
-    if not key:
-        return QUALITY_PRESETS["standard"]
-    return QUALITY_PRESETS.get(key.lower(), QUALITY_PRESETS["standard"])
+    """Return the only supported quality preset: the fastest draft mode."""
+    return QUALITY_PRESETS["draft"]
 
 
 def all_styles_json() -> list[dict]:

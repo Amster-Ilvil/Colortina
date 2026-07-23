@@ -1,108 +1,134 @@
-"""Download manga-colorization-v2 model weights if not present."""
+"""Download and validate optional model weights.
+
+The downloader is intentionally strict: a failed Google Drive request must not
+be reported as success, because that leaves the UI waiting on a model file that
+does not exist and makes Auto Colorize appear unresponsive.
+"""
+
+from __future__ import annotations
 
 import os
+import zipfile
 
-import gdown
 
 
-# Google Drive file IDs for the model weights
 _GENERATOR_ID = "1qmxUEKADkEM4iYLp1fpPLLKnfZ6tcF-t"
 _DENOISER_ID = "161oyQcYpdkVdw8gKz_MA8RD-Wtg9XDp3"
 
 
-def _gdrive_download(file_id: str, dest: str, label: str, callback=None):
-    """Download a file from Google Drive by *file_id* to *dest*."""
-    if os.path.exists(dest):
-        return
+class ModelDownloadError(RuntimeError):
+    """Raised when a required weight download is missing or incomplete."""
 
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-
-    if callback:
-        callback(f"Downloading {label}...")
-
-    url = f"https://drive.google.com/uc?id={file_id}"
-    gdown.download(url, dest, quiet=False)
-
-    if callback:
-        callback(f"Downloaded {label}")
+def _download_via_gdown(url: str, dest: str):
+    try:
+        import gdown
+    except ImportError as exc:
+        raise ModelDownloadError(
+            "缺少 gdown 依赖，请先执行 pip install -r requirements.txt") from exc
+    return gdown.download(url, dest, quiet=False, resume=True)
 
 
-def ensure_models_downloaded(weights_dir: str, callback=None):
-    """Download all required model weights into *weights_dir*.
-
-    Directory layout after download::
-
-        weights_dir/
-            generator.zip          (main colorizer generator — also used by torch.load)
-            extractor.pth          (SEResNeXt feature extractor — extracted from generator.zip if bundled)
-            denoiser/
-                net_rgb.pth        (FFDNet denoiser)
-
-    Parameters
-    ----------
-    weights_dir : str
-        Path to the directory where weights will be stored.
-    callback : callable, optional
-        ``callback(message: str)`` called with status strings.
-    """
-    os.makedirs(weights_dir, exist_ok=True)
-
+def model_paths(weights_dir: str) -> tuple[str, str, str, str]:
     generator_path = os.path.join(weights_dir, "generator.zip")
     extractor_path = os.path.join(weights_dir, "extractor.pth")
     denoiser_dir = os.path.join(weights_dir, "denoiser")
     denoiser_path = os.path.join(denoiser_dir, "net_rgb.pth")
+    return generator_path, extractor_path, denoiser_dir, denoiser_path
 
-    _gdrive_download(_GENERATOR_ID, generator_path, "generator weights (~400 MB)", callback)
 
-    # The extractor weights may be bundled inside generator.zip.
-    # If not available as a separate file, try to extract from the zip.
-    if not os.path.exists(extractor_path):
-        import zipfile
+def models_ready(weights_dir: str) -> bool:
+    """Return True when the hard-required mc-v2 files are present."""
+    generator_path, _extractor_path, _denoiser_dir, denoiser_path = model_paths(weights_dir)
+    return (_valid_file(generator_path, min_bytes=1024 * 1024)
+            and _valid_file(denoiser_path, min_bytes=64 * 1024))
 
+
+def _valid_file(path: str, min_bytes: int = 1) -> bool:
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) >= min_bytes
+    except OSError:
+        return False
+
+
+def _gdrive_download(file_id: str, dest: str, label: str, callback=None,
+                     min_bytes: int = 1):
+    if _valid_file(dest, min_bytes=min_bytes):
+        if callback:
+            callback(f"已找到 {label}")
+        return dest
+
+    # Delete zero-byte/HTML/error remnants before retrying.
+    try:
+        if os.path.exists(dest):
+            os.remove(dest)
+    except OSError:
+        pass
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if callback:
+        callback(f"首次运行：正在下载 {label}，请保持网络连接...")
+
+    url = f"https://drive.google.com/uc?id={file_id}"
+    result = _download_via_gdown(url, dest)
+    if not result or not _valid_file(dest, min_bytes=min_bytes):
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        raise ModelDownloadError(
+            f"{label} 下载失败或文件不完整。请检查网络后重试，目标位置：{dest}")
+
+    if callback:
+        callback(f"{label} 下载完成")
+    return dest
+
+
+def ensure_models_downloaded(weights_dir: str, callback=None):
+    """Download all required mc-v2 weights into ``weights_dir``."""
+    os.makedirs(weights_dir, exist_ok=True)
+    generator_path, extractor_path, denoiser_dir, denoiser_path = model_paths(weights_dir)
+
+    _gdrive_download(
+        _GENERATOR_ID, generator_path, "generator 权重（约 400 MB）",
+        callback, min_bytes=1024 * 1024)
+
+    if not _valid_file(extractor_path, min_bytes=64 * 1024):
+        # torch.save files are zip containers too; only extract when an actual
+        # extractor member exists. The generator itself may already contain the
+        # encoder weights, so extractor.pth remains optional.
         if zipfile.is_zipfile(generator_path):
-            if callback:
-                callback("Extracting extractor weights from generator.zip...")
-            with zipfile.ZipFile(generator_path, "r") as zf:
-                names = zf.namelist()
-                # Look for extractor.pth inside the zip
-                extractor_names = [n for n in names if "extractor" in n.lower()]
-                if extractor_names:
-                    with zf.open(extractor_names[0]) as src, open(extractor_path, "wb") as dst:
-                        dst.write(src.read())
-                    if callback:
-                        callback("Extracted extractor weights")
+            try:
+                with zipfile.ZipFile(generator_path, "r") as zf:
+                    names = [n for n in zf.namelist() if "extractor" in n.lower()]
+                    if names:
+                        if callback:
+                            callback("正在提取 extractor 权重...")
+                        with zf.open(names[0]) as src, open(extractor_path, "wb") as dst:
+                            dst.write(src.read())
+            except (OSError, zipfile.BadZipFile):
+                pass
 
-    # If still missing, the generator.zip is actually a torch state_dict
-    # (PyTorch uses .zip extension for its save format). In this case,
-    # the extractor weights may need to be downloaded separately or the
-    # generator state_dict contains the encoder weights already.
-    # We'll let the model loading handle it — the SEResNeXt encoder is
-    # initialized inside the Generator and its weights are part of
-    # generator.zip's state_dict.
+    _gdrive_download(
+        _DENOISER_ID, denoiser_path, "denoiser 权重（约 7 MB）",
+        callback, min_bytes=64 * 1024)
 
-    _gdrive_download(_DENOISER_ID, denoiser_path, "denoiser weights (~7 MB)", callback)
-
+    if callback:
+        callback("mc-v2 模型文件准备完成")
     return generator_path, extractor_path, denoiser_dir
 
 
 def ensure_manganinja_downloaded(config, callback=None):
-    """Download MangaNinja weights from HuggingFace if not present.
-
-    Downloads 4 ``.pth`` files from the ``Johanan0528/MangaNinja`` repo
-    into *config.MANGANINJA_WEIGHTS_DIR*.
-    """
     from huggingface_hub import hf_hub_download
 
     weights_dir = config.MANGANINJA_WEIGHTS_DIR
     os.makedirs(weights_dir, exist_ok=True)
-
     files = [
         ("denoising_unet.pth", config.MANGANINJA_DENOISING_UNET),
         ("reference_unet.pth", config.MANGANINJA_REFERENCE_UNET),
         ("point_net.pth", config.MANGANINJA_POINTNET),
         ("controlnet.pth", config.MANGANINJA_CONTROLNET),
     ]
-
     for fname, dest_path in files:
         if os.path.exists(dest_path):
             continue
@@ -113,7 +139,6 @@ def ensure_manganinja_downloaded(config, callback=None):
             filename=fname,
             local_dir=weights_dir,
         )
-        # hf_hub_download may place in a sub-path; move if needed
         if downloaded != dest_path and os.path.exists(downloaded):
             import shutil
             shutil.move(downloaded, dest_path)
@@ -122,17 +147,13 @@ def ensure_manganinja_downloaded(config, callback=None):
 
 
 def ensure_esrgan_downloaded(config, callback=None):
-    """Download Real-ESRGAN anime weights if not present."""
     dest = config.ESRGAN_MODEL_PATH
     if os.path.exists(dest):
         return
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-
     if callback:
         callback("Downloading Real-ESRGAN weights (~17 MB)...")
-
     import urllib.request
     urllib.request.urlretrieve(config.ESRGAN_MODEL_URL, dest)
-
     if callback:
         callback("Downloaded Real-ESRGAN weights")

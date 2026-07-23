@@ -11,6 +11,7 @@ access, no external APIs.
 DEFAULT_PALETTE: dict[str, str] = {
     "skin":               "#f0c8a0",
     "hair":               "#6b4a32",
+    "eyes":               "#4f7397",
     "clothing_primary":   "#5b7fa6",
     "clothing_secondary": "#a65e50",
     "clothing_accent":    "#c9a227",
