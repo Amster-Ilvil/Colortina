@@ -27,12 +27,13 @@ class TestV60ManualToolsAndUi(unittest.TestCase):
         i18n = (ROOT / 'ui' / 'i18n.py').read_text(encoding='utf-8')
         self.assertIn('调大 = 自动补更长的断线，区域更容易被封住，因此选择范围更小', i18n)
 
-    def test_light_wash_restored_to_colored_version(self):
-        style = get_style('light')
+    def test_light_wash_name_cleanup_keeps_colored_builtin_style(self):
+        style = get_style('light2')
         self.assertGreaterEqual(style.saturation_boost, 0.40)
         self.assertGreaterEqual(style.l_gamma, 0.88)
         self.assertLessEqual(style.guided_filter_radius, 4)
-        self.assertLessEqual(style.neutral_fade_floor, 0.12)
+        self.assertGreaterEqual(style.neutral_fade_floor, 0.30)
+        self.assertLessEqual(style.neutral_fade_floor, 0.60)
 
     def test_i18n_contains_picker_hint(self):
         i18n = (ROOT / 'ui' / 'i18n.py').read_text(encoding='utf-8')

@@ -80,6 +80,22 @@ class HintCanvas(QGraphicsView):
         if fit:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
+    def update_image_pixels(self, image_bgr: np.ndarray) -> None:
+        """Refresh only the displayed pixels without rebuilding the scene.
+
+        Brush edits use this during a stroke so the recolor is visible
+        immediately. Keeping the scene intact avoids losing mouse capture or
+        temporary overlays while dragging.
+        """
+        if image_bgr is None:
+            return
+        h, w = image_bgr.shape[:2]
+        if self._pixmap_item is None or (w, h) != (self._image_w, self._image_h):
+            self.set_image(image_bgr, fit=False)
+            return
+        self._current_bgr = image_bgr
+        self._pixmap_item.setPixmap(bgr_to_qpixmap(image_bgr))
+
     def clear_dabs(self) -> None:
         """Remove the visual brush-dab overlay (call after a re-colorize,
         once the new result already reflects those hints)."""
@@ -292,12 +308,19 @@ class HintCanvas(QGraphicsView):
 
         self.hint_dab_added.emit(x_norm, y_norm, color, radius_norm)
 
+    def _event_scene_pos(self, event):
+        try:
+            viewport_pos = event.position().toPoint()
+        except Exception:
+            viewport_pos = event.pos()
+        return self.mapToScene(viewport_pos)
+
     def mousePressEvent(self, event):
         if self._pixmap_item is None:
             return super().mousePressEvent(event)
 
         if event.button() == Qt.MouseButton.LeftButton:
-            pos = self.mapToScene(event.pos())
+            pos = self._event_scene_pos(event)
             ix, iy = int(pos.x()), int(pos.y())
 
             if self._tool == self.TOOL_BRUSH:
@@ -321,7 +344,7 @@ class HintCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         if self._painting and self._tool == self.TOOL_BRUSH:
-            pos = self.mapToScene(event.pos())
+            pos = self._event_scene_pos(event)
             ix, iy = int(pos.x()), int(pos.y())
             if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
                 self._drop_dab(ix, iy)

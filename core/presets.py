@@ -79,29 +79,29 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         denoise_sigma=15,
         diffusion_steps=16,
     ),
-    "light": StylePreset(
-        key="light",
-        label="\u6de1\u5f69\u6c34\u58a8 (Light Wash)",
-        description=("Pale watercolor / ink-wash rendering: chroma pulled "
-                     "well below mc-v2's saturated defaults, lightness "
-                     "lifted, edges soft - colors read as translucent "
-                     "washes over the ink lines rather than solid fills."),
-        saturation_boost=0.42,
+    "light3": StylePreset(
+        key="light3",
+        label="淡彩水墨（极淡）",
+        description=("Very pale variant of 淡彩水墨: keeps the same soft "
+                     "watercolor / ink-wash feel, but pushes the "
+                     "palette noticeably lighter and lower-saturation for an "
+                     "even more delicate wash."),
+        saturation_boost=0.26,
         l_blend_alpha=0.0,
-        l_gamma=0.88,
+        l_gamma=0.90,
         guided_filter_radius=4,
-        guided_filter_eps=0.03,
+        guided_filter_eps=0.032,
         cel_flatten=0.0,
-        neutral_fade_floor=0.12,
+        neutral_fade_floor=0.09,
         denoise_sigma=20,
         diffusion_steps=16,
     ),
     "light2": StylePreset(
         key="light2",
-        label="淡彩水墨2（参考风格）",
-        description=("Bundled reference style extracted from 10 color pages. "
-                     "Keeps a soft watercolor palette with stronger visible color "
-                     "than black-and-white pastel."),
+        label="淡彩水墨",
+        description=("Soft watercolor preset with clearer visible color than the "
+                     "extremely pale variant, while retaining gentle warmth, "
+                     "light gradients and restrained saturation."),
         saturation_boost=0.85,
         white_threshold=221,
         black_threshold=24,
@@ -116,88 +116,22 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         denoise_sigma=15,
         diffusion_steps=16,
     ),
-    "monochrome": StylePreset(
-        key="monochrome",
-        label="黑白淡彩（统一）",
-        description=("Unified monochrome pastel mode. Character colour, scene tint, "
-                     "highlight retention, warmth and flattening can be tuned in detail "
-                     "without switching between separate people/full-page presets."),
-        saturation_boost=1.05,
-        l_blend_alpha=0.0,
-        l_gamma=1.0,
-        cel_flatten=0.02,
-        neutral_fade_floor=0.13,
-        semantic_mode="page_pastel",
-        person_chroma_scale=0.36,
-        skin_chroma_scale=0.60,
-        hair_chroma_scale=0.86,
-        eye_chroma_scale=1.00,
-        clothing_chroma_scale=0.64,
-        environment_chroma_scale=0.08,
-        unknown_chroma_scale=0.04,
-        skin_neutralize=0.62,
-        skin_target_a=2.0,
-        skin_target_b=8.7,
-        denoise_sigma=12,
-        diffusion_steps=16,
-    ),
-    "monochrome_people": StylePreset(
-        key="monochrome_people",
-        label="黑白淡彩·人物 (人物轻着色)",
-        description=("Preserve original manga luminance; keep visibly coloured skin, "
-                     "hair, eyes and clothing while the environment stays almost monochrome."),
-        saturation_boost=1.06,
-        l_blend_alpha=0.0,
-        l_gamma=1.0,
-        cel_flatten=0.0,
-        neutral_fade_floor=0.10,
-        semantic_mode="people_pastel",
-        person_chroma_scale=0.34,
-        skin_chroma_scale=0.58,
-        hair_chroma_scale=0.84,
-        eye_chroma_scale=1.00,
-        clothing_chroma_scale=0.62,
-        environment_chroma_scale=0.0,
-        unknown_chroma_scale=0.0,
-        skin_neutralize=0.62,
-        skin_target_a=2.0,
-        skin_target_b=9.0,
-        force_environment_grayscale=True,
-        denoise_sigma=12,
-        diffusion_steps=16,
-    ),
-    "monochrome_page": StylePreset(
-        key="monochrome_page",
-        label="黑白淡彩·全页 (环境微着色)",
-        description=("Characters receive clear but restrained colour and the environment keeps "
-                     "a faint atmosphere over the black-and-white page."),
-        saturation_boost=1.04,
-        l_blend_alpha=0.0,
-        l_gamma=1.0,
-        cel_flatten=0.0,
-        neutral_fade_floor=0.11,
-        semantic_mode="page_pastel",
-        person_chroma_scale=0.38,
-        skin_chroma_scale=0.62,
-        hair_chroma_scale=0.88,
-        eye_chroma_scale=1.00,
-        clothing_chroma_scale=0.66,
-        environment_chroma_scale=0.13,
-        unknown_chroma_scale=0.08,
-        skin_neutralize=0.62,
-        skin_target_a=2.0,
-        skin_target_b=8.5,
-        denoise_sigma=12,
-        diffusion_steps=16,
-    ),
+
 }
 
 
 def get_style(key: Optional[str]) -> StylePreset:
-    """Return a style preset by key, falling back to neutral."""
+    """Return a style preset by key, falling back to neutral.
+
+    Legacy compatibility: the removed old "light" preset now resolves to
+    the built-in 淡彩水墨 style (light2).
+    """
     if not key:
         return STYLE_PRESETS["none"]
-    return STYLE_PRESETS.get(key.lower(), STYLE_PRESETS["none"])
+    key_norm = key.lower()
+    if key_norm == "light":
+        key_norm = "light2"
+    return STYLE_PRESETS.get(key_norm, STYLE_PRESETS["none"])
 
 
 # ── Quality presets ──────────────────────────────────────────────────────────

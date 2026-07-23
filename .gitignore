@@ -1,9 +1,44 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments / local runtime
+.venv/
+venv/
+runtime/
+
+# OS / editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets and local settings
 .env
+.env.*
+
+# Downloaded models and caches
 models/weights/
 models/*.pth
 models/*.zip
-*.ccstyle
+*.onnx
+
+# User-generated Colortina data
+styles/
+characters/
 outputs/
+*.ccstyle
+*.ccpalette
+*.ccscene
+*.ccproject
+*_assets/
+
+# Generated validation reports
+VALIDATION_EFFECT_CONTROLS.md
+validation.md

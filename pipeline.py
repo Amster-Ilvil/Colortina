@@ -30,6 +30,7 @@ from core.lineart_fill import label_regions
 from core.ml_colorizer import MangaColorizer
 from core.presets import get_quality, get_style
 from core.style_post import apply_style_grade
+from core.image_filter import apply_image_filter
 
 _colorizer: MangaColorizer | None = None
 _guided = None
@@ -319,6 +320,61 @@ def _effective_job_quality(style, quality, *, needs_guided: bool, model_specs: l
     return effective_quality, effective_denoise, optimizations
 
 
+
+
+def _is_default_style_tuning(tuning: dict | None) -> bool:
+    if not tuning:
+        return True
+    # Only controls visibly shared by all styles decide whether original mc-v2
+    # remains untouched. Hidden Light Wash 3 / legacy semantic values must not
+    # accidentally activate original-style grading after a style switch.
+    default_map = {
+        "color_strength": 100,
+        "brightness": 100,
+        "warmth": 100,
+        "highlight_preserve": 100,
+        "softness": 100,
+        "flatten": 100,
+    }
+    for key, default in default_map.items():
+        try:
+            value = int(round(float(tuning.get(key, default))))
+        except Exception:
+            value = default
+        if value != default:
+            return False
+    return True
+
+
+def _adjustable_original_style():
+    """Synthetic baseline for fine-tuning the original mc-v2 output.
+
+    At default slider positions this style is not used; the raw mc-v2 output is
+    returned unchanged. Once the user moves a style-fine-tuning control while
+    the original preset is selected, we grade from this near-neutral baseline
+    so the controls have visible effect without depending on another preset.
+    """
+    from core.presets import StylePreset
+    return StylePreset(
+        key="none_tuned",
+        label="MC v2（细调）",
+        description="Adjustable baseline for original mc-v2 fine tuning.",
+        saturation_boost=1.0,
+        white_threshold=255,
+        black_threshold=0,
+        neutral_transition=64,
+        l_blend_alpha=1.0,
+        guided_filter_radius=2,
+        guided_filter_eps=0.01,
+        chroma_warm_shift=0.0,
+        chroma_red_shift=0.0,
+        l_gamma=1.0,
+        cel_flatten=0.0,
+        neutral_fade_floor=1.0,
+        denoise_sigma=15,
+        diffusion_steps=16,
+    )
+
 def _apply_pastel_tuning(style, tuning: dict | None):
     """Return a tuned copy of a style preset.
 
@@ -329,6 +385,7 @@ def _apply_pastel_tuning(style, tuning: dict | None):
     """
     if not tuning or style is None:
         return style
+    style_key = str(getattr(style, "key", "") or "")
 
     def factor(key: str, default: float = 100.0, lo: float = 0.0, hi: float = 200.0) -> float:
         try:
@@ -350,14 +407,25 @@ def _apply_pastel_tuning(style, tuning: dict | None):
         t = np.clip(value - 1.0, 0.0, 1.0)
         return float(mid * (1.0 - t) + hi * t)
 
-    sat = float(np.clip(style.saturation_boost * interp01(color, 0.24, 1.0, 1.95), 0.08, 2.8))
+    sat = float(np.clip(style.saturation_boost * interp01(color, 0.24, 1.0, 1.95), 0.04, 2.8))
     gamma = float(np.clip(style.l_gamma * interp01(brightness, 1.34, 1.0, 0.72), 0.68, 1.58))
+    # Dedicated continuous strength for the 淡彩水墨3 family.  At 0 the page
+    # is an extremely faint wash; 100 preserves the preset; 200 increases
+    # visible colour while remaining substantially softer than ordinary mc-v2.
+    if str(getattr(style, "key", "")).startswith("light3"):
+        light3_intensity = factor("light3_intensity", 100.0, 0.0, 200.0)
+        sat *= interp01(light3_intensity, 0.18, 1.0, 1.72)
+        gamma *= interp01(light3_intensity, 0.96, 1.0, 1.04)
     warm_shift = float(style.chroma_warm_shift + (interp01(warmth, -1.0, 0.0, 1.0) * 11.0))
     red_shift = float(style.chroma_red_shift + (interp01(warmth, -1.0, 0.0, 1.0) * 2.8))
     radius = int(np.clip(round(max(1.0, float(style.guided_filter_radius)) * interp01(softness, 0.55, 1.0, 1.95)), 1, 11))
     eps = float(np.clip(float(style.guided_filter_eps) * interp01(softness, 0.55, 1.0, 2.15), 0.003, 0.11))
     cel = float(np.clip(float(style.cel_flatten) + interp01(flatten, -0.22, 0.0, 0.58), 0.0, 0.90))
     fade_floor = float(np.clip(float(style.neutral_fade_floor) * interp01(highlight, 0.55, 1.0, 2.25), 0.02, 0.98))
+    if str(getattr(style, "key", "")).startswith("light3"):
+        light3_intensity = factor("light3_intensity", 100.0, 0.0, 200.0)
+        fade_floor *= interp01(light3_intensity, 0.55, 1.0, 1.30)
+        fade_floor = float(np.clip(fade_floor, 0.015, 0.45))
 
     updates = dict(
         saturation_boost=sat,
@@ -409,25 +477,6 @@ def _apply_pastel_tuning(style, tuning: dict | None):
     return replace(style, **updates)
 
 
-def _builtin_reference_profile(style_key: str | None):
-    """Load bundled .ccstyle profiles without any reference-image analysis."""
-    key = str(style_key or "").lower()
-    filenames = {"light2": "淡彩水墨2.ccstyle"}
-    filename = filenames.get(key)
-    if filename is None:
-        return None
-    cached = _builtin_style_profile_cache.get(key)
-    if cached is not None:
-        return cached
-    try:
-        from core.style_engine import StyleProfile
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "styles", filename)
-        profile = StyleProfile.load(path)
-    except Exception:
-        return None
-    _builtin_style_profile_cache[key] = profile
-    return profile
-
 
 def _post_only_context(hint_manager: HintManager, diagnostics: dict):
     """Reuse lightweight post-style state for one page across style switches."""
@@ -446,7 +495,6 @@ def colorize_page(image_bgr: np.ndarray,
                    regenerate_auto: bool = True,
                    style_key: str | None = None,
                    quality_key: str | None = None,
-                   style_profile=None,
                    character_memories: dict | None = None,
                    character_library=None,
                    scene_palette=None,
@@ -454,14 +502,11 @@ def colorize_page(image_bgr: np.ndarray,
                    reference_strength: float = 1.0,
                    manual_strength: float = 1.0,
                    pastel_tuning: dict | None = None,
-                   forced_matches: dict[int, int] | None = None) -> np.ndarray:
+                   filter_tuning: dict | None = None,
+                   forced_matches: dict[int, int] | None = None,
+                   return_filter_base: bool = False):
     """Run the full Auto pipeline on one page.
 
-    `style_profile` may be a legacy StyleProfile OR a new v2 profile that
-    carries a StyleDescriptor — the pipeline handles both.  When a
-    StyleDescriptor is present, GuidedColorist generates layered
-    (hi/mid/shadow) hints per region, making the style actually visible
-    in the model's colorization output rather than only in post-processing.
     """
     if hint_manager is None:
         hint_manager = HintManager()
@@ -470,8 +515,13 @@ def colorize_page(image_bgr: np.ndarray,
     manual_strength = float(np.clip(manual_strength, 0.0, 1.0))
     # Region maps are built lazily only when a model hint actually needs them.
 
-    # "none" — raw mc-v2, no guided hints, no grading
-    is_none_style = style_profile is None and (style_key or "").lower() == "none"
+    style_key_normalized = (style_key or "").lower()
+    original_style_selected = style_key_normalized == "none"
+    default_style_tuning = _is_default_style_tuning(pastel_tuning)
+    # Plain original mc-v2: no style processing at all. If the user changes the
+    # style-fine-tuning sliders while the original preset is selected, we switch
+    # to a synthetic adjustable baseline so the controls can visibly affect the output.
+    is_none_style = original_style_selected and default_style_tuning
 
     # Only enable semantic/identity analysis when it materially changes the
     # result. This keeps ordinary "raw mc-v2" jobs fast, while letting
@@ -479,28 +529,14 @@ def colorize_page(image_bgr: np.ndarray,
     # instructions actually function again.
     has_manual_region = any(getattr(h, 'source', '') == 'manual_region'
                             for h in getattr(hint_manager, 'manual_hints', []) or [])
-    active_style_profile = style_profile or _builtin_reference_profile(style_key)
-    effective_profile = active_style_profile
+    effective_profile = None
     needs_guided = False
-    if effective_profile is None and not is_none_style and (needs_guided or has_manual_region):
+    if not is_none_style and has_manual_region:
         effective_profile = _builtin_style_profile(style_key or "neutral")
 
-    if active_style_profile is not None:
-        descriptor_for_grade = getattr(active_style_profile, "_descriptor", None)
-        if descriptor_for_grade is not None:
-            style = descriptor_for_grade.to_style_preset(key=style_key or None)
-        else:
-            style = active_style_profile.to_style_preset(key=style_key or None)
-    else:
-        style = get_style(style_key)
+    style = _adjustable_original_style() if (original_style_selected and not default_style_tuning) else get_style(style_key)
     style = _apply_pastel_tuning(style, pastel_tuning)
     quality = get_quality(quality_key)
-
-    descriptor = None
-    if effective_profile is not None:
-        descriptor = getattr(effective_profile, "_descriptor", None)
-        if descriptor is None and hasattr(effective_profile, "get_descriptor"):
-            descriptor = effective_profile.get_descriptor()
 
     needs_guided = _need_guided_context(
         style, effective_profile=effective_profile,
@@ -529,6 +565,7 @@ def colorize_page(image_bgr: np.ndarray,
         if regenerate_auto or not hint_manager.auto_hints:
             hint_manager.set_auto_hints([])
 
+    descriptor = getattr(effective_profile, "_descriptor", None) if effective_profile is not None else None
     merged_specs = hint_manager.merge_specs(
         image_bgr=image_bgr, style_descriptor=descriptor,
         style_strength=style_strength, manual_strength=manual_strength)
@@ -611,15 +648,7 @@ def colorize_page(image_bgr: np.ndarray,
     if is_none_style:
         result_bgr = raw_result
     else:
-        # A user-created reference profile may define its own grade. Built-in
-        # descriptors are hint language only; the selected preset controls the
-        # visible final grade and avoids an unnecessary descriptor conversion.
-        desc = descriptor
-        if active_style_profile is not None:
-            grade_preset = (desc.to_style_preset(key=style_key or None)
-                            if desc is not None else active_style_profile.to_style_preset(key=style_key or None))
-        else:
-            grade_preset = style
+        grade_preset = style
         grade_started = time.perf_counter()
         graded = apply_style_grade(raw_result, image_bgr, grade_preset, context=page_context)
         grade_seconds = time.perf_counter() - grade_started
@@ -632,14 +661,6 @@ def colorize_page(image_bgr: np.ndarray,
                 raw_result.astype(np.float32) * (1.0 - style_strength) +
                 graded.astype(np.float32) * style_strength,
                 0, 255).astype(np.uint8)
-
-        # Reference styles must remain visible even when mc-v2 ignores sparse
-        # hints or CLIP cannot semantically label a cover illustration.
-        if active_style_profile is not None and desc is not None and getattr(desc, "reference_lab_mean", None):
-            from core.reference_style import apply_reference_style
-            result_bgr = apply_reference_style(
-                result_bgr, image_bgr, desc, strength=style_strength,
-                context=page_context)
 
     # Hints guide the model; this deterministic lock guarantees identity
     # colours across pages for matched hair, skin, eyes and clothing regions.
@@ -670,6 +691,13 @@ def colorize_page(image_bgr: np.ndarray,
                 opacity=min(0.9, 0.9 * spec.effective_strength),
                 region_map=region_map,
                 gap_close=getattr(region_map, "gap_close", 4) if region_map is not None else 4)
+
+    filter_base_bgr = result_bgr.copy()
+    result_bgr = apply_image_filter(
+        result_bgr, filter_tuning,
+        style_strength=style_strength,
+        is_styled=not is_none_style,
+        source_bw_bgr=image_bgr)
 
     if quality.use_upscale:
         from core.upscaler import upscale
@@ -718,6 +746,8 @@ def colorize_page(image_bgr: np.ndarray,
     })
     hint_manager.last_diagnostics = diagnostics
     hint_manager.last_page_context = page_context
+    if return_filter_base:
+        return result_bgr, filter_base_bgr
     return result_bgr
 
 

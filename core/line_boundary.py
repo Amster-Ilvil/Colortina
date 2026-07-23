@@ -140,6 +140,10 @@ def _repair_short_gaps_native(base_ink: np.ndarray, gray: np.ndarray,
     accepted_count = 0
 
     lengths = list(range(3, max_gap + 2, 2))
+    # max_gap=1 produces an empty range; treat it as the smallest safe
+    # three-pixel morphology kernel instead of indexing an empty list.
+    if not lengths:
+        lengths = [3]
     if lengths[-1] < max_gap + 1:
         lengths.append(max_gap + 1 if (max_gap + 1) % 2 else max_gap)
     for length in sorted(set(max(3, int(v)) for v in lengths)):

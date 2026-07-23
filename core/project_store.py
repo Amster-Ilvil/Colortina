@@ -62,6 +62,7 @@ def save_project(path: str, *, pages: list, style_profile=None,
             "hints": state.hint_manager.to_dict(),
             "ai_result": None,
             "result": None,
+            "filter_base": None,
             "diagnostics": dict(getattr(state, "pipeline_diagnostics", {}) or
                                 getattr(state.hint_manager, "last_diagnostics", {}) or {}),
             "forced_character_matches": {
@@ -80,6 +81,11 @@ def save_project(path: str, *, pages: list, style_profile=None,
             imwrite(os.path.join(asset_dir, name), state.result_bgr)
             record["result"] = os.path.relpath(os.path.join(asset_dir, name),
                                                 os.path.dirname(path))
+        if getattr(state, "filter_base_bgr", None) is not None:
+            name = f"page_{index:04d}_filter_base.png"
+            imwrite(os.path.join(asset_dir, name), state.filter_base_bgr)
+            record["filter_base"] = os.path.relpath(
+                os.path.join(asset_dir, name), os.path.dirname(path))
         if record["diagnostics"]:
             diag_name = f"page_{index:04d}.diagnostics.json"
             diag_path = os.path.join(asset_dir, diag_name)
@@ -117,7 +123,7 @@ def load_project(path: str) -> dict:
     pages = []
     for record in payload.get("pages", []):
         item = dict(record)
-        for key in ("ai_result", "result"):
+        for key in ("ai_result", "result", "filter_base"):
             value = item.get(key)
             if value:
                 item[key] = os.path.abspath(os.path.join(base, value))

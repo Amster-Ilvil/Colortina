@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 
 from core.region_map import RegionMap, build_region_map
+from core.perceptual_recolor import perceptual_target_ab
 
 
 def _target_lab(rgb: tuple[int, int, int]) -> np.ndarray:
@@ -281,16 +282,13 @@ def apply_local_brush_recolor(
     target_ab = np.clip(target_ab, 0.0, 255.0)
 
     active = alpha_local > 0.02
-    if np.any(active):
-        median_ab = np.median(current_ab[active], axis=0).astype(np.float32)
-    else:
-        median_ab = np.array([128.0, 128.0], dtype=np.float32)
-    # Keep only a very small amount of local chroma texture so the applied
-    # result does not drift toward neighbouring colours.
-    desired_ab = target_ab + (current_ab - median_ab) * 0.03
+    desired_ab = perceptual_target_ab(
+        lab, active, target_ab, texture_retention=0.68, chroma_retention=0.88)
     a3 = alpha_local[..., None]
     lab[..., 1:3] = current_ab * (1.0 - a3) + desired_ab * a3
-    l_alpha = np.clip(alpha_local * 0.22, 0.0, 1.0)
+    # Luminance belongs to the AI shading. Only a faint colour-lightness cue is
+    # mixed in so highlights and material texture remain intact.
+    l_alpha = np.clip(alpha_local * 0.07, 0.0, 1.0)
     lab[..., 0] = current_L * (1.0 - l_alpha) + float(target_lab[0]) * l_alpha
     crop_out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     crop[alpha_local > 1e-5] = crop_out[alpha_local > 1e-5]

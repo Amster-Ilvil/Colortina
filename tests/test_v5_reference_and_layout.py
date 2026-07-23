@@ -105,19 +105,19 @@ class V5ReferenceAndLayoutTests(unittest.TestCase):
         self.assertIn("QTabWidget", body)
         self.assertNotIn("QScrollArea", body)
         self.assertNotIn("setVerticalScrollBarPolicy", body)
-        self.assertIn("_btn_manual_character", body)
+        self.assertNotIn("reference_tab, reference_layout", body)
         self.assertIn("right_tab_render", body)
-        self.assertIn("right_tab_reference", body)
+        self.assertNotIn("right_tab_reference", body)
         self.assertIn("right_tab_edit", body)
         self.assertIn("right_tab_output", body)
 
 
-    def test_reference_tab_has_character_diagnostics_panel(self):
+    def test_reference_tab_is_fully_removed(self):
         source = (Path(__file__).resolve().parents[1] /
                   "ui" / "main_window.py").read_text(encoding="utf-8")
-        self.assertIn("character_diagnostics_group", source)
-        self.assertIn("_character_diag_label", source)
-        self.assertIn("_refresh_character_diagnostics", source)
+        self.assertNotIn("reference_tab, reference_layout", source)
+        self.assertNotIn("_nav_reference_btn", source)
+        self.assertNotIn("addTab(reference_tab", source)
 
     def test_responsive_density_has_no_scrollbars(self):
         source = (Path(__file__).resolve().parents[1] /

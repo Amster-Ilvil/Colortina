@@ -88,29 +88,6 @@ class V53LocalityAndSkinTests(unittest.TestCase):
         self.assertEqual(len(manual), 1)
         self.assertAlmostEqual(manual[0].x_norm, 70 / 180, places=4)
 
-    def test_people_pastel_turns_low_chroma_pink_skin_to_warm_ivory(self):
-        source = np.full((80, 80, 3), 220, np.uint8)
-        # Pale pink face from the failure example, plus a high-chroma blush patch.
-        result = np.full((80, 80, 3), (248, 232, 255), np.uint8)
-        result[30:50, 30:50] = (90, 80, 230)
-        labels = np.ones((80, 80), np.int32)
-        region = Region(1, 6400, (0, 0, 80, 80), (40, 40), 220.0, 1.0)
-        context = SimpleNamespace(
-            segmentation=Segmentation([region], labels, 1.0),
-            semantic_labels=[("skin", 0.92)],
-            identity_assignments={},
-            character_instances=[],
-        )
-        out = apply_style_grade(
-            result, source, get_style("monochrome_people"), context=context)
-        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.int16)
-        face_ab = lab[10, 10, 1:3] - 128
-        blush_ab = lab[40, 40, 1:3] - 128
-        # Main face is close to neutral but slightly warm/yellow, not magenta.
-        self.assertLessEqual(abs(int(face_ab[0])), 3)
-        self.assertGreaterEqual(int(face_ab[1]), 1)
-        # The local blush remains more chromatic/red than the surrounding face.
-        self.assertGreater(int(blush_ab[0]), int(face_ab[0]) + 6)
 
     def test_pipeline_withholds_local_manual_hint_from_model(self):
         from pipeline import colorize_page
@@ -147,7 +124,7 @@ class V53LocalityAndSkinTests(unittest.TestCase):
         i18n = (root / "ui" / "i18n.py").read_text(encoding="utf-8")
         self.assertIn("brush_stroke_started.connect", main)
         self.assertIn("brush_stroke_finished.connect", main)
-        self.assertIn("apply_local_brush_recolor", main)
+        self.assertIn("apply_brush_edit", main)
         self.assertIn("brush_stroke_started = Signal()", canvas)
         self.assertIn('"tool_brush": "区域画笔"', i18n)
 

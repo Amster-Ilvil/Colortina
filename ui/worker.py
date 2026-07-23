@@ -28,12 +28,13 @@ class ColorizeWorker(QThread):
     def __init__(self, image_bgr: np.ndarray, hint_manager: HintManager,
                  regenerate_auto: bool, parent=None,
                  style_key: str | None = None, quality_key: str | None = None,
-                 style_profile=None, character_memories: dict | None = None,
+                 character_memories: dict | None = None,
                  character_library=None, scene_palette=None,
                  style_strength: float = 1.0,
                  reference_strength: float = 1.0,
                  manual_strength: float = 1.0,
                  pastel_tuning: dict | None = None,
+                 filter_tuning: dict | None = None,
                  forced_matches: dict[int, int] | None = None):
         super().__init__(parent)
         self._character_library = character_library
@@ -43,12 +44,12 @@ class ColorizeWorker(QThread):
         self._regenerate_auto = regenerate_auto
         self._style_key = style_key
         self._quality_key = "draft"
-        self._style_profile = style_profile
         self._character_memories = character_memories
         self._style_strength = style_strength
         self._reference_strength = reference_strength
         self._manual_strength = manual_strength
         self._pastel_tuning = dict(pastel_tuning or {})
+        self._filter_tuning = dict(filter_tuning or {})
         self._forced_matches = dict(forced_matches or {})
 
     def run(self):
@@ -64,7 +65,6 @@ class ColorizeWorker(QThread):
                 regenerate_auto=self._regenerate_auto,
                 style_key=self._style_key,
                 quality_key=self._quality_key,
-                style_profile=self._style_profile,
                 character_memories=self._character_memories,
                 character_library=self._character_library,
                 scene_palette=self._scene_palette,
@@ -72,7 +72,9 @@ class ColorizeWorker(QThread):
                 reference_strength=self._reference_strength,
                 manual_strength=self._manual_strength,
                 pastel_tuning=self._pastel_tuning,
+                filter_tuning=self._filter_tuning,
                 forced_matches=self._forced_matches,
+                return_filter_base=True,
             )
             self.finished_ok.emit(result)
         except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
@@ -98,13 +100,14 @@ class BatchColorizeWorker(QThread):
     def __init__(self, pages: list,
                  regenerate_auto: bool, parent=None,
                  style_key: str | None = None, quality_key: str | None = None,
-                 style_profile=None, character_memories: dict | None = None,
+                 character_memories: dict | None = None,
                  character_library=None, scene_palette=None,
                  skip_colored: bool = True,
                  style_strength: float = 1.0,
                  reference_strength: float = 1.0,
                  manual_strength: float = 1.0,
-                 pastel_tuning: dict | None = None):
+                 pastel_tuning: dict | None = None,
+                 filter_tuning: dict | None = None):
         super().__init__(parent)
         self._pages = pages
         self._regenerate_auto = regenerate_auto
@@ -114,7 +117,6 @@ class BatchColorizeWorker(QThread):
         self._scene_palette = scene_palette
         self._style_key = style_key
         self._quality_key = "draft"
-        self._style_profile = style_profile
         # Same dict (same CharacterMemory instances) reused across every
         # page in the batch, so character slots learned on page 1 carry
         # over to page 50 — this is what makes CharacterMemory book-level
@@ -124,6 +126,7 @@ class BatchColorizeWorker(QThread):
         self._reference_strength = reference_strength
         self._manual_strength = manual_strength
         self._pastel_tuning = dict(pastel_tuning or {})
+        self._filter_tuning = dict(filter_tuning or {})
 
     def run(self):
         """Run the batch and *always* release the UI busy state.
@@ -170,15 +173,16 @@ class BatchColorizeWorker(QThread):
                         regenerate_auto=self._regenerate_auto,
                         style_key=self._style_key,
                         quality_key=self._quality_key,
-                        style_profile=self._style_profile,
-                        character_memories=self._character_memories,
+                                character_memories=self._character_memories,
                         character_library=self._character_library,
                         scene_palette=self._scene_palette,
                         style_strength=self._style_strength,
                         reference_strength=self._reference_strength,
                         manual_strength=self._manual_strength,
                         pastel_tuning=self._pastel_tuning,
+                        filter_tuning=self._filter_tuning,
                         forced_matches=forced_matches,
+                        return_filter_base=True,
                     )
                     self.page_done.emit(path, result)
                 except Exception as exc:  # noqa: BLE001 — keep going per page

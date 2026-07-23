@@ -62,11 +62,11 @@ class V51ResponsivenessTests(unittest.TestCase):
         start = source.index("    def _build_right_panel")
         end = source.index("\n    def ", start + 10)
         body = source[start:end]
-        self.assertIn("render_layout.addWidget(style_group, stretch=3)", body)
-        self.assertIn("render_layout.addWidget(auto_group, stretch=2)", body)
-        self.assertIn("reference_layout.addWidget(character_group, stretch=3)", body)
+        self.assertIn("render_layout.addWidget(style_group, stretch=2)", body)
+        self.assertIn("render_layout.addWidget(auto_group, stretch=1)", body)
+        self.assertNotIn("reference_tab, reference_layout", body)
         self.assertNotIn("render_layout.addStretch", body)
-        self.assertNotIn("reference_layout.addStretch", body)
+        self.assertIn("render_layout.addWidget(render_detail_tabs, stretch=4)", body)
         self.assertIn("_auto_status_label", body)
 
     def test_worker_always_emits_completion(self):

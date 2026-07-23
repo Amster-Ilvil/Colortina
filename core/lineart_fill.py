@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from core.paint_bucket import hex_to_lab
+from core.perceptual_recolor import perceptual_target_ab
 from core.region_map import RegionMap, build_region_map
 
 
@@ -273,25 +274,28 @@ def lineart_region_recolor(original_bw: np.ndarray, result_bgr: np.ndarray,
     roi = result_bgr[y1:y2, x1:x2]
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    if mode == "shift":
-        seed_lab = _representative_lab(result_bgr, mask)
-        residual = lab[:, :, 1:3] - seed_lab[None, None, 1:3]
-        desired_ab = np.dstack([
-            np.full_like(lab[:, :, 0], float(a_target)),
-            np.full_like(lab[:, :, 0], float(b_target)),
-        ]).astype(np.float32) + residual * 0.06
-        lab[:, :, 1:3] = np.clip(lab[:, :, 1:3] * (1.0 - soft[:, :, None]) + desired_ab * soft[:, :, None], 0, 255)
-        l_soft = np.clip(soft * 0.18, 0.0, 1.0)
-        lab[:, :, 0] = lab[:, :, 0] * (1.0 - l_soft) + float(L_target) * l_soft
+    active = roi_mask > 0
+    target_ab = np.array([a_target, b_target], dtype=np.float32)
+    if mode == "flat":
+        # Explicit flat mode remains available, but even here retain a modest
+        # amount of AI colour variation so the fill does not look pasted on.
+        desired_ab = perceptual_target_ab(
+            lab, active, target_ab, texture_retention=0.22, chroma_retention=0.30)
+        l_soft = np.clip(soft * 0.42, 0.0, 1.0)
+    elif mode == "shading":
+        desired_ab = perceptual_target_ab(
+            lab, active, target_ab, texture_retention=0.74, chroma_retention=0.90)
+        l_soft = np.clip(soft * 0.04, 0.0, 1.0)
     else:
-        lab[:, :, 1] = lab[:, :, 1] * (1.0 - soft) + float(a_target) * soft
-        lab[:, :, 2] = lab[:, :, 2] * (1.0 - soft) + float(b_target) * soft
-        if mode == "flat":
-            lab[:, :, 0] = lab[:, :, 0] * (1.0 - soft) + float(L_target) * soft
-        elif mode == "shading":
-            l_soft = np.clip(soft * 0.10, 0.0, 1.0)
-            lab[:, :, 0] = lab[:, :, 0] * (1.0 - l_soft) + float(L_target) * l_soft
-        np.clip(lab, 0, 255, out=lab)
+        desired_ab = perceptual_target_ab(
+            lab, active, target_ab, texture_retention=0.66, chroma_retention=0.86)
+        l_soft = np.clip(soft * 0.06, 0.0, 1.0)
+
+    lab[:, :, 1:3] = np.clip(
+        lab[:, :, 1:3] * (1.0 - soft[:, :, None]) + desired_ab * soft[:, :, None],
+        0.0, 255.0)
+    lab[:, :, 0] = lab[:, :, 0] * (1.0 - l_soft) + float(L_target) * l_soft
+    np.clip(lab, 0, 255, out=lab)
 
     recolored = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     # Defensive guarantee: even rounding/ROI code may never touch pixels

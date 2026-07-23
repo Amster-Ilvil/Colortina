@@ -10,8 +10,9 @@ class TestV61UiReferenceBundle(unittest.TestCase):
         self.assertIn('_build_book_reference_bundle', main)
         self.assertIn('book_reference_bundle_status', main)
         self.assertIn('_update_tool_specific_visibility', main)
-        self.assertIn('setMinimumContentsLength(18)', main)
-        self.assertIn('QAbstractItemView.ScrollMode.ScrollPerPixel', main)
+        self.assertIn('_eyedropper_mode_point = QCheckBox', main)
+        self.assertIn('_eyedropper_mode_region = QCheckBox', main)
+        self.assertIn('_current_color_info = QLabel()', main)
 
     def test_i18n_contains_book_reference_bundle_labels(self):
         i18n = (ROOT / 'ui' / 'i18n.py').read_text(encoding='utf-8')

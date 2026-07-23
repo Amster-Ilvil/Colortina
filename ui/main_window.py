@@ -19,12 +19,15 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog, QSplitter,
     QStatusBar, QColorDialog, QButtonGroup, QRadioButton, QGroupBox,
     QMessageBox, QProgressBar, QCheckBox, QComboBox, QSpinBox, QInputDialog,
-    QListView, QSizePolicy, QGridLayout, QTabWidget, QAbstractItemView,
+    QSizePolicy, QGridLayout, QTabWidget,
 )
 
 from config import Config
 from core.hint_manager import HintManager
+from core.edit_snapshot import capture_edit_state, restore_edit_state, snapshots_equal
 from core.lineart_fill import lineart_region_recolor
+from core.manual_style import adapt_rgb_to_style
+from core.manual_edit import apply_brush_edit, apply_region_edit
 from core.pdf_handler import extract_pages
 from ui.canvas import HintCanvas
 from ui.i18n import tr, set_language, get_language
@@ -50,6 +53,8 @@ class PageState:
         self._load_error: str | None = None
         self.ai_result_bgr: np.ndarray | None = None
         self.result_bgr: np.ndarray | None = None
+        # Unfiltered final colorization used for non-cumulative filter changes.
+        self.filter_base_bgr: np.ndarray | None = None
         self.hint_manager = HintManager()
         # Do not decode every page or build a region map during import.  Both
         # are loaded lazily when the page is first viewed / edited / generated.
@@ -58,11 +63,12 @@ class PageState:
         # Page-local explicit character binding.  Values are character IDs;
         # -1 means the user explicitly disabled identity locking.
         self.forced_character_matches: dict[int, int] = {}
-        # Unified undo/redo over the "Edited" layer — covers both a full
-        # colorize run and a region-fill touch-up, so Ctrl+Z steps back
-        # through whatever you actually did, in order.
-        self.undo_stack: list[np.ndarray] = []
-        self.redo_stack: list[np.ndarray] = []
+        # Full-state undo/redo.  A snapshot includes the editable result,
+        # stored AI base layer and manual hints.  This allows the very first
+        # auto-colorize to be undone back to an empty/B&W state and prevents
+        # operations that touch more than result_bgr from becoming irreversible.
+        self.undo_stack: list[dict] = []
+        self.redo_stack: list[dict] = []
 
     @property
     def original_bgr(self) -> np.ndarray:
@@ -84,13 +90,35 @@ class PageState:
         if self.ai_result_bgr is None and self.result_bgr is None:
             self._original_bgr = None
 
+    def edit_snapshot(self) -> dict:
+        """Capture every user-visible, editable part of this page."""
+        return capture_edit_state(self)
+
+    def snapshot_equals_current(self, snapshot: dict) -> bool:
+        return snapshots_equal(snapshot, self.edit_snapshot())
+
+    def restore_snapshot(self, snapshot: dict) -> None:
+        """Force the page back to an exact prior edit state."""
+        restore_edit_state(self, snapshot)
+
     def push_undo(self):
-        """Call BEFORE mutating result_bgr — snapshots the pre-edit state."""
-        if self.result_bgr is not None:
-            self.undo_stack.append(self.result_bgr.copy())
-            if len(self.undo_stack) > 30:
+        """Call BEFORE any visible mutation; empty states are valid snapshots."""
+        snapshot = self.edit_snapshot()
+        if not self.undo_stack or not snapshots_equal(self.undo_stack[-1], snapshot):
+            self.undo_stack.append(snapshot)
+            if len(self.undo_stack) > 20:
                 self.undo_stack.pop(0)
         self.redo_stack.clear()
+
+    @staticmethod
+    def _snapshot_equal(left: dict, right: dict) -> bool:
+        return snapshots_equal(left, right)
+
+    def discard_unchanged_undo(self) -> None:
+        """Drop a checkpoint when the attempted operation changed nothing."""
+        if self.undo_stack and self.snapshot_equals_current(self.undo_stack[-1]):
+            self.undo_stack.pop()
+
 
 
 class MainWindow(QMainWindow):
@@ -114,12 +142,12 @@ class MainWindow(QMainWindow):
         self._local_brush_stroke_active = False
         self._last_brush_was_local_edit = False
         self._last_local_edit_mode = "paint"
+        self._brush_changed_during_stroke = False
         
         # Book-level state (persists across all pages of this session):
         # an optional extracted/loaded StyleProfile (overrides the style
         # preset combo when set) and one CharacterMemory per label that
         # needs multi-character consistency.
-        self._style_profile = None
         self._character_memories: dict = {}
         # Character-aware Color Assignment: one CharacterLibrary per book,
         # built from color reference pages (角色决定颜色).
@@ -127,8 +155,6 @@ class MainWindow(QMainWindow):
         self._scene_palette = None
         self._current_project_path: str | None = None
 
-        from core.style_engine import StyleEngine
-        self._style_engine = StyleEngine(styles_dir=Config.STYLES_DIR)
 
         self._build_menu_bar()
         self._build_chrome()
@@ -316,6 +342,22 @@ class MainWindow(QMainWindow):
         prev_style_softness = prev_style_softness.value() if prev_style_softness is not None else 100
         prev_style_flatten = getattr(self, "_style_flatten_slider", None)
         prev_style_flatten = prev_style_flatten.value() if prev_style_flatten is not None else 100
+        prev_filter_brightness = getattr(self, "_filter_brightness_slider", None)
+        prev_filter_brightness = prev_filter_brightness.value() if prev_filter_brightness is not None else 100
+        prev_filter_contrast = getattr(self, "_filter_contrast_slider", None)
+        prev_filter_contrast = prev_filter_contrast.value() if prev_filter_contrast is not None else 100
+        prev_filter_saturation = getattr(self, "_filter_saturation_slider", None)
+        prev_filter_saturation = prev_filter_saturation.value() if prev_filter_saturation is not None else 100
+        prev_filter_warmth = getattr(self, "_filter_warmth_slider", None)
+        prev_filter_warmth = prev_filter_warmth.value() if prev_filter_warmth is not None else 100
+        prev_filter_shadow = getattr(self, "_filter_shadow_slider", None)
+        prev_filter_shadow = prev_filter_shadow.value() if prev_filter_shadow is not None else 100
+        prev_filter_highlight = getattr(self, "_filter_highlight_slider", None)
+        prev_filter_highlight = prev_filter_highlight.value() if prev_filter_highlight is not None else 100
+        prev_filter_scope = getattr(self, "_filter_scope_combo", None)
+        prev_filter_scope = prev_filter_scope.currentData() if prev_filter_scope is not None else "current"
+        prev_light3_intensity = getattr(self, "_light3_intensity_slider", None)
+        prev_light3_intensity = prev_light3_intensity.value() if prev_light3_intensity is not None else 100
         prev_pastel_person = getattr(self, "_pastel_person_slider", None)
         prev_pastel_person = prev_pastel_person.value() if prev_pastel_person is not None else 100
         prev_pastel_hair = getattr(self, "_pastel_hair_slider", None)
@@ -336,14 +378,14 @@ class MainWindow(QMainWindow):
         prev_char_mem = prev_char_mem.isChecked() if prev_char_mem is not None else Config.USE_CHARACTER_MEMORY
         prev_skip_colored = getattr(self, "_chk_skip_colored", None)
         prev_skip_colored = prev_skip_colored.isChecked() if prev_skip_colored is not None else True
-        prev_picker_mode = getattr(self, "_eyedropper_mode_combo", None)
-        prev_picker_mode = prev_picker_mode.currentData() if prev_picker_mode is not None else "point"
+        prev_picker_mode = self._current_eyedropper_mode() if hasattr(self, '_current_eyedropper_mode') else "point"
         prev_brush_pct = getattr(self, "_brush_slider", None)
         prev_brush_pct = prev_brush_pct.value() if prev_brush_pct is not None else self._brush_percent_from_px(12)
         prev_picker_lightness = getattr(self, "_picker_lightness_slider", None)
         prev_picker_lightness = prev_picker_lightness.value() if prev_picker_lightness is not None else 0
         prev_gap_pct = getattr(self, "_gap_close_slider", None)
         prev_gap_pct = prev_gap_pct.value() if prev_gap_pct is not None else self._gap_percent_from_px(4)
+        prev_manual_match_style = bool(getattr(self, "_chk_manual_match_style", None) and self._chk_manual_match_style.isChecked()) if getattr(self, "_chk_manual_match_style", None) is not None else True
         prev_right_tab = getattr(self, "_right_tabs", None)
         prev_right_tab = prev_right_tab.currentIndex() if prev_right_tab is not None else 0
 
@@ -375,6 +417,8 @@ class MainWindow(QMainWindow):
 
         if prev_style_key in {"monochrome_people", "monochrome_page"}:
             prev_style_key = "monochrome"
+        if prev_style_key == "light":
+            prev_style_key = "light2"
         if prev_style_key:
             idx = self._style_combo.findData(prev_style_key)
             if idx >= 0:
@@ -391,6 +435,16 @@ class MainWindow(QMainWindow):
         self._style_highlight_slider.setValue(prev_style_highlight)
         self._style_softness_slider.setValue(prev_style_softness)
         self._style_flatten_slider.setValue(prev_style_flatten)
+        self._filter_brightness_slider.setValue(prev_filter_brightness)
+        self._filter_contrast_slider.setValue(prev_filter_contrast)
+        self._filter_saturation_slider.setValue(prev_filter_saturation)
+        self._filter_warmth_slider.setValue(prev_filter_warmth)
+        self._filter_shadow_slider.setValue(prev_filter_shadow)
+        self._filter_highlight_slider.setValue(prev_filter_highlight)
+        idx = self._filter_scope_combo.findData(prev_filter_scope)
+        if idx >= 0:
+            self._filter_scope_combo.setCurrentIndex(idx)
+        self._light3_intensity_slider.setValue(prev_light3_intensity)
         self._pastel_person_slider.setValue(prev_pastel_person)
         self._pastel_hair_slider.setValue(prev_pastel_hair)
         self._pastel_skin_slider.setValue(prev_pastel_skin)
@@ -401,22 +455,19 @@ class MainWindow(QMainWindow):
         self._chk_show_regions.setChecked(prev_show_regions)
         self._chk_character_memory.setChecked(prev_char_mem)
         self._chk_skip_colored.setChecked(prev_skip_colored)
-        idx = self._eyedropper_mode_combo.findData(prev_picker_mode)
-        if idx >= 0:
-            self._eyedropper_mode_combo.setCurrentIndex(idx)
-        self._canvas.set_eyedropper_mode(prev_picker_mode)
+        self._set_eyedropper_mode(prev_picker_mode)
         self._brush_slider.setValue(prev_brush_pct)
         self._picker_lightness_slider.setValue(prev_picker_lightness)
         self._gap_close_slider.setValue(prev_gap_pct)
+        if getattr(self, "_chk_manual_match_style", None) is not None:
+            self._chk_manual_match_style.setChecked(prev_manual_match_style)
         self._right_tabs.setCurrentIndex(max(0, min(prev_right_tab, self._right_tabs.count() - 1)))
         self._canvas.set_brush_color(self._brush_color)
         self._update_color_swatch()
-        self._refresh_custom_style_combo()
         self._sync_workspace_nav()
         self._apply_workspace_theme()
         self._update_tool_specific_visibility()
         self._update_pastel_controls_visibility()
-        self._update_style_profile_label()
 
         self._repopulate_page_list()
         self._update_controls_enabled()
@@ -451,9 +502,8 @@ class MainWindow(QMainWindow):
 
         self._nav_pages_btn = add_nav("页面", lambda: self._page_list.setFocus(), checked=True)
         self._nav_render_btn = add_nav(tr("right_tab_render"), lambda: self._right_tabs.setCurrentIndex(0))
-        self._nav_reference_btn = add_nav(tr("right_tab_reference"), lambda: self._right_tabs.setCurrentIndex(1))
-        self._nav_edit_btn = add_nav(tr("right_tab_edit"), lambda: self._right_tabs.setCurrentIndex(2))
-        self._nav_output_btn = add_nav(tr("right_tab_output"), lambda: self._right_tabs.setCurrentIndex(3))
+        self._nav_edit_btn = add_nav(tr("right_tab_edit"), lambda: self._right_tabs.setCurrentIndex(1))
+        self._nav_output_btn = add_nav(tr("right_tab_output"), lambda: self._right_tabs.setCurrentIndex(2))
         layout.addStretch(1)
         return bar
 
@@ -462,9 +512,8 @@ class MainWindow(QMainWindow):
             return
         mapping = {
             0: getattr(self, "_nav_render_btn", None),
-            1: getattr(self, "_nav_reference_btn", None),
-            2: getattr(self, "_nav_edit_btn", None),
-            3: getattr(self, "_nav_output_btn", None),
+            1: getattr(self, "_nav_edit_btn", None),
+            2: getattr(self, "_nav_output_btn", None),
         }
         current = self._right_tabs.currentIndex()
         btn = mapping.get(current)
@@ -476,6 +525,7 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget#CentralWorkspace { background: #eaf4ff; color: #243244; }
             QMenuBar, QStatusBar { background: #dbe9f7; color: #29405b; }
             QLabel#WorkspaceTitle { font-size: 18px; font-weight: 700; color: #36506f; padding: 6px 2px 2px 2px; }
+            QLabel#VersionLabel { color: #6c7f94; font-size: 11px; font-weight: 700; padding: 3px 4px; }
             QPushButton#GhostButton {
                 background: #f4f9ff; border: 1px solid #bfd3e8; border-radius: 10px;
                 padding: 7px 14px; font-weight: 600; }
@@ -576,6 +626,12 @@ class MainWindow(QMainWindow):
         project_row.addWidget(btn_load_project)
         project_row.addWidget(btn_save_project)
         layout.addLayout(project_row)
+
+        self._version_label = QLabel("V2")
+        self._version_label.setObjectName("VersionLabel")
+        self._version_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._version_label.setToolTip("Colortina V2")
+        layout.addWidget(self._version_label)
         return w
 
     def _build_canvas_panel(self) -> QWidget:
@@ -697,7 +753,7 @@ class MainWindow(QMainWindow):
         style_grid.setVerticalSpacing(4)
         style_grid.addWidget(QLabel(tr("style_label")), 0, 0)
         self._style_combo = QComboBox()
-        visible_style_keys = ["none", "light", "light2", "monochrome"]
+        visible_style_keys = ["none", "light2", "light3"]
         for key in visible_style_keys:
             preset = STYLE_PRESETS.get(key)
             if preset is not None:
@@ -741,7 +797,13 @@ class MainWindow(QMainWindow):
         add_strength_row(1, "reference_strength_label", "_reference_strength_slider")
         add_strength_row(2, "manual_strength_label", "_manual_strength_slider")
         style_layout.addLayout(strength_grid)
+        self._style_strength_hint_label = QLabel(tr("style_strength_hint"))
+        self._style_strength_hint_label.setWordWrap(True)
+        self._style_strength_hint_label.setStyleSheet("color: #6c7f94; font-size: 10px;")
+        style_layout.addWidget(self._style_strength_hint_label)
 
+        # Fine-tuning now lives inside the render tab again, alongside the
+        # colourization controls, instead of being a separate main tab.
         self._style_fine_group = QGroupBox(tr("style_fine_controls_group"))
         fine_layout = QVBoxLayout(self._style_fine_group)
         fine_layout.setContentsMargins(10, 10, 10, 8)
@@ -750,6 +812,14 @@ class MainWindow(QMainWindow):
         fine_hint.setWordWrap(True)
         fine_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
         fine_layout.addWidget(fine_hint)
+        self._style_fine_active_label = QLabel()
+        self._style_fine_active_label.setWordWrap(True)
+        self._style_fine_active_label.setStyleSheet("font-weight: 600;")
+        fine_layout.addWidget(self._style_fine_active_label)
+        fine_apply_hint = QLabel(tr("style_fine_apply_hint"))
+        fine_apply_hint.setWordWrap(True)
+        fine_apply_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
+        fine_layout.addWidget(fine_apply_hint)
         fine_grid = QGridLayout()
         fine_grid.setContentsMargins(0, 0, 0, 0)
         fine_grid.setHorizontalSpacing(5)
@@ -780,8 +850,53 @@ class MainWindow(QMainWindow):
         add_tune_row(fine_grid, 3, "style_highlight_strength", "_style_highlight_slider")
         add_tune_row(fine_grid, 4, "style_softness_strength", "_style_softness_slider")
         add_tune_row(fine_grid, 5, "style_flatten_strength", "_style_flatten_slider")
+        add_tune_row(fine_grid, 6, "light3_intensity", "_light3_intensity_slider", 0, 200, 100)
+        self._light3_intensity_label = fine_grid.itemAtPosition(6, 0).widget()
+        self._light3_intensity_spin = fine_grid.itemAtPosition(6, 2).widget()
+        self._light3_intensity_slider.valueChanged.connect(self._update_color_swatch)
+        for slider in (self._style_color_slider, self._style_brightness_slider,
+                       self._style_warmth_slider, self._style_highlight_slider,
+                       self._style_softness_slider, self._style_flatten_slider):
+            slider.valueChanged.connect(self._update_color_swatch)
         fine_layout.addLayout(fine_grid)
-        style_layout.addWidget(self._style_fine_group)
+        self._btn_reset_style_fine = QPushButton(tr("reset_style_fine_btn"))
+        self._btn_reset_style_fine.clicked.connect(self._reset_style_fine_tuning)
+        fine_layout.addWidget(self._btn_reset_style_fine)
+
+        self._filter_group = QGroupBox(tr("image_filter_group"))
+        filter_layout = QVBoxLayout(self._filter_group)
+        filter_layout.setContentsMargins(10, 10, 10, 8)
+        filter_layout.setSpacing(4)
+        filter_hint = QLabel(tr("image_filter_hint"))
+        filter_hint.setWordWrap(True)
+        filter_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
+        filter_layout.addWidget(filter_hint)
+        filter_grid = QGridLayout()
+        filter_grid.setContentsMargins(0, 0, 0, 0)
+        filter_grid.setHorizontalSpacing(5)
+        filter_grid.setVerticalSpacing(3)
+        add_tune_row(filter_grid, 0, "filter_brightness", "_filter_brightness_slider", 0, 200, 100)
+        add_tune_row(filter_grid, 1, "filter_contrast", "_filter_contrast_slider", 0, 200, 100)
+        add_tune_row(filter_grid, 2, "filter_saturation", "_filter_saturation_slider", 0, 200, 100)
+        add_tune_row(filter_grid, 3, "filter_warmth", "_filter_warmth_slider", 0, 200, 100)
+        add_tune_row(filter_grid, 4, "filter_shadow_lift", "_filter_shadow_slider", 0, 200, 100)
+        add_tune_row(filter_grid, 5, "filter_highlight", "_filter_highlight_slider", 0, 200, 100)
+        filter_layout.addLayout(filter_grid)
+        filter_scope_row = QHBoxLayout()
+        filter_scope_row.addWidget(QLabel(tr("filter_scope_label")))
+        self._filter_scope_combo = QComboBox()
+        self._filter_scope_combo.addItem(tr("filter_scope_current"), "current")
+        self._filter_scope_combo.addItem(tr("filter_scope_all"), "all")
+        filter_scope_row.addWidget(self._filter_scope_combo, stretch=1)
+        filter_layout.addLayout(filter_scope_row)
+        self._btn_filter_reset = QPushButton(tr("filter_reset"))
+        self._btn_filter_reset.clicked.connect(self._reset_filter_controls)
+        self._btn_filter_apply = QPushButton(tr("filter_apply"))
+        self._btn_filter_apply.clicked.connect(self._apply_filter_to_scope)
+        filter_button_row = QHBoxLayout()
+        filter_button_row.addWidget(self._btn_filter_reset)
+        filter_button_row.addWidget(self._btn_filter_apply)
+        filter_layout.addLayout(filter_button_row)
 
         self._pastel_controls_group = QGroupBox(tr("pastel_controls_group"))
         pastel_layout = QVBoxLayout(self._pastel_controls_group)
@@ -809,10 +924,6 @@ class MainWindow(QMainWindow):
         pastel_layout.addLayout(pastel_grid)
         style_layout.addWidget(self._pastel_controls_group)
 
-        self._style_profile_label = QLabel(tr("style_profile_unset"))
-        self._style_profile_label.setWordWrap(True)
-        self._style_profile_label.setStyleSheet("color: #777; font-size: 11px;")
-        style_layout.addWidget(self._style_profile_label)
 
         self._chk_character_memory = QCheckBox(tr("character_memory_checkbox"))
         self._chk_character_memory.setChecked(False)
@@ -834,90 +945,27 @@ class MainWindow(QMainWindow):
         self._auto_status_label.setSizePolicy(QSizePolicy.Policy.Expanding,
                                               QSizePolicy.Policy.Expanding)
         auto_layout.addWidget(self._auto_status_label, stretch=1)
-        render_layout.addWidget(style_group, stretch=3)
-        render_layout.addWidget(auto_group, stretch=2)
+        render_detail_tabs = QTabWidget()
+        render_detail_tabs.setDocumentMode(True)
+        render_detail_tabs.setUsesScrollButtons(False)
+        render_detail_tabs.tabBar().setExpanding(True)
+        self._render_detail_tabs = render_detail_tabs
+
+        detail_fine_tab, detail_fine_layout = make_tab()
+        detail_fine_layout.addWidget(self._style_fine_group, stretch=1)
+        render_detail_tabs.addTab(detail_fine_tab, tr("style_detail_tab_fine"))
+
+        detail_filter_tab, detail_filter_layout = make_tab()
+        detail_filter_layout.addWidget(self._filter_group, stretch=1)
+        render_detail_tabs.addTab(detail_filter_tab, tr("image_filter_group"))
+
+        render_layout.addWidget(style_group, stretch=2)
+        render_layout.addWidget(render_detail_tabs, stretch=4)
+        # Keep the primary action at the very bottom of the render page.
+        render_layout.addWidget(auto_group, stretch=1)
         self._right_tabs.addTab(render_tab, tr("right_tab_render"))
 
-        # ── Tab 2: reference style / identity / scene data ────────────
-        reference_tab, reference_layout = make_tab()
-
-        custom_style_group, custom_style_layout = make_group(tr("custom_style_group"))
-        self._custom_style_combo = QComboBox()
-        custom_style_layout.addWidget(self._custom_style_combo)
-        self._btn_new_style = tune_button(QPushButton(tr("btn_new_style")))
-        self._btn_new_style.clicked.connect(self._new_style_from_reference)
-        self._btn_load_style_file = tune_button(QPushButton(tr("btn_load_style_file")))
-        self._btn_load_style_file.clicked.connect(self._load_style_file)
-        self._btn_reference_points = tune_button(QPushButton(tr("reference_points")))
-        self._btn_reference_points.clicked.connect(self._apply_reference_points)
-        custom_style_layout.addWidget(self._btn_new_style)
-        custom_style_layout.addWidget(self._btn_load_style_file)
-        custom_style_layout.addWidget(self._btn_reference_points)
-        self._btn_apply_saved_style = QPushButton(tr("btn_apply_saved_style"))
-        self._btn_apply_saved_style.clicked.connect(self._apply_saved_style)
-        self._btn_delete_style = QPushButton(tr("btn_delete_style"))
-        self._btn_delete_style.clicked.connect(self._delete_saved_style)
-        add_button_grid(custom_style_layout,
-                        [self._btn_apply_saved_style, self._btn_delete_style])
-        self._btn_clear_style_profile = tune_button(
-            QPushButton(tr("btn_clear_style_profile")))
-        self._btn_clear_style_profile.clicked.connect(self._clear_style_profile)
-        custom_style_layout.addWidget(self._btn_clear_style_profile)
-        reference_layout.addWidget(custom_style_group, stretch=3)
-        self._refresh_custom_style_combo()
-
-        character_group, character_layout = make_group(tr("character_palette_group"))
-        self._btn_extract_characters = QPushButton(tr("extract_character_palette"))
-        self._btn_extract_characters.clicked.connect(self._extract_character_palette)
-        self._btn_manual_character = QPushButton(tr("manual_add_character"))
-        self._btn_manual_character.clicked.connect(self._manual_add_reference_character)
-        self._btn_bind_page_characters = QPushButton(tr("bind_page_characters"))
-        self._btn_bind_page_characters.clicked.connect(self._bind_page_characters)
-        self._btn_manage_characters = QPushButton(tr("manage_characters"))
-        self._btn_manage_characters.clicked.connect(self._manage_characters)
-        self._btn_load_palette = QPushButton(tr("load_palette"))
-        self._btn_load_palette.clicked.connect(self._load_character_palette)
-        self._btn_save_palette = QPushButton(tr("save_palette"))
-        self._btn_save_palette.clicked.connect(self._save_character_palette)
-        add_button_grid(character_layout,
-                        [self._btn_extract_characters, self._btn_manual_character,
-                         self._btn_bind_page_characters, self._btn_manage_characters,
-                         self._btn_load_palette, self._btn_save_palette], columns=2)
-        reference_layout.addWidget(character_group, stretch=3)
-
-        diagnostics_group, diagnostics_layout = make_group(tr("character_diagnostics_group"))
-        self._character_diag_label = QLabel(tr("character_diagnostics_empty"))
-        self._character_diag_label.setWordWrap(True)
-        self._character_diag_label.setTextFormat(Qt.TextFormat.RichText)
-        self._character_diag_label.setStyleSheet("color: #666; font-size: 11px;")
-        diagnostics_layout.addWidget(self._character_diag_label)
-        self._btn_refresh_character_diag = QPushButton(tr("refresh_character_diagnostics"))
-        self._btn_refresh_character_diag.clicked.connect(self._refresh_character_diagnostics)
-        diagnostics_layout.addWidget(self._btn_refresh_character_diag)
-        reference_layout.addWidget(diagnostics_group, stretch=4)
-
-        scene_group, scene_layout = make_group(tr("scene_palette_group"))
-        self._scene_palette_label = QLabel(tr("scene_palette_unset"))
-        self._scene_palette_label.setWordWrap(True)
-        self._scene_palette_label.setStyleSheet("color: #777; font-size: 11px;")
-        scene_layout.addWidget(self._scene_palette_label)
-        self._btn_extract_scene = QPushButton(tr("extract_scene_palette"))
-        self._btn_extract_scene.clicked.connect(self._extract_scene_palette)
-        self._btn_load_scene = QPushButton(tr("load_scene_palette"))
-        self._btn_load_scene.clicked.connect(self._load_scene_palette)
-        self._btn_save_scene = QPushButton(tr("save_scene_palette"))
-        self._btn_save_scene.clicked.connect(self._save_scene_palette)
-        self._btn_clear_scene = QPushButton(tr("clear_scene_palette"))
-        self._btn_clear_scene.clicked.connect(self._clear_scene_palette)
-        add_button_grid(scene_layout,
-                        [self._btn_extract_scene, self._btn_load_scene,
-                         self._btn_save_scene, self._btn_clear_scene], columns=2)
-        reference_layout.addWidget(scene_group, stretch=2)
-        self._right_tabs.addTab(reference_tab, tr("right_tab_reference"))
-        self._update_scene_palette_label()
-        self._refresh_character_diagnostics()
-
-        # ── Tab 3: manual editing ─────────────────────────────────────
+        # ── Tab 2: manual editing ─────────────────────────────────────
         edit_tab, edit_tab_layout = make_tab()
         edit_group, edit_layout = make_group(tr("edit_group"))
 
@@ -944,27 +992,35 @@ class MainWindow(QMainWindow):
         edit_grid.setVerticalSpacing(4)
         self._eyedropper_mode_label = QLabel(tr("eyedropper_mode_label"))
         edit_grid.addWidget(self._eyedropper_mode_label, 0, 0)
-        self._eyedropper_mode_combo = QComboBox()
-        self._eyedropper_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self._eyedropper_mode_combo.setMinimumContentsLength(18)
-        self._eyedropper_mode_combo.setMaxVisibleItems(8)
-        eyedrop_view = QListView()
-        eyedrop_view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        eyedrop_view.setUniformItemSizes(True)
-        self._eyedropper_mode_combo.setView(eyedrop_view)
-        self._eyedropper_mode_combo.addItem(tr("eyedropper_mode_point"), "point")
-        self._eyedropper_mode_combo.addItem(tr("eyedropper_mode_region"), "region")
-        self._eyedropper_mode_combo.currentIndexChanged.connect(
-            lambda _: self._canvas.set_eyedropper_mode(
-                self._eyedropper_mode_combo.currentData()))
-        edit_grid.addWidget(self._eyedropper_mode_combo, 0, 1, 1, 2)
+        eyedrop_box = QWidget()
+        self._eyedropper_mode_box = eyedrop_box
+        eyedrop_layout = QHBoxLayout(eyedrop_box)
+        eyedrop_layout.setContentsMargins(0, 0, 0, 0)
+        eyedrop_layout.setSpacing(8)
+        self._eyedropper_mode_group = QButtonGroup(self)
+        self._eyedropper_mode_group.setExclusive(True)
+        self._eyedropper_mode_point = QCheckBox(tr("eyedropper_mode_point"))
+        self._eyedropper_mode_region = QCheckBox(tr("eyedropper_mode_region"))
+        self._eyedropper_mode_group.addButton(self._eyedropper_mode_point)
+        self._eyedropper_mode_group.addButton(self._eyedropper_mode_region)
+        self._eyedropper_mode_point.toggled.connect(lambda checked: checked and self._set_eyedropper_mode("point"))
+        self._eyedropper_mode_region.toggled.connect(lambda checked: checked and self._set_eyedropper_mode("region"))
+        eyedrop_layout.addWidget(self._eyedropper_mode_point)
+        eyedrop_layout.addWidget(self._eyedropper_mode_region)
+        eyedrop_layout.addStretch(1)
+        edit_grid.addWidget(eyedrop_box, 0, 1, 1, 2)
 
         edit_grid.addWidget(QLabel(tr("color_label")), 1, 0)
         self._color_swatch = QPushButton()
-        self._color_swatch.setFixedSize(42, 25)
+        self._color_swatch.setFixedSize(54, 30)
         self._color_swatch.clicked.connect(self._pick_color)
-        self._update_color_swatch()
         edit_grid.addWidget(self._color_swatch, 1, 1)
+        self._current_color_info = QLabel()
+        self._current_color_info.setWordWrap(True)
+        self._current_color_info.setStyleSheet("color: #5d6f84; font-size: 10px;")
+        edit_grid.addWidget(self._current_color_info, 1, 2)
+        self._update_color_swatch()
+        self._set_eyedropper_mode("point")
 
         edit_grid.addWidget(QLabel(tr("brush_size_label")), 2, 0)
         self._brush_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1023,6 +1079,12 @@ class MainWindow(QMainWindow):
         edit_grid.setColumnStretch(1, 1)
         edit_layout.addLayout(edit_grid)
 
+        self._chk_manual_match_style = QCheckBox(tr("manual_match_style_checkbox"))
+        self._chk_manual_match_style.setChecked(True)
+        self._chk_manual_match_style.setToolTip(tr("manual_match_style_hint"))
+        self._chk_manual_match_style.toggled.connect(self._update_color_swatch)
+        edit_layout.addWidget(self._chk_manual_match_style)
+
         bucket_hint = QLabel(tr("bucket_hint_compact"))
         bucket_hint.setWordWrap(True)
         bucket_hint.setToolTip(tr("bucket_hint"))
@@ -1053,7 +1115,7 @@ class MainWindow(QMainWindow):
         edit_tab_layout.addWidget(history_group, stretch=1)
         self._right_tabs.addTab(edit_tab, tr("right_tab_edit"))
 
-        # ── Tab 4: view, restore and export ───────────────────────────
+        # ── Tab 3: view, restore and export ───────────────────────────
         output_tab, output_layout = make_tab()
         view_group, view_layout = make_group(tr("view_group"))
         self._view_tool_group = QButtonGroup(self)
@@ -1338,7 +1400,6 @@ class MainWindow(QMainWindow):
             pages, regenerate_auto,
             style_key=self._style_combo.currentData(),
             quality_key="draft",
-            style_profile=self._style_profile,
             character_memories=character_memories,
             character_library=self._character_library,
             scene_palette=self._scene_palette,
@@ -1347,6 +1408,7 @@ class MainWindow(QMainWindow):
             reference_strength=self._reference_strength_slider.value() / 100.0,
             manual_strength=self._manual_strength_slider.value() / 100.0,
             pastel_tuning=self._current_pastel_tuning(),
+            filter_tuning=self._current_filter_tuning(),
         )
         self._batch_worker.page_done.connect(self._on_batch_page_done)
         self._batch_worker.page_error.connect(self._on_batch_page_error)
@@ -1364,6 +1426,26 @@ class MainWindow(QMainWindow):
             self._character_memories = {"hair": CharacterMemory(label="hair")}
         return self._character_memories
 
+    def _open_style_fine_tab(self):
+        self._right_tabs.setCurrentIndex(0)
+        if getattr(self, "_render_detail_tabs", None) is not None:
+            self._render_detail_tabs.setCurrentIndex(0)
+        self._update_pastel_controls_visibility()
+
+    def _reset_style_fine_tuning(self):
+        for widget in (
+            getattr(self, "_style_color_slider", None),
+            getattr(self, "_style_brightness_slider", None),
+            getattr(self, "_style_warmth_slider", None),
+            getattr(self, "_style_highlight_slider", None),
+            getattr(self, "_style_softness_slider", None),
+            getattr(self, "_style_flatten_slider", None),
+            getattr(self, "_light3_intensity_slider", None),
+        ):
+            if widget is not None:
+                widget.setValue(100)
+        self._update_color_swatch()
+
     def _current_pastel_tuning(self) -> dict:
         return {
             "color_strength": self._style_color_slider.value(),
@@ -1372,6 +1454,7 @@ class MainWindow(QMainWindow):
             "highlight_preserve": self._style_highlight_slider.value(),
             "softness": self._style_softness_slider.value(),
             "flatten": self._style_flatten_slider.value(),
+            "light3_intensity": self._light3_intensity_slider.value(),
             "person_strength": self._pastel_person_slider.value(),
             "hair_strength": self._pastel_hair_slider.value(),
             "skin_strength": self._pastel_skin_slider.value(),
@@ -1381,6 +1464,66 @@ class MainWindow(QMainWindow):
             "skin_warmth": self._pastel_skin_warmth_slider.value(),
         }
 
+    def _current_filter_tuning(self) -> dict:
+        return {
+            "brightness": self._filter_brightness_slider.value(),
+            "contrast": self._filter_contrast_slider.value(),
+            "saturation": self._filter_saturation_slider.value(),
+            "warmth": self._filter_warmth_slider.value(),
+            "shadow_lift": self._filter_shadow_slider.value(),
+            "highlight": self._filter_highlight_slider.value(),
+        }
+
+    def _reset_filter_controls(self):
+        for slider in (
+            self._filter_brightness_slider, self._filter_contrast_slider,
+            self._filter_saturation_slider, self._filter_warmth_slider,
+            self._filter_shadow_slider, self._filter_highlight_slider,
+        ):
+            slider.setValue(100)
+        self.statusBar().showMessage(tr("filter_reset_done"), 3000)
+
+    def _filter_target_states(self) -> list[PageState]:
+        scope = self._filter_scope_combo.currentData() if getattr(self, "_filter_scope_combo", None) else "current"
+        if scope == "all":
+            return [state for state in self._ordered_states() if state.result_bgr is not None]
+        state = self._current_state()
+        return [state] if state is not None and state.result_bgr is not None else []
+
+    def _apply_filter_to_scope(self):
+        states = self._filter_target_states()
+        if not states:
+            self.statusBar().showMessage(tr("filter_no_result"), 3500)
+            return
+        from core.image_filter import apply_image_filter
+        tuning = self._current_filter_tuning()
+        style_key = self._style_combo.currentData()
+        style_strength = self._style_strength_slider.value() / 100.0
+        for state in states:
+            base = state.filter_base_bgr
+            if base is None or base.shape[:2] != state.result_bgr.shape[:2]:
+                # Legacy projects have no stored pre-filter layer. Capture the
+                # current visible result once, then all later adjustments remain
+                # non-cumulative from this stable base.
+                state.filter_base_bgr = state.result_bgr.copy()
+                base = state.filter_base_bgr
+            state.push_undo()
+            state.result_bgr = apply_image_filter(
+                base.copy(), tuning,
+                style_strength=style_strength,
+                is_styled=style_key not in {None, "none"},
+                source_bw_bgr=state.original_bgr)
+            state.discard_unchanged_undo()
+            self._mark_page_done(state.path)
+        current = self._current_state()
+        if current is not None and current in states:
+            self._radio_view_edited.setChecked(True)
+            self._sync_view_after_edit(current)
+        if self._filter_scope_combo.currentData() == "all":
+            self.statusBar().showMessage(tr("filter_applied_all").format(n=len(states)), 4500)
+        else:
+            self.statusBar().showMessage(tr("filter_applied_current"), 4000)
+
     def _update_pastel_controls_visibility(self):
         style_group = getattr(self, "_style_fine_group", None)
         mono_group = getattr(self, "_pastel_controls_group", None)
@@ -1389,102 +1532,26 @@ class MainWindow(QMainWindow):
             return
         key = combo.currentData()
         if style_group is not None:
-            style_group.setVisible(key not in {None, "none"})
+            style_group.setVisible(True)
+        active_label = getattr(self, "_style_fine_active_label", None)
+        if active_label is not None:
+            active_label.setText(tr("style_fine_active").format(name=combo.currentText()))
+        is_light3 = key == "light3"
+        for widget in (getattr(self, "_light3_intensity_label", None),
+                       getattr(self, "_light3_intensity_slider", None),
+                       getattr(self, "_light3_intensity_spin", None)):
+            if widget is not None:
+                widget.setVisible(is_light3)
         if mono_group is not None:
-            mono_group.setVisible(key in {"monochrome", "monochrome_people", "monochrome_page"})
+            mono_group.setVisible(False)
 
     def _on_style_combo_changed(self):
         """React to style changes and expose relevant fine controls."""
         self._update_pastel_controls_visibility()
-        if self._style_combo.currentData() == "none" and self._style_profile is not None:
-            self._style_profile = None
-            self._update_style_profile_label()
-            self.statusBar().showMessage(tr("style_cleared_msg").format(name=self._style_combo.currentText()), 4000)
+        self._update_color_swatch()
 
-    def _refresh_custom_style_combo(self):
-        self._custom_style_combo.clear()
-        entries = self._style_engine.list_styles_with_names()
-        if not entries:
-            self._custom_style_combo.addItem(tr("custom_style_combo_placeholder"), None)
-            return
-        for filename, name in entries:
-            self._custom_style_combo.addItem(name, filename)
 
-    def _update_style_profile_label(self):
-        if self._style_profile is not None:
-            p = self._style_profile
-            text = tr("style_profile_active").format(
-                name=p.name, saturation=p.saturation,
-                contrast=p.contrast, temperature=p.temperature)
-            desc = getattr(p, "_descriptor", None)
-            palette_count = len(getattr(desc, "reference_palette", []) or [])
-            character_count = len(getattr(self._character_library, "characters", [])
-                                  if self._character_library is not None else [])
-            text += "\n" + tr("reference_profile_summary").format(
-                palette_count=palette_count, character_count=character_count)
-            self._style_profile_label.setText(text)
-        else:
-            self._style_profile_label.setText(tr("style_profile_unset"))
 
-    def _new_style_from_reference(self):
-        """Extract rendering language only.
-
-        Character identity colours and environment colours are deliberately
-        handled by their own controls.  A style operation must never silently
-        replace or merge the active character library.
-        """
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, tr("extract_style_dialog_title"), "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
-        if not paths:
-            return
-
-        images = []
-        for path in paths:
-            from core.imageio import imread as _uimread
-            image = _uimread(path)
-            if image is not None:
-                images.append(image)
-        if not images:
-            QMessageBox.warning(self, tr("extract_style_fail_title"),
-                                tr("extract_style_fail_body"))
-            return
-
-        default_name = os.path.splitext(os.path.basename(paths[0]))[0]
-        name, ok = QInputDialog.getText(
-            self, tr("new_style_name_title"), tr("new_style_name_label"),
-            text=default_name or tr("new_style_name_default"))
-        if not ok:
-            return
-        name = (name or "").strip() or default_name or tr("new_style_name_default")
-
-        try:
-            from core.guided_colorist import _get_classifier
-            classifier = _get_classifier()
-        except Exception:
-            classifier = None
-
-        try:
-            if len(images) == 1:
-                profile = self._style_engine.extract_from_reference(
-                    images[0], name=name, classifier=classifier)
-            else:
-                profile = self._style_engine.extract_from_references(
-                    images, name=name, classifier=classifier)
-            self._style_profile = profile
-            self._style_engine.save_style(profile)
-        except Exception as exc:
-            QMessageBox.warning(self, tr("extract_style_fail_title"), str(exc))
-            return
-
-        self._update_style_profile_label()
-        self._refresh_custom_style_combo()
-        filename = f"{name.lower().replace(' ', '_')}.ccstyle"
-        idx = self._custom_style_combo.findData(filename)
-        if idx >= 0:
-            self._custom_style_combo.setCurrentIndex(idx)
-        self.statusBar().showMessage(
-            tr("extract_style_status_separate").format(name=name), 7000)
 
     def _extract_character_palette(self):
         """Build a fresh character identity library from colour references."""
@@ -1517,7 +1584,6 @@ class MainWindow(QMainWindow):
                 tr("anime_detector_download_hint"))
             return
         self._character_library = library
-        self._update_style_profile_label()
         self._refresh_character_diagnostics()
         self.statusBar().showMessage(
             tr("characters_extracted_separate").format(
@@ -1566,137 +1632,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, tr("warning_title"), str(exc))
             return
-        self._update_style_profile_label()
         self._refresh_character_diagnostics()
         self.statusBar().showMessage(
             tr("manual_character_added").format(
                 name=profile.name or f"#{profile.char_id}",
                 n=len(self._character_library.characters)), 7000)
 
-    def _load_style_file(self):
-        """Load an existing .ccstyle file from anywhere on disk and make
-        it the active style. A copy is also kept in the style library
-        folder so it can be re-selected/deleted from the combo above."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("load_style_dialog_title"), "", "Colortina Style (*.ccstyle)")
-        if not path:
-            return
-        try:
-            profile = self._style_engine.load_style(path)
-        except Exception as exc:
-            QMessageBox.warning(self, tr("load_style_fail_title"),
-                               tr("load_style_fail_body").format(exc=exc))
-            return
 
-        self._style_profile = profile
-        styles_dir = os.path.abspath(self._style_engine.styles_dir)
-        if os.path.dirname(os.path.abspath(path)) != styles_dir:
-            self._style_engine.save_style(
-                profile, filename=os.path.basename(path))
 
-        self._update_style_profile_label()
-        self._refresh_custom_style_combo()
-        idx = self._custom_style_combo.findData(os.path.basename(path))
-        if idx >= 0:
-            self._custom_style_combo.setCurrentIndex(idx)
-        self.statusBar().showMessage(tr("style_loaded_msg").format(name=profile.name), 4000)
 
-    def _apply_reference_points(self):
-        """Transfer paired reference colours without whole-region propagation.
 
-        When an edited result exists, each pair is applied as a strictly local
-        LAB recolour. Before the first model run, pairs are stored as local model
-        hints. Oil-paint bucket remains the explicit whole-region tool.
-        """
-        state = self._current_state()
-        if state is None:
-            QMessageBox.information(self, tr("no_result_title"), tr("reference_points_need_page"))
-            return
-        path, _ = QFileDialog.getOpenFileName(
-            self, tr("reference_points_select"), "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tiff)")
-        if not path:
-            return
-        from core.imageio import imread as _uimread
-        reference = _uimread(path)
-        if reference is None:
-            QMessageBox.warning(self, tr("warning_title"),
-                                tr("cannot_read_image").format(path=path))
-            return
-        from ui.reference_match_dialog import ReferenceMatchDialog
-        dialog = ReferenceMatchDialog(reference, state.original_bgr, self)
-        if not dialog.exec() or not dialog.pairs:
-            return
-        gap = self._gap_px_from_percent(self._gap_close_slider.value())
-        state.hint_manager.bind_source_image(state.original_bgr, gap_close=gap)
-        radius_norm = self._brush_px_from_percent(self._brush_slider.value()) / max(
-            1, state.original_bgr.shape[1])
-        from core.reference_points import sample_reference_rgb
-        if state.result_bgr is not None:
-            from core.local_brush import apply_local_brush_recolor
-            state.push_undo()
-            region_map = state.hint_manager.bind_source_image(
-                state.original_bgr, gap_close=gap)
-            h, w = state.result_bgr.shape[:2]
-            radius_px = max(1, int(round(radius_norm * w)))
-            for rx, ry, tx, ty in dialog.pairs:
-                rgb = sample_reference_rgb(reference, rx, ry)
-                ix = min(w - 1, max(0, int(round(tx * (w - 1)))))
-                iy = min(h - 1, max(0, int(round(ty * (h - 1)))))
-                state.result_bgr, _mask = apply_local_brush_recolor(
-                    state.original_bgr, state.result_bgr, ix, iy,
-                    radius_px, rgb, opacity=0.82,
-                    region_map=region_map, gap_close=gap)
-            self._radio_view_edited.setChecked(True)
-            self._sync_view_after_edit(state)
-            self._last_brush_was_local_edit = True
-        else:
-            for rx, ry, tx, ty in dialog.pairs:
-                rgb = sample_reference_rgb(reference, rx, ry)
-                state.hint_manager.add_manual_hint(tx, ty, rgb, radius_norm)
-            self._refresh_hint_overlay()
-        self._refresh_character_diagnostics()
-        self.statusBar().showMessage(
-            tr("reference_points_applied").format(n=len(dialog.pairs)), 5000)
-
-    def _apply_saved_style(self):
-        filename = self._custom_style_combo.currentData()
-        if not filename:
-            QMessageBox.information(self, tr("no_result_title"), tr("no_style_selected_msg"))
-            return
-        try:
-            profile = self._style_engine.load_style(filename)
-        except Exception as exc:
-            QMessageBox.warning(self, tr("load_style_fail_title"),
-                               tr("load_style_fail_body").format(exc=exc))
-            return
-        self._style_profile = profile
-        self._update_style_profile_label()
-        self.statusBar().showMessage(tr("style_loaded_msg").format(name=profile.name), 4000)
-
-    def _delete_saved_style(self):
-        filename = self._custom_style_combo.currentData()
-        if not filename:
-            QMessageBox.information(self, tr("no_result_title"), tr("no_style_selected_msg"))
-            return
-        name = self._custom_style_combo.currentText()
-        reply = QMessageBox.question(
-            self, tr("confirm_delete_style_title"), tr("confirm_delete_style_body").format(name=name),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        self._style_engine.delete_style(filename)
-        if self._style_profile is not None and self._style_profile.name == name:
-            self._style_profile = None
-            self._update_style_profile_label()
-        self._refresh_custom_style_combo()
-        self.statusBar().showMessage(tr("style_deleted_msg").format(name=name), 4000)
-
-    def _clear_style_profile(self):
-        self._style_profile = None
-        self._update_style_profile_label()
-        self.statusBar().showMessage(
-            tr("style_cleared_msg").format(name=self._style_combo.currentText()), 4000)
 
     def _bind_page_characters(self):
         state = self._current_state()
@@ -1736,7 +1681,6 @@ class MainWindow(QMainWindow):
         from ui.character_dialog import CharacterLibraryDialog
         dialog = CharacterLibraryDialog(self._character_library, self)
         if dialog.exec():
-            self._update_style_profile_label()
             self._refresh_character_diagnostics()
             self.statusBar().showMessage(tr("characters_updated"), 4000)
 
@@ -1766,7 +1710,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, tr("load_style_fail_title"), str(exc))
             return
-        self._update_style_profile_label()
         self._refresh_character_diagnostics()
         self.statusBar().showMessage(tr("palette_loaded").format(path=path), 5000)
 
@@ -1881,18 +1824,6 @@ class MainWindow(QMainWindow):
                 except Exception:
                     continue
 
-            style_name = tr("scene_palette_name_default")
-            try:
-                style_name, ok = QInputDialog.getText(
-                    self, tr("new_style_name_title"), tr("new_style_name_label"),
-                    text=tr("new_style_name_default"))
-                if not ok:
-                    style_name = tr("new_style_name_default")
-            except Exception:
-                style_name = tr("new_style_name_default")
-
-            profile = self._style_engine.extract_from_references(
-                images, name=(style_name or tr("new_style_name_default")).strip() or tr("new_style_name_default"))
             scene_palette = ScenePalette.extract_from_references(
                 images, RegionClassifier(), name=tr("scene_palette_name_default"))
         except Exception as exc:
@@ -1907,21 +1838,12 @@ class MainWindow(QMainWindow):
             self._character_library = library
         if scene_palette is not None and scene_palette.colors:
             self._scene_palette = scene_palette
-        if profile is not None:
-            self._style_profile = profile
-            try:
-                self._style_engine.save_style(profile)
-            except Exception:
-                pass
-        self._update_style_profile_label()
-        self._refresh_custom_style_combo()
         self._refresh_character_diagnostics()
         self._update_scene_palette_label()
         chars = len(getattr(self._character_library, "characters", []) or [])
         scenes = len(getattr(self._scene_palette, "colors", {}) or {})
-        style = getattr(self._style_profile, "name", "-") or "-"
         self.statusBar().showMessage(
-            tr("book_reference_bundle_status").format(chars=chars, scenes=scenes, style=style), 8000)
+            tr("book_reference_bundle_status").format(chars=chars, scenes=scenes, style=self._style_combo.currentText()), 8000)
 
     def _extract_scene_palette(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -2011,6 +1933,14 @@ class MainWindow(QMainWindow):
             "style_highlight_strength": self._style_highlight_slider.value(),
             "style_softness_strength": self._style_softness_slider.value(),
             "style_flatten_strength": self._style_flatten_slider.value(),
+            "light3_intensity": self._light3_intensity_slider.value(),
+            "filter_brightness": self._filter_brightness_slider.value(),
+            "filter_contrast": self._filter_contrast_slider.value(),
+            "filter_saturation": self._filter_saturation_slider.value(),
+            "filter_warmth": self._filter_warmth_slider.value(),
+            "filter_shadow": self._filter_shadow_slider.value(),
+            "filter_highlight": self._filter_highlight_slider.value(),
+            "filter_scope": self._filter_scope_combo.currentData(),
             "pastel_person_strength": self._pastel_person_slider.value(),
             "pastel_hair_strength": self._pastel_hair_slider.value(),
             "pastel_skin_strength": self._pastel_skin_slider.value(),
@@ -2021,6 +1951,7 @@ class MainWindow(QMainWindow):
             "gap_close": self._gap_close_slider.value(),
             "brush_size": self._brush_slider.value(),
             "picker_lightness": self._picker_lightness_slider.value(),
+            "manual_match_style": self._chk_manual_match_style.isChecked(),
             "skip_colored": self._chk_skip_colored.isChecked(),
             "character_memory": self._chk_character_memory.isChecked(),
         }
@@ -2036,8 +1967,7 @@ class MainWindow(QMainWindow):
             from core.project_store import save_project
             path = save_project(
                 path, pages=self._ordered_states(),
-                style_profile=self._style_profile,
-                character_library=self._character_library,
+                    character_library=self._character_library,
                 character_memories=self._character_memories,
                 scene_palette=self._scene_palette,
                 settings=self._project_settings())
@@ -2085,17 +2015,25 @@ class MainWindow(QMainWindow):
                 record.get("forced_character_matches", {}) or {})
             ai_path = record.get("ai_result")
             result_path = record.get("result")
+            filter_base_path = record.get("filter_base")
             if ai_path and os.path.isfile(ai_path):
                 state.ai_result_bgr = _uimread(ai_path)
             if result_path and os.path.isfile(result_path):
                 state.result_bgr = _uimread(result_path)
             elif state.ai_result_bgr is not None:
                 state.result_bgr = state.ai_result_bgr.copy()
+            if filter_base_path and os.path.isfile(filter_base_path):
+                state.filter_base_bgr = _uimread(filter_base_path)
+            elif state.result_bgr is not None:
+                # Compatibility with projects saved before V2 filter-base persistence.
+                state.filter_base_bgr = state.result_bgr.copy()
 
         settings = data.get("settings", {})
         loaded_style_key = settings.get("style_key")
         if loaded_style_key in {"monochrome_people", "monochrome_page"}:
             loaded_style_key = "monochrome"
+        if loaded_style_key == "light":
+            loaded_style_key = "light2"
             settings = dict(settings)
             if "pastel_environment_strength" not in settings:
                 settings["pastel_environment_strength"] = 0 if settings.get("style_key") == "monochrome_people" else 100
@@ -2105,7 +2043,6 @@ class MainWindow(QMainWindow):
             idx = widget.findData(desired)
             if idx >= 0:
                 widget.setCurrentIndex(idx)
-        self._style_profile = data["style_profile"]
         self._character_library = data["character_library"]
         self._character_memories = data["character_memories"]
         self._scene_palette = data.get("scene_palette")
@@ -2119,6 +2056,16 @@ class MainWindow(QMainWindow):
         self._style_highlight_slider.setValue(settings.get("style_highlight_strength", 100))
         self._style_softness_slider.setValue(settings.get("style_softness_strength", 100))
         self._style_flatten_slider.setValue(settings.get("style_flatten_strength", 100))
+        self._light3_intensity_slider.setValue(settings.get("light3_intensity", 100))
+        self._filter_brightness_slider.setValue(settings.get("filter_brightness", 100))
+        self._filter_contrast_slider.setValue(settings.get("filter_contrast", 100))
+        self._filter_saturation_slider.setValue(settings.get("filter_saturation", 100))
+        self._filter_warmth_slider.setValue(settings.get("filter_warmth", 100))
+        self._filter_shadow_slider.setValue(settings.get("filter_shadow", 100))
+        self._filter_highlight_slider.setValue(settings.get("filter_highlight", 100))
+        idx = self._filter_scope_combo.findData(settings.get("filter_scope", "current"))
+        if idx >= 0:
+            self._filter_scope_combo.setCurrentIndex(idx)
         self._pastel_person_slider.setValue(settings.get("pastel_person_strength", 100))
         self._pastel_hair_slider.setValue(settings.get("pastel_hair_strength", 100))
         self._pastel_skin_slider.setValue(settings.get("pastel_skin_strength", 100))
@@ -2131,10 +2078,11 @@ class MainWindow(QMainWindow):
             settings.get("gap_close", self._gap_close_slider.value())))
         self._brush_slider.setValue(settings.get("brush_size", self._brush_slider.value()))
         self._picker_lightness_slider.setValue(settings.get("picker_lightness", 0))
+        if getattr(self, '_chk_manual_match_style', None) is not None:
+            self._chk_manual_match_style.setChecked(settings.get("manual_match_style", True))
         self._chk_skip_colored.setChecked(settings.get("skip_colored", True))
         self._chk_character_memory.setChecked(settings.get("character_memory", True))
         self._current_project_path = path
-        self._update_style_profile_label()
         if self._page_list.count():
             self._page_list.setCurrentRow(0)
         self._update_controls_enabled()
@@ -2149,13 +2097,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_auto_status_label"):
             self._auto_status_label.setText(message)
 
-    def _on_batch_page_done(self, path: str, result_bgr: np.ndarray):
+    def _on_batch_page_done(self, path: str, result_payload):
         state = self._pages.get(path)
         if state is None:
             return
+        if isinstance(result_payload, tuple) and len(result_payload) == 2:
+            result_bgr, filter_base_bgr = result_payload
+        else:
+            result_bgr, filter_base_bgr = result_payload, None
         state.push_undo()  # snapshot whatever was there before this run
-        state.ai_result_bgr = result_bgr
-        state.result_bgr = result_bgr
+        state.ai_result_bgr = result_bgr.copy()
+        state.result_bgr = result_bgr.copy()
+        state.filter_base_bgr = (filter_base_bgr.copy() if filter_base_bgr is not None
+                                 else result_bgr.copy())
         state.pipeline_diagnostics = dict(
             getattr(state.hint_manager, "last_diagnostics", {}) or {})
         self._refresh_character_diagnostics()
@@ -2293,8 +2247,14 @@ class MainWindow(QMainWindow):
         is_eyedropper = getattr(self, "_radio_eyedropper", None) is not None and self._radio_eyedropper.isChecked()
         if getattr(self, "_eyedropper_mode_label", None) is not None:
             self._eyedropper_mode_label.setVisible(is_eyedropper)
-        if getattr(self, "_eyedropper_mode_combo", None) is not None:
-            self._eyedropper_mode_combo.setVisible(is_eyedropper)
+        mode_box = getattr(self, "_eyedropper_mode_box", None)
+        if mode_box is not None:
+            mode_box.setVisible(is_eyedropper)
+        else:
+            for widget_name in ("_eyedropper_mode_point", "_eyedropper_mode_region"):
+                widget = getattr(self, widget_name, None)
+                if widget is not None:
+                    widget.setVisible(is_eyedropper)
 
     def _on_tool_changed(self):
         if self._radio_brush.isChecked():
@@ -2305,6 +2265,29 @@ class MainWindow(QMainWindow):
             tool = HintCanvas.TOOL_BUCKET
         self._canvas.set_tool(tool)
         self._update_tool_specific_visibility()
+
+    def _current_eyedropper_mode(self) -> str:
+        if getattr(self, '_eyedropper_mode_region', None) is not None and self._eyedropper_mode_region.isChecked():
+            return 'region'
+        return 'point'
+
+    def _set_eyedropper_mode(self, mode: str):
+        mode = 'region' if mode == 'region' else 'point'
+        point = getattr(self, '_eyedropper_mode_point', None)
+        region = getattr(self, '_eyedropper_mode_region', None)
+        if point is not None:
+            point.blockSignals(True)
+        if region is not None:
+            region.blockSignals(True)
+        if point is not None:
+            point.setChecked(mode == 'point')
+        if region is not None:
+            region.setChecked(mode == 'region')
+        if point is not None:
+            point.blockSignals(False)
+        if region is not None:
+            region.blockSignals(False)
+        self._canvas.set_eyedropper_mode(mode)
 
     @staticmethod
     def _adjust_picker_lightness(rgb: tuple[int, int, int], amount: int) -> tuple[int, int, int]:
@@ -2352,15 +2335,67 @@ class MainWindow(QMainWindow):
     def _update_color_swatch(self):
         if getattr(self, "_color_swatch", None) is None:
             return
+        info = getattr(self, '_current_color_info', None)
         if self._uses_ai_original_color():
             self._color_swatch.setToolTip(tr("brush_color_mode_ai"))
+            self._color_swatch.setText('')
             self._color_swatch.setStyleSheet(
                 "background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #ffffff, stop:1 #cfd8ea); "
                 "border: 1px dashed #7e8aa6;")
+            if info is not None:
+                info.setText(tr("brush_color_mode_ai"))
+                info.setToolTip(tr("brush_color_mode_ai"))
         else:
-            self._color_swatch.setToolTip(self._brush_color.name())
-            self._color_swatch.setStyleSheet(
-                f"background-color: {self._brush_color.name()}; border: 1px solid #888;")
+            raw_rgb = (self._brush_color.red(), self._brush_color.green(), self._brush_color.blue())
+            shown_rgb = self._manual_target_rgb(raw_rgb) if self._manual_style_match_enabled() else raw_rgb
+            shown_hex = '#%02x%02x%02x' % shown_rgb
+            raw_hex = self._brush_color.name()
+            self._color_swatch.setText('')
+            if shown_hex.lower() != raw_hex.lower():
+                tip = tr("manual_color_preview_tooltip").format(raw=raw_hex, adapted=shown_hex)
+                self._color_swatch.setToolTip(tip)
+                self._color_swatch.setStyleSheet(
+                    f"background-color: {shown_hex}; border: 2px solid {raw_hex};")
+                if info is not None:
+                    info.setText(tr("current_color_value").format(current=raw_hex) + "\n" +
+                                 tr("adapted_color_value").format(adapted=shown_hex))
+                    info.setToolTip(tr("current_color_tooltip").format(current=raw_hex, adapted=shown_hex))
+            else:
+                self._color_swatch.setToolTip(raw_hex)
+                self._color_swatch.setStyleSheet(
+                    f"background-color: {raw_hex}; border: 1px solid #888;")
+                if info is not None:
+                    info.setText(tr("current_color_value").format(current=raw_hex))
+                    info.setToolTip(tr("current_color_tooltip").format(current=raw_hex, adapted=shown_hex))
+
+    def _manual_style_match_enabled(self) -> bool:
+        return bool(getattr(self, '_chk_manual_match_style', None) and self._chk_manual_match_style.isChecked())
+
+    def _active_manual_style_preset(self):
+        if not self._manual_style_match_enabled():
+            return None
+        key = None
+        combo = getattr(self, '_style_combo', None)
+        if combo is not None:
+            key = combo.currentData()
+        style = None
+        try:
+            from core.presets import get_style
+            style = get_style(key)
+            from pipeline import _apply_pastel_tuning
+            style = _apply_pastel_tuning(style, self._current_pastel_tuning())
+        except Exception:
+            return None
+        if style is None or getattr(style, 'key', 'none') == 'none':
+            return None
+        return style
+
+    def _manual_target_rgb(self, rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+        rgb = tuple(int(np.clip(v, 0, 255)) for v in rgb)
+        style = self._active_manual_style_preset()
+        if style is None:
+            return rgb
+        return adapt_rgb_to_style(rgb, style)
 
     def _on_color_picked(self, rgb: tuple):
         self._apply_picked_color(rgb, remember_raw=True)
@@ -2371,6 +2406,7 @@ class MainWindow(QMainWindow):
         state = self._current_state()
         self._local_brush_stroke_active = bool(
             state is not None and state.result_bgr is not None)
+        self._brush_changed_during_stroke = False
         if self._local_brush_stroke_active:
             state.push_undo()
             self._last_brush_was_local_edit = True
@@ -2385,6 +2421,13 @@ class MainWindow(QMainWindow):
             state.original_bgr, gap_close=gap_close)
 
         if state.result_bgr is not None:
+            # Be robust even if a platform drops the stroke-start signal: a dab
+            # must still create an undo checkpoint and become visible.
+            if not self._local_brush_stroke_active:
+                self._local_brush_stroke_active = True
+                self._brush_changed_during_stroke = False
+                state.push_undo()
+                self._last_brush_was_local_edit = True
             # The visible brush is a true local post-edit.  It never becomes a
             # whole-face/whole-region model instruction.
             h, w = state.result_bgr.shape[:2]
@@ -2397,24 +2440,44 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage(tr("manual_restore_unavailable"), 4000)
                     return
                 from core.local_brush import restore_local_brush_from_reference
+                before_restore = state.result_bgr.copy()
                 state.result_bgr, _mask = restore_local_brush_from_reference(
                     state.original_bgr, state.result_bgr, state.ai_result_bgr,
                     ix, iy, radius_px, opacity=0.88 * strength, region_map=region_map,
                     gap_close=gap_close)
+                if state.filter_base_bgr is not None:
+                    state.filter_base_bgr, _ = restore_local_brush_from_reference(
+                        state.original_bgr, state.filter_base_bgr, state.ai_result_bgr,
+                        ix, iy, radius_px, opacity=0.88 * strength, region_map=region_map,
+                        gap_close=gap_close)
+                self._brush_changed_during_stroke = self._brush_changed_during_stroke or not np.array_equal(before_restore, state.result_bgr)
                 self._last_local_edit_mode = "restore"
             else:
-                from core.local_brush import apply_local_brush_recolor
-                state.result_bgr, _mask = apply_local_brush_recolor(
-                    state.original_bgr, state.result_bgr, ix, iy, radius_px, rgb,
+                paint_rgb = self._manual_target_rgb(rgb)
+                state.result_bgr, state.filter_base_bgr, _mask, changed = apply_brush_edit(
+                    state.original_bgr, state.result_bgr, state.filter_base_bgr,
+                    ix, iy, radius_px, paint_rgb,
                     opacity=min(1.0, 1.00 * strength), region_map=region_map,
                     gap_close=gap_close)
+                self._brush_changed_during_stroke = self._brush_changed_during_stroke or changed
                 self._last_local_edit_mode = "paint"
+            if self._brush_changed_during_stroke:
+                self._radio_view_edited.setChecked(True)
+                # Immediate pixel refresh: the edit is visible while dragging,
+                # not only after a mouse-release event.
+                if hasattr(self._canvas, "update_image_pixels"):
+                    self._canvas.update_image_pixels(state.result_bgr)
+                else:
+                    self._sync_view_after_edit(state)
             return
 
         # Before the first AI result, retain a *local* model hint.  Ordinary
         # manual hints no longer expand into highlight/mid/shadow points across
         # the entire connected region.
-        state.hint_manager.add_manual_hint(x_norm, y_norm, rgb, radius_norm)
+        state.push_undo()
+        changed = state.hint_manager.add_manual_hint(x_norm, y_norm, rgb, radius_norm)
+        if not changed:
+            state.discard_unchanged_undo()
         self._refresh_hint_overlay()
 
     def _on_brush_stroke_finished(self):
@@ -2424,29 +2487,39 @@ class MainWindow(QMainWindow):
         self._local_brush_stroke_active = False
         if state is None or state.result_bgr is None:
             return
+        state.discard_unchanged_undo()
         self._canvas.clear_dabs()
         self._radio_view_edited.setChecked(True)
         self._sync_view_after_edit(state)
-        message = tr("local_brush_done")
+        if self._brush_changed_during_stroke:
+            message = tr("local_brush_done")
+        else:
+            message = tr("manual_edit_no_change")
         self.statusBar().showMessage(message, 3500)
+        self._brush_changed_during_stroke = False
 
     def _undo_last_hint(self):
+        """Use the same force-undo history as Ctrl+Z.
+
+        Keeping a second, hint-only undo path caused the canvas overlay and the
+        actual page state to diverge.  One history now owns every edit.
+        """
         state = self._current_state()
         if state is None:
             return
-        if self._last_brush_was_local_edit and state.undo_stack:
+        if state.undo_stack:
             self._undo()
             self._last_brush_was_local_edit = False
             return
-        state.hint_manager.undo_last_manual()
-        self._canvas.undo_last_dab()
-        self._refresh_hint_overlay()
+        self.statusBar().showMessage(tr("nothing_to_undo"), 1800)
 
     def _clear_manual_hints(self):
         state = self._current_state()
         if state is None:
             return
+        state.push_undo()
         state.hint_manager.clear_manual_hints()
+        state.discard_unchanged_undo()
         self._canvas.clear_dabs()
         self._refresh_hint_overlay()
 
@@ -2458,16 +2531,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, tr("no_result_title"), tr("no_result_body"))
             return
 
-        hex_color = self._brush_color.name()  # '#rrggbb'
+        paint_rgb = self._manual_target_rgb((self._brush_color.red(), self._brush_color.green(), self._brush_color.blue()))
+        hex_color = '#%02x%02x%02x' % paint_rgb
         gap_close = self._gap_px_from_percent(self._gap_close_slider.value())
         fill_mode = self._fill_mode_combo.currentData()
 
         region_map = state.hint_manager.bind_source_image(
             state.original_bgr, gap_close=gap_close)
-        new_img, mask = lineart_region_recolor(
-            state.original_bgr, state.result_bgr.copy(), ix, iy, hex_color,
-            gap_close=gap_close, mode=fill_mode, feather=2,
-            region_map=region_map)
+        new_img, new_base, mask, changed = apply_region_edit(
+            state.original_bgr, state.result_bgr, state.filter_base_bgr,
+            ix, iy, hex_color, gap_close=gap_close, mode=fill_mode,
+            feather=2, region_map=region_map)
         if not mask.any():
             self.statusBar().showMessage(tr("no_fill_area"), 5000)
             return
@@ -2479,31 +2553,80 @@ class MainWindow(QMainWindow):
             if restore.shape[:2] != state.result_bgr.shape[:2]:
                 restore = cv2.resize(restore, (state.result_bgr.shape[1], state.result_bgr.shape[0]), interpolation=cv2.INTER_AREA)
             state.result_bgr[mask > 0] = restore[mask > 0]
+            if state.filter_base_bgr is not None:
+                state.filter_base_bgr[mask > 0] = restore[mask > 0]
             message = tr("region_restore_done")
         else:
             state.result_bgr = new_img
-            message = tr("region_fill_done")
+            state.filter_base_bgr = new_base
+            message = tr("region_fill_done") if changed else tr("manual_edit_no_change")
+        state.discard_unchanged_undo()
+        self._radio_view_edited.setChecked(True)
         self._sync_view_after_edit(state)
         self.statusBar().showMessage(message, 3000)
 
     def _undo(self):
+        """Force-revert to the nearest genuinely different prior state."""
         state = self._current_state()
         if state is None or not state.undo_stack:
+            self.statusBar().showMessage(tr("nothing_to_undo"), 1800)
             return
-        if state.result_bgr is not None:
-            state.redo_stack.append(state.result_bgr.copy())
-        state.result_bgr = state.undo_stack.pop()
+        current = state.edit_snapshot()
+        target = None
+        # Skip stale/no-op checkpoints so one Ctrl+Z always produces a visible
+        # state change whenever an earlier state exists.
+        while state.undo_stack:
+            candidate = state.undo_stack.pop()
+            if not state._snapshot_equal(candidate, current):
+                target = candidate
+                break
+        if target is None:
+            self.statusBar().showMessage(tr("nothing_to_undo"), 1800)
+            return
+        state.redo_stack.append(current)
+        if len(state.redo_stack) > 20:
+            state.redo_stack.pop(0)
+        state.restore_snapshot(target)
+        self._radio_view_edited.setChecked(state.result_bgr is not None)
+        if state.result_bgr is None:
+            self._radio_view_original.setChecked(True)
+            self._unmark_page_done(state.path)
+        else:
+            self._mark_page_done(state.path)
+        self._canvas.clear_dabs()
         self._sync_view_after_edit(state)
-        self.statusBar().showMessage(tr("undone"), 2000)
+        self._refresh_character_diagnostics()
+        self.statusBar().showMessage(tr("force_undone"), 2200)
 
     def _redo(self):
+        """Restore the nearest genuinely different forward state."""
         state = self._current_state()
         if state is None or not state.redo_stack:
+            self.statusBar().showMessage(tr("nothing_to_redo"), 1800)
             return
-        if state.result_bgr is not None:
-            state.undo_stack.append(state.result_bgr.copy())
-        state.result_bgr = state.redo_stack.pop()
+        current = state.edit_snapshot()
+        target = None
+        while state.redo_stack:
+            candidate = state.redo_stack.pop()
+            if not state._snapshot_equal(candidate, current):
+                target = candidate
+                break
+        if target is None:
+            self.statusBar().showMessage(tr("nothing_to_redo"), 1800)
+            return
+        state.undo_stack.append(current)
+        if len(state.undo_stack) > 20:
+            state.undo_stack.pop(0)
+        state.restore_snapshot(target)
+        self._radio_view_edited.setChecked(state.result_bgr is not None)
+        if state.result_bgr is None:
+            self._radio_view_original.setChecked(True)
+            self._unmark_page_done(state.path)
+        else:
+            self._mark_page_done(state.path)
+        self._canvas.clear_dabs()
         self._sync_view_after_edit(state)
+        self._refresh_character_diagnostics()
         self.statusBar().showMessage(tr("redone"), 2000)
 
     def _restore_to_original(self):
@@ -2516,15 +2639,15 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
+        state.push_undo()
         state.ai_result_bgr = None
         state.result_bgr = None
+        state.filter_base_bgr = None
         state.quality_report = None
         state.hint_manager = HintManager()
         state.hint_manager.bind_source_image(
             state.original_bgr,
             gap_close=self._gap_px_from_percent(self._gap_close_slider.value()))
-        state.undo_stack.clear()
-        state.redo_stack.clear()
         self._canvas.clear_dabs()
         self._radio_view_edited.setChecked(False)
         self._radio_view_original.setChecked(True)
