@@ -5,8 +5,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from core.paint_bucket import hex_to_lab
-from core.perceptual_recolor import perceptual_target_ab
+from core.perceptual_recolor import recolor_with_mode
 from core.region_map import RegionMap, build_region_map
 
 
@@ -43,7 +42,9 @@ def _connected_component(binary: np.ndarray, x: int, y: int) -> np.ndarray:
 
 def _refine_region_mask(original_bw: np.ndarray, result_bgr: np.ndarray,
                         mask: np.ndarray, x: int, y: int,
-                        region_map: RegionMap | None = None) -> np.ndarray:
+                        region_map: RegionMap | None = None, *,
+                        safety_margin: float = 2.8,
+                        max_area_ratio: float = 0.35) -> np.ndarray:
     """Split suspiciously leaky regions using local tone/chroma continuity.
 
     If a line gap leaves two semantic areas connected, the raw connected
@@ -54,11 +55,13 @@ def _refine_region_mask(original_bw: np.ndarray, result_bgr: np.ndarray,
     if mask is None or not np.any(mask):
         return mask
     binary = mask > 0
+    h, w = binary.shape[:2]
     area = int(np.count_nonzero(binary))
+    max_area = int(max(1, h * w) * float(max_area_ratio))
+    oversized = area > max_area
     if area < 48:
         return mask
 
-    h, w = binary.shape[:2]
     x = int(np.clip(x, 0, w - 1))
     y = int(np.clip(y, 0, h - 1))
     seed = _nearest_valid_seed(binary.astype(np.uint8), x, y)
@@ -71,8 +74,11 @@ def _refine_region_mask(original_bw: np.ndarray, result_bgr: np.ndarray,
     lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
     region_id = region_map.region_at(sx, sy) if region_map is not None else 0
+    if region_map is not None and region_map.touches_border(region_id):
+        return np.zeros_like(mask, dtype=np.uint8)
     if region_map is not None and region_id > 0:
-        safety = region_map.safe_interior(region_id, margin_px=2.4)
+        safety = region_map.safe_interior(
+            region_id, margin_px=max(0.5, float(safety_margin)))
     else:
         safety = binary.astype(np.float32)
 
@@ -100,14 +106,16 @@ def _refine_region_mask(original_bw: np.ndarray, result_bgr: np.ndarray,
         return mask
 
     comp_area = int(np.count_nonzero(component))
+    if comp_area > max_area:
+        return np.zeros_like(mask, dtype=np.uint8)
     # Adopt the refined component when it materially reduces an over-large or
     # leaky region, but never collapse a normal fill down to a tiny fragment.
     min_keep = min(max(36, area // 200), max(96, area // 20))
     if comp_area >= min_keep and comp_area <= int(area * 0.97):
         return component
     if comp_area >= int(area * 0.97):
-        return component
-    return mask
+        return component if not oversized else np.zeros_like(mask, dtype=np.uint8)
+    return np.zeros_like(mask, dtype=np.uint8) if oversized else mask
 
 
 def _fillable_mask(gray_or_bgr: np.ndarray, line_low: int = 75,
@@ -177,7 +185,18 @@ def lineart_mask_at_point(gray_or_bgr: np.ndarray, x: int, y: int, *,
     supplied_map = region_map is not None
     region_map = region_map or build_region_map(
         gray_or_bgr, line_low=line_low, gap_close=gap_close)
+    h, w = region_map.shape
+    if not (0 <= int(x) < w and 0 <= int(y) < h):
+        return np.zeros(region_map.shape, dtype=np.uint8)
+
+    # A direct click in the page-wide component is a background click, not a
+    # request to search for a nearby small region.  Reject it immediately.
+    direct_id = int(region_map.labels[int(y), int(x)])
+    if direct_id > 0 and region_map.touches_border(direct_id):
+        return np.zeros(region_map.shape, dtype=np.uint8)
+
     search_radius = max(10, int(gap_close) * 2 + 8)
+    selected_map = region_map
     region_id = region_map.region_at(int(x), int(y), search_radius=search_radius)
     mask = region_map.mask(region_id)
 
@@ -185,7 +204,6 @@ def lineart_mask_at_point(gray_or_bgr: np.ndarray, x: int, y: int, *,
     # small neighbourhood and prefer the smallest reasonable nearby component.
     area = int(np.count_nonzero(mask))
     if area == 0 or area > int(mask.size * 0.20):
-        h, w = region_map.shape
         x1, x2 = max(0, int(x) - 4), min(w, int(x) + 5)
         y1, y2 = max(0, int(y) - 4), min(h, int(y) + 5)
         local = region_map.labels[y1:y2, x1:x2]
@@ -210,9 +228,38 @@ def lineart_mask_at_point(gray_or_bgr: np.ndarray, x: int, y: int, *,
         retry_area = int(np.count_nonzero(retry_mask))
         page_area = int(mask.size)
         safe_cap = min(int(page_area * 0.10), max(512, base_area * 16))
-        if base_area < retry_area <= safe_cap:
+        if (base_area < retry_area <= safe_cap
+                and not retry.is_background_region(
+                    retry_id, max_area_ratio=0.35)):
             mask = retry_mask
+            region_id = retry_id
+            selected_map = retry
+
+    if selected_map.touches_border(region_id):
+        return np.zeros(region_map.shape, dtype=np.uint8)
     return mask
+
+
+def refined_lineart_mask_at_point(original_bw: np.ndarray, result_bgr: np.ndarray,
+                                    x: int, y: int, *,
+                                    line_low: int = 75, gap_close: int = 4,
+                                    region_map: RegionMap | None = None) -> np.ndarray:
+    """Return the reference-style refined region mask without recoloring.
+
+    The raw line component is first controlled by ``gap_close`` and then split
+    by the current tone/chroma field, matching the supplied Colortina-main
+    behaviour while avoiding an unnecessary probe recolor.
+    """
+    region_map = region_map or build_region_map(
+        original_bw, line_low=line_low, gap_close=gap_close)
+    mask = lineart_mask_at_point(
+        original_bw, x, y, line_low=line_low, gap_close=gap_close,
+        region_map=region_map)
+    if mask is None or not np.any(mask):
+        return np.zeros(region_map.shape, np.uint8)
+    mask = _refine_region_mask(
+        original_bw, result_bgr, mask, x, y, region_map=region_map)
+    return np.where(mask > 0, 255, 0).astype(np.uint8)
 
 
 def _inside_feather(mask: np.ndarray, feather: int) -> np.ndarray:
@@ -254,6 +301,8 @@ def lineart_region_recolor(original_bw: np.ndarray, result_bgr: np.ndarray,
     if not mask.any():
         return result_bgr, mask
     mask = _refine_region_mask(original_bw, result_bgr, mask, x, y, region_map=region_map)
+    if mask is None or not np.any(mask):
+        return result_bgr, np.zeros(region_map.shape, np.uint8)
 
     h, w = mask.shape
     bx, by, bw_, bh_ = cv2.boundingRect(mask)
@@ -266,38 +315,12 @@ def lineart_region_recolor(original_bw: np.ndarray, result_bgr: np.ndarray,
     roi_mask = mask[y1:y2, x1:x2]
     soft = _inside_feather(roi_mask, feather)
 
-    L_target, a_target, b_target = hex_to_lab(hex_color)
-    # One-pass chroma compensation: preserving existing luminance otherwise
-    # makes a selected colour appear too weak, especially on pale manga tones.
-    a_target = float(np.clip(128.0 + (a_target - 128.0) * 1.10, 0.0, 255.0))
-    b_target = float(np.clip(128.0 + (b_target - 128.0) * 1.10, 0.0, 255.0))
+    value = hex_color.lstrip('#')
+    r, g, b = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
     roi = result_bgr[y1:y2, x1:x2]
-    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    active = roi_mask > 0
-    target_ab = np.array([a_target, b_target], dtype=np.float32)
-    if mode == "flat":
-        # Explicit flat mode remains available, but even here retain a modest
-        # amount of AI colour variation so the fill does not look pasted on.
-        desired_ab = perceptual_target_ab(
-            lab, active, target_ab, texture_retention=0.22, chroma_retention=0.30)
-        l_soft = np.clip(soft * 0.42, 0.0, 1.0)
-    elif mode == "shading":
-        desired_ab = perceptual_target_ab(
-            lab, active, target_ab, texture_retention=0.74, chroma_retention=0.90)
-        l_soft = np.clip(soft * 0.04, 0.0, 1.0)
-    else:
-        desired_ab = perceptual_target_ab(
-            lab, active, target_ab, texture_retention=0.66, chroma_retention=0.86)
-        l_soft = np.clip(soft * 0.06, 0.0, 1.0)
-
-    lab[:, :, 1:3] = np.clip(
-        lab[:, :, 1:3] * (1.0 - soft[:, :, None]) + desired_ab * soft[:, :, None],
-        0.0, 255.0)
-    lab[:, :, 0] = lab[:, :, 0] * (1.0 - l_soft) + float(L_target) * l_soft
-    np.clip(lab, 0, 255, out=lab)
-
-    recolored = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    recolored = recolor_with_mode(
+        roi, (r, g, b), soft, active=roi_mask > 0, mode=mode)
     # Defensive guarantee: even rounding/ROI code may never touch pixels
     # outside the connected component.
     binary = (roi_mask > 0)[:, :, None]

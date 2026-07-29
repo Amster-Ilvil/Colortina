@@ -24,9 +24,11 @@ pydantic>=2.5
 # Phase 2 — desktop editor UI
 PySide6>=6.6
 
-# Optional — only used by core/upscaler.py for the "Ultra" quality
-# preset's 4x upscale pass. Without these installed (or without the
-# weights downloaded), upscaling silently falls back to a Lanczos
-# resize, so these are NOT required for the app to run.
-# realesrgan>=0.3
-# basicsr>=1.4
+# Local ONNX inference — text/bubble protection (comic-text-detector)
+# and character-scope segmentation (SkyTNT anime-seg). Both features
+# degrade gracefully when the model files are absent.
+onnxruntime>=1.20
+
+# Real-ESRGAN upscaling now uses the vendored torch-only RRDBNet in
+# vendor/realesrgan_min — the fragile realesrgan/basicsr packages are
+# no longer needed. Only the anime6B weights file is required.

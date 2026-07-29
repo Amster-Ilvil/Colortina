@@ -71,7 +71,7 @@ class StylePreset:
 STYLE_PRESETS: dict[str, StylePreset] = {
     "none": StylePreset(
         key="none",
-        label="MC v2 (\u539f\u59cb mc-v2)",
+        label="MC v2",
         description=("No style processing at all - skips guided/CLIP hint "
                      "generation and post-processing color grading, "
                      "returning the original manga-colorization-v2 output "

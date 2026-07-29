@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QRectF
-from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QBrush
-from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF
+from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QBrush, QPainterPath
+from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsRectItem
 
 
 def bgr_to_qpixmap(image_bgr: np.ndarray) -> QPixmap:
@@ -33,14 +33,31 @@ class HintCanvas(QGraphicsView):
     hint_dab_added = Signal(float, float, tuple, float)
     brush_stroke_started = Signal()
     brush_stroke_finished = Signal()
-    # Emitted when the eyedropper samples a pixel: (r, g, b)
-    color_picked = Signal(tuple)
+    # Completely independent custom-colour-bias brush channel.
+    bias_brush_dab_added = Signal(float, float, float)
+    bias_brush_stroke_started = Signal()
+    bias_brush_stroke_finished = Signal()
+    bias_eraser_dab_added = Signal(float, float, float)
+    bias_eraser_stroke_started = Signal()
+    bias_eraser_stroke_finished = Signal()
+    # Emitted when the eyedropper samples a pixel: ((r, g, b), x_norm, y_norm)
+    color_picked = Signal(tuple, float, float)
     # Emitted by the region-fill (paint bucket) tool: full-res pixel coords
     region_fill_requested = Signal(int, int)
+    # Emitted by selection-recolor tools. Polygon points are image pixel coords.
+    polygon_fill_requested = Signal(object)
+    rect_fill_requested = Signal(int, int, int, int)
+    selection_preview_active = Signal(bool)
+    # Emitted when the user manually tweaks the pending blue selection mask: (ix, iy, radius_px, add_mode)
+    selection_adjust_dab = Signal(int, int, int, bool)
 
     TOOL_BRUSH = "brush"
+    TOOL_BIAS_BRUSH = "bias_brush"
+    TOOL_BIAS_ERASER = "bias_eraser"
     TOOL_EYEDROPPER = "eyedropper"
     TOOL_BUCKET = "bucket"
+    TOOL_LASSO_BUCKET = "lasso_bucket"
+    TOOL_RECT_BUCKET = "rect_bucket"
     TOOL_PAN = "pan"
 
     def __init__(self, parent=None):
@@ -59,10 +76,26 @@ class HintCanvas(QGraphicsView):
         self._tool = self.TOOL_BRUSH
         self._brush_color = QColor(255, 0, 0)
         self._brush_radius = 12  # image pixels
+        self._bias_brush_color = QColor(120, 160, 255)
+        self._bias_brush_radius = 18
+        self._bias_eraser_color = QColor(210, 210, 210)
+        self._bias_eraser_radius = 18
         self._painting = False
         self._dab_items: list[QGraphicsEllipseItem] = []
         self._debug_items: list = []
         self._last_dab_pos: tuple[int, int] | None = None
+        self._selection_points: list[tuple[int, int]] = []
+        self._selection_item: QGraphicsPathItem | None = None
+        self._selection_rect_item: QGraphicsRectItem | None = None
+        self._pending_selection_item: QGraphicsPathItem | None = None
+        self._selection_combine_mode = "replace"
+        self._selection_start: tuple[int, int] | None = None
+        self._selection_rect: tuple[int, int, int, int] | None = None
+        self._selection_adjust_enabled = False
+        self._selection_adjust_radius = 18
+        self._selection_adjust_active = False
+        self._selection_adjust_add_mode = True
+        self._selection_adjust_mode = "add"
 
     # ── Image display ──────────────────────────────────────────────────
 
@@ -74,6 +107,12 @@ class HintCanvas(QGraphicsView):
         self._scene.clear()
         self._dab_items = []
         self._debug_items = []
+        self._selection_points = []
+        self._selection_item = None
+        self._selection_rect_item = None
+        self._pending_selection_item = None
+        self._selection_start = None
+        self._selection_rect = None
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(QRectF(0, 0, self._image_w, self._image_h))
 
@@ -167,6 +206,8 @@ class HintCanvas(QGraphicsView):
                 self._debug_items.append(label_item)
 
         for hint in hints or []:
+            if getattr(hint, "source", "") == "eyedropper_hint":
+                continue
             x = float(hint.x_norm) * self._image_w
             y = float(hint.y_norm) * self._image_h
             radius = max(3.0, float(hint.radius_norm) * self._image_w)
@@ -194,6 +235,15 @@ class HintCanvas(QGraphicsView):
     def set_brush_radius(self, radius_px: int) -> None:
         self._brush_radius = max(1, radius_px)
 
+    def set_bias_brush_color(self, color: QColor) -> None:
+        self._bias_brush_color = QColor(color)
+
+    def set_bias_brush_radius(self, radius_px: int) -> None:
+        self._bias_brush_radius = max(1, int(radius_px))
+
+    def set_bias_eraser_radius(self, radius_px: int) -> None:
+        self._bias_eraser_radius = max(1, int(radius_px))
+
     def zoom_in(self) -> None:
         self.scale(1.25, 1.25)
 
@@ -205,6 +255,26 @@ class HintCanvas(QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     # ── Mouse handling ────────────────────────────────────────────────
+    def set_selection_adjust_enabled(self, enabled: bool) -> None:
+        self._selection_adjust_enabled = bool(enabled)
+
+    def set_selection_adjust_radius(self, radius_px: int) -> None:
+        self._selection_adjust_radius = max(1, int(radius_px))
+
+    def set_selection_adjust_mode(self, mode: str) -> None:
+        self._selection_adjust_mode = "erase" if str(mode) == "erase" else "add"
+
+    def _can_adjust_pending_selection(self) -> bool:
+        return bool(self._selection_adjust_enabled and self._pending_selection_item is not None
+                    and self._tool in (self.TOOL_RECT_BUCKET, self.TOOL_LASSO_BUCKET))
+
+    def _emit_selection_adjust_dab(self, ix: int, iy: int) -> None:
+        if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+            self.selection_adjust_dab.emit(
+                int(ix), int(iy), int(self._selection_adjust_radius),
+                bool(self._selection_adjust_add_mode))
+
+    # ── Mouse handling ────────────────────────────────────────────────
 
     def set_eyedropper_mode(self, mode: str) -> None:
         """'point' samples the single pixel under the cursor; 'region'
@@ -212,6 +282,7 @@ class HintCanvas(QGraphicsView):
         (tolerance flood fill) — much more robust on screentone,
         gradients and JPEG noise."""
         self._eyedropper_mode = mode if mode in ("point", "region") else "point"
+
 
     def _robust_patch_color(self, ix: int, iy: int, radius: int = 2) -> tuple[int, int, int] | None:
         if self._current_bgr is None:
@@ -293,9 +364,6 @@ class HintCanvas(QGraphicsView):
                  self._brush_color.blue())
         x_norm = ix / self._image_w
         y_norm = iy / self._image_h
-        # Brush radius is in image pixels (matches the visual overlay
-        # below) — convert to a fraction of image width so it survives
-        # the resize into the model's working resolution unchanged.
         radius_norm = self._brush_radius / self._image_w
 
         item = QGraphicsEllipseItem(ix - self._brush_radius, iy - self._brush_radius,
@@ -308,6 +376,186 @@ class HintCanvas(QGraphicsView):
 
         self.hint_dab_added.emit(x_norm, y_norm, color, radius_norm)
 
+    def _drop_bias_dab(self, ix: int, iy: int) -> None:
+        def emit_bias_point(px: int, py: int) -> None:
+            x_norm = px / max(1, self._image_w)
+            y_norm = py / max(1, self._image_h)
+            radius_norm = self._bias_brush_radius / max(1, self._image_w)
+            item = QGraphicsEllipseItem(
+                px - self._bias_brush_radius, py - self._bias_brush_radius,
+                self._bias_brush_radius * 2, self._bias_brush_radius * 2)
+            preview = QColor(self._bias_brush_color)
+            item.setBrush(QBrush(preview))
+            item.setPen(QPen(QColor(255, 255, 255, 210),
+                             max(1, self._bias_brush_radius // 8)))
+            item.setOpacity(0.42)
+            item.setZValue(12)
+            self._scene.addItem(item)
+            self._dab_items.append(item)
+            self.bias_brush_dab_added.emit(x_norm, y_norm, radius_norm)
+
+        if self._last_dab_pos is None:
+            self._last_dab_pos = (ix, iy)
+            emit_bias_point(ix, iy)
+            return
+
+        lx, ly = self._last_dab_pos
+        dx = ix - lx
+        dy = iy - ly
+        min_step = max(2, int(self._bias_brush_radius * 0.34))
+        distance = float(np.hypot(dx, dy))
+        if distance < float(min_step):
+            return
+        steps = max(1, int(np.ceil(distance / float(min_step))))
+        for step in range(1, steps + 1):
+            t = step / float(steps)
+            px = int(round(lx + dx * t))
+            py = int(round(ly + dy * t))
+            emit_bias_point(px, py)
+        self._last_dab_pos = (ix, iy)
+
+
+    def _drop_bias_eraser_dab(self, ix: int, iy: int) -> None:
+        def emit_eraser_point(px: int, py: int) -> None:
+            x_norm = px / max(1, self._image_w)
+            y_norm = py / max(1, self._image_h)
+            radius_norm = self._bias_eraser_radius / max(1, self._image_w)
+            item = QGraphicsEllipseItem(
+                px - self._bias_eraser_radius, py - self._bias_eraser_radius,
+                self._bias_eraser_radius * 2, self._bias_eraser_radius * 2)
+            preview = QColor(self._bias_eraser_color)
+            item.setBrush(QBrush(QColor(preview.red(), preview.green(), preview.blue(), 40)))
+            item.setPen(QPen(QColor(255, 255, 255, 220),
+                             max(1, self._bias_eraser_radius // 8)))
+            item.setOpacity(0.55)
+            item.setZValue(12)
+            self._scene.addItem(item)
+            self._dab_items.append(item)
+            self.bias_eraser_dab_added.emit(x_norm, y_norm, radius_norm)
+
+        if self._last_dab_pos is None:
+            self._last_dab_pos = (ix, iy)
+            emit_eraser_point(ix, iy)
+            return
+
+        lx, ly = self._last_dab_pos
+        dx = ix - lx
+        dy = iy - ly
+        min_step = max(2, int(self._bias_eraser_radius * 0.34))
+        distance = float(np.hypot(dx, dy))
+        if distance < float(min_step):
+            return
+        steps = max(1, int(np.ceil(distance / float(min_step))))
+        for step in range(1, steps + 1):
+            t = step / float(steps)
+            px = int(round(lx + dx * t))
+            py = int(round(ly + dy * t))
+            emit_eraser_point(px, py)
+        self._last_dab_pos = (ix, iy)
+
+    def set_selection_combine_mode(self, mode: str) -> None:
+        self._selection_combine_mode = mode if mode in {"replace", "add", "subtract"} else "replace"
+
+    def _selection_preview_color(self, mode: str | None = None) -> QColor:
+        mode = mode or self._selection_combine_mode
+        if mode == "add":
+            return QColor(0, 185, 100)
+        if mode == "subtract":
+            return QColor(225, 70, 70)
+        return QColor(0, 150, 245)
+
+    def set_selection_mask_overlay(self, mask: np.ndarray | None,
+                                   mode: str | None = None) -> None:
+        self._clear_drawing_selection_overlay()
+        self._clear_pending_selection_overlay()
+        if mask is None or mask.size == 0 or not np.any(mask):
+            self.selection_preview_active.emit(False)
+            return
+        binary = (mask > 0).astype(np.uint8)
+        contours, _ = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            self.selection_preview_active.emit(False)
+            return
+        path = QPainterPath()
+        for contour in contours:
+            if len(contour) < 2:
+                continue
+            first = contour[0][0]
+            path.moveTo(float(first[0]), float(first[1]))
+            for pt in contour[1:]:
+                x, y = pt[0]
+                path.lineTo(float(x), float(y))
+            path.closeSubpath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        color = self._selection_preview_color(mode)
+        item = QGraphicsPathItem(path)
+        item.setPen(QPen(color, 2))
+        item.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 36)))
+        item.setZValue(19)
+        self._scene.addItem(item)
+        self._pending_selection_item = item
+        self.selection_preview_active.emit(True)
+
+    def clear_selection_preview(self) -> None:
+        self._selection_points = []
+        self._selection_start = None
+        self._selection_rect = None
+        self._clear_selection_overlay()
+        self.selection_preview_active.emit(False)
+
+    def _clear_pending_selection_overlay(self) -> None:
+        item = self._pending_selection_item
+        if item is not None:
+            try:
+                self._scene.removeItem(item)
+            except RuntimeError:
+                pass
+            self._pending_selection_item = None
+
+    def _clear_drawing_selection_overlay(self) -> None:
+        for attr in ("_selection_item", "_selection_rect_item"):
+            item = getattr(self, attr, None)
+            if item is not None:
+                try:
+                    self._scene.removeItem(item)
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
+
+    def _clear_selection_overlay(self) -> None:
+        self._clear_drawing_selection_overlay()
+        self._clear_pending_selection_overlay()
+
+    def _update_polygon_overlay(self, closed: bool = False) -> None:
+        self._clear_drawing_selection_overlay()
+        if len(self._selection_points) < 2:
+            return
+        path = QPainterPath(QPointF(*self._selection_points[0]))
+        for x, y in self._selection_points[1:]:
+            path.lineTo(float(x), float(y))
+        if closed and len(self._selection_points) >= 3:
+            path.closeSubpath()
+        color = self._selection_preview_color()
+        item = QGraphicsPathItem(path)
+        item.setPen(QPen(color, 2))
+        item.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 40)))
+        item.setZValue(20)
+        self._scene.addItem(item)
+        self._selection_item = item
+
+    def _update_rect_overlay(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        self._clear_drawing_selection_overlay()
+        self._selection_rect = (x1, y1, x2, y2)
+        rx1, rx2 = sorted((x1, x2))
+        ry1, ry2 = sorted((y1, y2))
+        color = self._selection_preview_color()
+        item = QGraphicsRectItem(rx1, ry1, max(1, rx2-rx1), max(1, ry2-ry1))
+        item.setPen(QPen(color, 2))
+        item.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 40)))
+        item.setZValue(20)
+        self._scene.addItem(item)
+        self._selection_rect_item = item
+
     def _event_scene_pos(self, event):
         try:
             viewport_pos = event.position().toPoint()
@@ -319,9 +567,18 @@ class HintCanvas(QGraphicsView):
         if self._pixmap_item is None:
             return super().mousePressEvent(event)
 
+        pos = self._event_scene_pos(event)
+        ix, iy = int(pos.x()), int(pos.y())
+
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            if self._can_adjust_pending_selection():
+                self._selection_adjust_active = True
+                configured_add = self._selection_adjust_mode != "erase"
+                self._selection_adjust_add_mode = (configured_add if event.button() == Qt.MouseButton.LeftButton else not configured_add)
+                self._emit_selection_adjust_dab(ix, iy)
+                return
+
         if event.button() == Qt.MouseButton.LeftButton:
-            pos = self._event_scene_pos(event)
-            ix, iy = int(pos.x()), int(pos.y())
 
             if self._tool == self.TOOL_BRUSH:
                 if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
@@ -330,35 +587,147 @@ class HintCanvas(QGraphicsView):
                     self.brush_stroke_started.emit()
                     self._drop_dab(ix, iy)
                 return
+            elif self._tool == self.TOOL_BIAS_BRUSH:
+                if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                    self._painting = True
+                    self._last_dab_pos = None
+                    self.bias_brush_stroke_started.emit()
+                    self._drop_bias_dab(ix, iy)
+                return
+            elif self._tool == self.TOOL_BIAS_ERASER:
+                if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                    self._painting = True
+                    self._last_dab_pos = None
+                    self.bias_eraser_stroke_started.emit()
+                    self._drop_bias_eraser_dab(ix, iy)
+                return
             elif self._tool == self.TOOL_EYEDROPPER:
                 color = self._sample_color_at(ix, iy)
                 if color is not None:
-                    self.color_picked.emit(color)
+                    x_norm = ix / max(1, self._image_w - 1)
+                    y_norm = iy / max(1, self._image_h - 1)
+                    self.color_picked.emit(color, float(x_norm), float(y_norm))
                 return
             elif self._tool == self.TOOL_BUCKET:
                 if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
                     self.region_fill_requested.emit(ix, iy)
                 return
+            elif self._tool == self.TOOL_LASSO_BUCKET:
+                if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                    self._selection_points = [(ix, iy)]
+                    self._painting = True
+                    self._update_polygon_overlay()
+                return
+            elif self._tool == self.TOOL_RECT_BUCKET:
+                if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                    self._selection_start = (ix, iy)
+                    self._painting = True
+                    self._update_rect_overlay(ix, iy, ix, iy)
+                return
 
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._selection_adjust_active and self._can_adjust_pending_selection():
+            pos = self._event_scene_pos(event)
+            ix, iy = int(pos.x()), int(pos.y())
+            self._emit_selection_adjust_dab(ix, iy)
+            return
         if self._painting and self._tool == self.TOOL_BRUSH:
             pos = self._event_scene_pos(event)
             ix, iy = int(pos.x()), int(pos.y())
             if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
                 self._drop_dab(ix, iy)
             return
+        if self._painting and self._tool == self.TOOL_BIAS_BRUSH:
+            pos = self._event_scene_pos(event)
+            ix, iy = int(pos.x()), int(pos.y())
+            if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                self._drop_bias_dab(ix, iy)
+            return
+        if self._painting and self._tool == self.TOOL_BIAS_ERASER:
+            pos = self._event_scene_pos(event)
+            ix, iy = int(pos.x()), int(pos.y())
+            if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                self._drop_bias_eraser_dab(ix, iy)
+            return
+        if self._painting and self._tool == self.TOOL_LASSO_BUCKET:
+            pos = self._event_scene_pos(event)
+            ix, iy = int(pos.x()), int(pos.y())
+            if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                if not self._selection_points or (ix - self._selection_points[-1][0]) ** 2 + (iy - self._selection_points[-1][1]) ** 2 >= 9:
+                    self._selection_points.append((ix, iy))
+                    self._update_polygon_overlay()
+            return
+        if self._painting and self._tool == self.TOOL_RECT_BUCKET:
+            pos = self._event_scene_pos(event)
+            ix, iy = int(pos.x()), int(pos.y())
+            if self._selection_start is not None:
+                sx, sy = self._selection_start
+                ix = min(max(ix, 0), self._image_w - 1)
+                iy = min(max(iy, 0), self._image_h - 1)
+                self._update_rect_overlay(sx, sy, ix, iy)
+            return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton) and self._selection_adjust_active:
+            self._selection_adjust_active = False
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             was_painting = self._painting
+            active_tool = self._tool
             self._painting = False
             self._last_dab_pos = None
-            if was_painting:
+            if was_painting and active_tool == self.TOOL_BRUSH:
                 self.brush_stroke_finished.emit()
+            elif was_painting and active_tool == self.TOOL_BIAS_BRUSH:
+                self.bias_brush_stroke_finished.emit()
+            elif was_painting and active_tool == self.TOOL_BIAS_ERASER:
+                self.bias_eraser_stroke_finished.emit()
+            elif was_painting and active_tool == self.TOOL_LASSO_BUCKET:
+                points = list(self._selection_points)
+                if len(points) >= 3:
+                    self._selection_points = points
+                    self._update_polygon_overlay(closed=True)
+                    self.selection_preview_active.emit(True)
+                    self.polygon_fill_requested.emit(points)
+                else:
+                    self.clear_selection_preview()
+            elif was_painting and active_tool == self.TOOL_RECT_BUCKET:
+                start = self._selection_start
+                pos = self._event_scene_pos(event)
+                ix, iy = int(pos.x()), int(pos.y())
+                ix = min(max(ix, 0), self._image_w - 1)
+                iy = min(max(iy, 0), self._image_h - 1)
+                if start is not None:
+                    self._update_rect_overlay(start[0], start[1], ix, iy)
+                    self.selection_preview_active.emit(True)
+                    self.rect_fill_requested.emit(start[0], start[1], ix, iy)
+                else:
+                    self.clear_selection_preview()
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self._pixmap_item is None:
+            return super().mouseDoubleClickEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self._tool == self.TOOL_LASSO_BUCKET and self._painting:
+            pos = self._event_scene_pos(event)
+            ix, iy = int(pos.x()), int(pos.y())
+            if 0 <= ix < self._image_w and 0 <= iy < self._image_h:
+                if not self._selection_points or self._selection_points[-1] != (ix, iy):
+                    self._selection_points.append((ix, iy))
+            self._painting = False
+            points = list(self._selection_points)
+            if len(points) >= 3:
+                self._selection_points = points
+                self._update_polygon_overlay(closed=True)
+                self.selection_preview_active.emit(True)
+                self.polygon_fill_requested.emit(points)
+            else:
+                self.clear_selection_preview()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
         # Ctrl+wheel to zoom; plain wheel scrolls (standard QGraphicsView behavior)

@@ -32,7 +32,8 @@ from core.presets import get_quality, get_style
 from core.style_post import apply_style_grade
 from core.image_filter import apply_image_filter
 
-_colorizer: MangaColorizer | None = None
+_colorizer: MangaColorizer | None = None  # legacy/current mc-v2 cache
+_colorizer_load_lock = threading.Lock()  # guards engine construction
 _guided = None
 _job_guided_cache: dict = {}
 _raw_result_cache: OrderedDict = OrderedDict()
@@ -84,7 +85,8 @@ def _raw_cache_key(image_bgr: np.ndarray, quality, denoise_sigma: int,
         _image_fingerprint(image_bgr),
         int(quality.model_size), bool(quality.tiled_inference),
         int(quality.tile_size), int(quality.tile_overlap), bool(quality.per_panel),
-        int(denoise_sigma), _hint_signature(model_specs), _label_map_signature(label_map),
+        int(denoise_sigma),
+        _hint_signature(model_specs), _label_map_signature(label_map),
     )
 
 
@@ -204,17 +206,23 @@ def _guided_cache_key(style_profile, character_memories, character_library=None,
             round(float(style_strength), 3), round(float(reference_strength), 3))
 
 
+
+
 def get_colorizer(cfg: Config = Config, *, ensure_weights: bool = True,
                   status_callback=None) -> MangaColorizer:
     """Return the cached mc-v2 instance.
 
     ``ensure_weights`` lets the background worker perform the download once
     with visible UI status, then load the model without repeating downloader
-    work.  This also prevents first-run initialization from looking like a
-    dead Auto button.
+    work. Construction is lock-guarded so a UI preload thread and a colorize
+    worker never build the model twice.
     """
     global _colorizer
-    if _colorizer is None:
+    if _colorizer is not None:
+        return _colorizer
+    with _colorizer_load_lock:
+        if _colorizer is not None:
+            return _colorizer
         if ensure_weights:
             from core.model_downloader import ensure_models_downloaded
             ensure_models_downloaded(
@@ -228,7 +236,7 @@ def get_colorizer(cfg: Config = Config, *, ensure_weights: bool = True,
             denoiser_weights_dir=cfg.DENOISER_WEIGHTS_DIR,
         )
         print(f"[pipeline] mc-v2 loaded on device: {_colorizer.device_name}")
-    return _colorizer
+        return _colorizer
 
 
 def get_guided_colorist(cfg: Config = Config, style_profile=None,
@@ -503,8 +511,13 @@ def colorize_page(image_bgr: np.ndarray,
                    manual_strength: float = 1.0,
                    pastel_tuning: dict | None = None,
                    filter_tuning: dict | None = None,
+                   custom_color_bias: dict | None = None,
                    forced_matches: dict[int, int] | None = None,
-                   return_filter_base: bool = False):
+                   preserve_empty_auto_hints: bool = False,
+                   learn_identity: bool = True,
+                   return_filter_base: bool = False,
+                   hint_render_mode: str = "mixed",
+                   protect_text: bool = True):
     """Run the full Auto pipeline on one page.
 
     """
@@ -518,9 +531,7 @@ def colorize_page(image_bgr: np.ndarray,
     style_key_normalized = (style_key or "").lower()
     original_style_selected = style_key_normalized == "none"
     default_style_tuning = _is_default_style_tuning(pastel_tuning)
-    # Plain original mc-v2: no style processing at all. If the user changes the
-    # style-fine-tuning sliders while the original preset is selected, we switch
-    # to a synthetic adjustable baseline so the controls can visibly affect the output.
+    # Plain original mc-v2: no style processing at all.
     is_none_style = original_style_selected and default_style_tuning
 
     # Only enable semantic/identity analysis when it materially changes the
@@ -534,7 +545,8 @@ def colorize_page(image_bgr: np.ndarray,
     if not is_none_style and has_manual_region:
         effective_profile = _builtin_style_profile(style_key or "neutral")
 
-    style = _adjustable_original_style() if (original_style_selected and not default_style_tuning) else get_style(style_key)
+    style = (_adjustable_original_style() if (original_style_selected and not default_style_tuning)
+             else get_style(style_key))
     style = _apply_pastel_tuning(style, pastel_tuning)
     quality = get_quality(quality_key)
 
@@ -550,7 +562,7 @@ def colorize_page(image_bgr: np.ndarray,
             character_memories=character_memories, character_library=character_library,
             scene_palette=scene_palette, style_strength=style_strength,
             reference_strength=reference_strength, forced_matches=forced_matches)
-        if regenerate_auto or not hint_manager.auto_hints:
+        if regenerate_auto or (not hint_manager.auto_hints and not preserve_empty_auto_hints):
             hint_manager.set_auto_hints(build_auto_hints(
                 image_bgr, cfg=cfg, style_profile=effective_profile,
                 character_memories=character_memories, character_library=character_library,
@@ -562,19 +574,25 @@ def colorize_page(image_bgr: np.ndarray,
             "post_only_style": None if is_none_style else (style_key or "custom"),
             "fast_mode": True,
         })
-        if regenerate_auto or not hint_manager.auto_hints:
+        if regenerate_auto or (not hint_manager.auto_hints and not preserve_empty_auto_hints):
             hint_manager.set_auto_hints([])
 
     descriptor = getattr(effective_profile, "_descriptor", None) if effective_profile is not None else None
     merged_specs = hint_manager.merge_specs(
         image_bgr=image_bgr, style_descriptor=descriptor,
         style_strength=style_strength, manual_strength=manual_strength)
-    # Ordinary manual brush strokes are post-colour local edits.  They are
-    # deliberately withheld from mc-v2 because even a tiny model hint can be
-    # propagated across a whole connected face.  ``manual_region`` remains an
-    # explicit advanced model instruction.
-    local_manual_specs = [h for h in merged_specs if h.source == "manual"]
-    model_specs = [h for h in merged_specs if h.source != "manual"]
+    # Manual dabs ARE model instructions: with the "mixed" hint renderer
+    # they fill exactly the enclosed line-art region they were placed in
+    # (bounded, WYSIWYG), so the historic fear of a tiny hint flooding a
+    # whole connected face no longer applies.
+    #
+    # ``manual_paint`` is the brush's OWN independent channel: strokes
+    # recorded with that source are painted onto the result as local
+    # dots/marks after generation and are never sent to the model.
+    local_manual_specs = [h for h in merged_specs
+                          if h.source == "manual_paint"]
+    model_specs = [h for h in merged_specs
+                   if h.source != "manual_paint"]
 
     label_map = None
     if model_specs:
@@ -606,6 +624,7 @@ def colorize_page(image_bgr: np.ndarray,
             per_panel=effective_quality.per_panel,
             hint_points=model_specs or None,
             label_map=label_map,
+            hint_render_mode=hint_render_mode,
         )
         _raw_cache_put(raw_key, raw_result)
     model_seconds = time.perf_counter() - model_started
@@ -632,6 +651,7 @@ def colorize_page(image_bgr: np.ndarray,
                     per_panel=effective_quality.per_panel,
                     hint_points=retry_specs or None,
                     label_map=label_map,
+                    hint_render_mode=hint_render_mode,
                 )
                 model_specs = retry_specs
                 retry_key = _raw_cache_key(
@@ -692,6 +712,26 @@ def colorize_page(image_bgr: np.ndarray,
                 region_map=region_map,
                 gap_close=getattr(region_map, "gap_close", 4) if region_map is not None else 4)
 
+    if custom_color_bias and custom_color_bias.get("enabled"):
+        from core.custom_color_bias import apply_global_color_bias
+        bias_rgb = tuple(custom_color_bias.get("rgb") or (255, 160, 160))
+        bias_strength = float(custom_color_bias.get("strength", 35)) / 100.0
+        bias_scope = str(custom_color_bias.get("scope", "page"))
+        bias_tone_range = str(custom_color_bias.get("tone_range", "all"))
+        result_bgr = apply_global_color_bias(
+            result_bgr, image_bgr, bias_rgb, bias_strength, bias_scope,
+            bias_tone_range,
+            protect_skin=bool(custom_color_bias.get("protect_skin", True)),
+            protect_lineart=bool(custom_color_bias.get("protect_lineart", True)),
+            protect_saturated=bool(custom_color_bias.get("protect_saturated", True)),
+        )
+
+    if protect_text:
+        # 文字气泡保护：把原始黑白页合成回检测到的文字像素，
+        # 对话框保持纸白、字保持墨黑。模型缺失时自动跳过。
+        from core.text_guard import protect_text_regions
+        result_bgr = protect_text_regions(result_bgr, image_bgr)
+
     filter_base_bgr = result_bgr.copy()
     result_bgr = apply_image_filter(
         result_bgr, filter_tuning,
@@ -705,7 +745,8 @@ def colorize_page(image_bgr: np.ndarray,
                              weights_path=getattr(cfg, "ESRGAN_MODEL_PATH", None))
 
     learned_identity_updates = 0
-    if character_library is not None and page_context is not None and reference_strength > 0.0:
+    if (learn_identity and character_library is not None and page_context is not None
+            and reference_strength > 0.0):
         try:
             learned_identity_updates = int(character_library.learn_from_colorized_page(
                 page_context, result_bgr, strength=reference_strength))

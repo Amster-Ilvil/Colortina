@@ -15,11 +15,33 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from core.natural_tint import apply_natural_tint
+
 
 _FILTER_KEYS = (
     "brightness", "contrast", "saturation", "warmth",
     "shadow_lift", "highlight",
 )
+
+
+def _parse_color_filter_rgb(tuning: dict | None) -> tuple[int, int, int] | None:
+    tuning = tuning or {}
+    rgb = tuning.get("color_filter_rgb")
+    if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
+        try:
+            r, g, b = [int(np.clip(float(v), 0.0, 255.0)) for v in rgb[:3]]
+            return r, g, b
+        except Exception:
+            pass
+    value = str(tuning.get("color_filter_color", "") or "").strip()
+    if value.startswith('#'):
+        value = value[1:]
+    if len(value) == 6:
+        try:
+            return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+        except Exception:
+            return None
+    return None
 
 
 def _slider_factor(tuning: dict | None, key: str, default: float = 100.0) -> float:
@@ -143,7 +165,8 @@ def apply_image_filter(result_bgr: np.ndarray,
     if result_bgr is None or result_bgr.size == 0:
         return result_bgr
     tuning = dict(tuning or {})
-    if all(int(tuning.get(key, 100)) == 100 for key in _FILTER_KEYS):
+    color_filter_enabled = bool(tuning.get("color_filter_enabled"))
+    if all(int(tuning.get(key, 100)) == 100 for key in _FILTER_KEYS) and not color_filter_enabled:
         return result_bgr
 
     brightness = _slider_factor(tuning, "brightness")
@@ -250,4 +273,19 @@ def apply_image_filter(result_bgr: np.ndarray,
     lab[..., 2] = np.clip(b, -127.0, 127.0)
     out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     out = np.clip(out * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    if color_filter_enabled:
+        color_rgb = _parse_color_filter_rgb(tuning)
+        strength = float(np.clip(
+            float(tuning.get("color_filter_strength", 35)), 0.0, 150.0)) / 100.0
+        if color_rgb is not None and strength > 1e-5:
+            # The permission field already protects ink, paper and hard edges.
+            # Natural tinting then rotates the remaining Lab colour texture
+            # toward the selected swatch instead of applying a uniform overlay.
+            alpha = np.clip(color_permission * 0.86, 0.0, 1.0).astype(np.float32)
+            if np.any(alpha > 1e-5):
+                out = apply_natural_tint(
+                    out, color_rgb, alpha, active=alpha > 1e-5,
+                    authority=strength, texture_retention=0.76,
+                    chroma_retention=0.46, tone_strength=0.045)
     return out

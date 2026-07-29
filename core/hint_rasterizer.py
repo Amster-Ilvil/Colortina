@@ -1,4 +1,9 @@
-"""Soft, region-clipped rasterization for mc-v2 colour hints."""
+"""Rasterization helpers for mc-v2 colour hints.
+
+Default mode keeps the project's region-aware soft hints. A separate legacy
+mode recreates the original manga-colorization interaction more faithfully:
+hard sparse point hints without Gaussian feathering or region expansion.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +20,7 @@ _SOURCE_RADIUS_PX = {
     "character_identity": (2, 3),
     "manual": (2, 32),
     "manual_region": (2, 64),
+    "eyedropper_hint": (2, 40),
 }
 
 
@@ -116,9 +122,9 @@ def rasterize_hint_specs(h: int, w: int, size: int, hint_specs,
             # erosion on pale/anti-aliased lines and still preserves thin regions.
             region_u8 = region.astype(np.uint8)
             distance = cv2.distanceTransform(region_u8, cv2.DIST_L2, 3)
-            margin = 1.0 if spec.source in ("manual", "manual_region") else 2.2
+            margin = 1.0 if spec.source in ("manual", "manual_region", "eyedropper_hint") else 2.2
             interior = np.clip(distance / margin, 0.0, 1.0)
-            if spec.source not in ("manual", "manual_region") and np.any(distance >= 1.5):
+            if spec.source not in ("manual", "manual_region", "eyedropper_hint") and np.any(distance >= 1.5):
                 interior[distance < 1.25] = 0.0
             local *= interior.astype(np.float32)
 
@@ -132,3 +138,56 @@ def rasterize_hint_specs(h: int, w: int, size: int, hint_specs,
     if np.any(used):
         hint[used] = rgb_acc[used] / weight_acc[used, None]
     return np.clip(hint, 0, 255).astype(np.uint8), np.clip(alpha, 0.0, 1.0).astype(np.float32)
+
+
+
+def _legacy_hard_disk(mask: np.ndarray, hint: np.ndarray, px: int, py: int,
+                      radius: int, rgb: tuple[int, int, int]) -> None:
+    radius = max(0, int(radius))
+    x1 = max(0, px - radius)
+    y1 = max(0, py - radius)
+    x2 = min(mask.shape[1], px + radius + 1)
+    y2 = min(mask.shape[0], py + radius + 1)
+    if x1 >= x2 or y1 >= y2:
+        return
+    if radius <= 0:
+        mask[py, px] = 1.0
+        hint[py, px] = np.asarray(rgb, dtype=np.uint8)
+        return
+    yy, xx = np.ogrid[y1:y2, x1:x2]
+    disk = ((xx - px) ** 2 + (yy - py) ** 2) <= radius * radius
+    region_mask = mask[y1:y2, x1:x2]
+    region_hint = hint[y1:y2, x1:x2]
+    region_mask[disk] = 1.0
+    region_hint[disk] = np.asarray(rgb, dtype=np.uint8)
+
+
+def rasterize_hint_specs_legacy(h: int, w: int, size: int, hint_specs,
+                                label_map=None, page_gray=None) -> tuple[np.ndarray, np.ndarray]:
+    """Render sparse original-style mc-v2 point hints.
+
+    This intentionally avoids Gaussian/soft alpha, connected-region clipping,
+    and whole-region expansion. It mirrors the behaviour of the original demo
+    more closely: a small explicit coloured point plus a binary mask.
+    """
+    ph, pw, rh, rw = model_geometry(h, w, size)
+    hint = np.zeros((ph, pw, 3), dtype=np.uint8)
+    alpha = np.zeros((ph, pw), dtype=np.float32)
+
+    specs = [HintSpec.from_any(v) for v in (hint_specs or [])]
+    specs.sort(key=lambda s: (s.priority or 0, s.effective_strength))
+    for spec in specs:
+        if spec.effective_strength <= 0.01 or spec.source == 'style_only':
+            continue
+        px = min(rw - 1, max(0, int(round(spec.x_norm * rw))))
+        py = min(rh - 1, max(0, int(round(spec.y_norm * rh))))
+        # Original browser demo used a single opaque pixel. Allow a very small
+        # hard radius so UI brush sizes still feel responsive without turning
+        # the hint into a coloured blob.
+        radius = int(round(spec.radius_norm * rw))
+        if spec.source in ('manual', 'manual_region', 'eyedropper_hint'):
+            radius = int(np.clip(radius, 0, 2))
+        else:
+            radius = int(np.clip(radius, 0, 1))
+        _legacy_hard_disk(alpha[:rh, :rw], hint[:rh, :rw], px, py, radius, spec.rgb)
+    return hint, alpha

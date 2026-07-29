@@ -19,13 +19,9 @@ import cv2
 import numpy as np
 
 from core.region_map import RegionMap, build_region_map
-from core.perceptual_recolor import perceptual_target_ab
+from core.perceptual_recolor import normalize_recolor_mode, recolor_with_mode
+from core.pupil_boundary import constrain_pupil_alpha_to_lineart
 
-
-def _target_lab(rgb: tuple[int, int, int]) -> np.ndarray:
-    r, g, b = [int(np.clip(v, 0, 255)) for v in rgb]
-    px = np.array([[[b, g, r]]], dtype=np.uint8)
-    return cv2.cvtColor(px, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
 
 
 def _smooth_radial(radius: int) -> np.ndarray:
@@ -142,6 +138,7 @@ def restore_local_brush_from_reference(
     opacity: float = 0.88,
     region_map: RegionMap | None = None,
     gap_close: int = 4,
+    snap_to_lineart: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Restore the brush footprint from a reference image (typically the
     stored AI result).
@@ -155,7 +152,8 @@ def restore_local_brush_from_reference(
     sentinel = (255, 64, 64)
     _tmp, alpha = apply_local_brush_recolor(
         source_bw_bgr, current_bgr, x, y, radius_px, sentinel,
-        opacity=opacity, region_map=region_map, gap_close=gap_close)
+        opacity=opacity, region_map=region_map, gap_close=gap_close,
+        snap_to_lineart=snap_to_lineart)
     if alpha is None or float(alpha.max()) <= 1e-5:
         return current_bgr.copy(), np.zeros(current_bgr.shape[:2], np.float32)
     edited = current_bgr.copy()
@@ -178,6 +176,9 @@ def apply_local_brush_recolor(
     opacity: float = 0.95,
     region_map: RegionMap | None = None,
     gap_close: int = 4,
+    mode: str = "shift",
+    snap_to_lineart: bool = True,
+    pupil_blend: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Recolour only the visible brush footprint.
 
@@ -198,10 +199,11 @@ def apply_local_brush_recolor(
     if opacity <= 0.0:
         return result_bgr.copy(), np.zeros((h, w), np.float32)
 
-    if region_map is None or region_map.shape != (h, w):
-        region_map = build_region_map(source_bw_bgr, gap_close=max(0, int(gap_close)))
-
-    region_id = region_map.region_at(x, y, search_radius=max(3, min(radius, 18)))
+    region_id = 0
+    if snap_to_lineart:
+        if region_map is None or region_map.shape != (h, w):
+            region_map = build_region_map(source_bw_bgr, gap_close=max(0, int(gap_close)))
+        region_id = region_map.region_at(x, y, search_radius=max(3, min(radius, 18)))
     # Crop exactly to the visible brush footprint.  Region clipping and line
     # confidence are evaluated inside this hard locality bound.
     x1 = max(0, x - radius)
@@ -243,7 +245,7 @@ def apply_local_brush_recolor(
     radial *= ink_gate
 
     confidence = None
-    if region_map.line_confidence is not None:
+    if region_map is not None and region_map.line_confidence is not None:
         confidence = region_map.line_confidence[y1:y2, x1:x2].astype(np.float32)
         radial *= np.clip(1.0 - confidence * 1.00, 0.0, 1.0)
 
@@ -269,28 +271,27 @@ def apply_local_brush_recolor(
     if float(alpha_local.max()) <= 1e-5:
         return result_bgr.copy(), np.zeros((h, w), np.float32)
 
+    # Uniform-hue and pure-colour modes must have a genuinely authoritative
+    # brush core.  At 100% opacity the central valid footprint is exact, while
+    # the visible outer edge remains softly blended and line-bounded.
+    canonical_mode = normalize_recolor_mode(mode)
+    if opacity >= 0.995 and canonical_mode in {"shading", "flat"}:
+        strong_core = (radial >= 0.72) & (alpha_local >= 0.48)
+        alpha_local[strong_core] = 1.0
+
+    if pupil_blend and canonical_mode != "flat":
+        alpha_local = constrain_pupil_alpha_to_lineart(
+            source_bw_bgr[y1:y2, x1:x2], alpha_local,
+            seed=(x - x1, y - y1))
+        if float(alpha_local.max()) <= 1e-5:
+            return result_bgr.copy(), np.zeros((h, w), np.float32)
+
     edited = result_bgr.copy()
     crop = edited[y1:y2, x1:x2]
-    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).astype(np.float32)
-    current_L = lab[..., 0]
-    current_ab = lab[..., 1:3]
-    target_lab = _target_lab(rgb)
-    target_ab = target_lab[1:3]
-    # Stronger compensation so the visible result matches the sampled / picked
-    # swatch more closely in one pass, even over pale screentones.
-    target_ab = 128.0 + (target_ab - 128.0) * 1.16
-    target_ab = np.clip(target_ab, 0.0, 255.0)
-
-    active = alpha_local > 0.02
-    desired_ab = perceptual_target_ab(
-        lab, active, target_ab, texture_retention=0.68, chroma_retention=0.88)
-    a3 = alpha_local[..., None]
-    lab[..., 1:3] = current_ab * (1.0 - a3) + desired_ab * a3
-    # Luminance belongs to the AI shading. Only a faint colour-lightness cue is
-    # mixed in so highlights and material texture remain intact.
-    l_alpha = np.clip(alpha_local * 0.07, 0.0, 1.0)
-    lab[..., 0] = current_L * (1.0 - l_alpha) + float(target_lab[0]) * l_alpha
-    crop_out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    crop_out = recolor_with_mode(
+        crop, rgb, alpha_local,
+        active=alpha_local > 0.02, mode=mode,
+        pupil_blend=pupil_blend)
     crop[alpha_local > 1e-5] = crop_out[alpha_local > 1e-5]
 
     alpha = np.zeros((h, w), np.float32)

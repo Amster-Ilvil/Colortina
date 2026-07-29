@@ -108,8 +108,8 @@ class HintComposer:
                     break
             selected.extend(chosen)
 
-        auto = [h for h in selected if h.source not in ("manual", "manual_region")]
-        manual = [h for h in selected if h.source in ("manual", "manual_region")]
+        auto = [h for h in selected if h.source not in ("manual", "manual_region", "eyedropper_hint")]
+        manual = [h for h in selected if h.source in ("manual", "manual_region", "eyedropper_hint")]
         auto = sorted(auto, key=lambda h: (h.priority or 0, h.effective_strength), reverse=True)
         return [*auto[:self.MAX_PAGE_AUTO], *manual]
 
@@ -118,7 +118,7 @@ def degrade_for_retry(hints: list[HintSpec]) -> list[HintSpec]:
     """One-shot safe retry policy after hint-blob detection."""
     out: list[HintSpec] = []
     for h in hints:
-        if h.source in ("manual", "manual_region"):
+        if h.source in ("manual", "manual_region", "eyedropper_hint"):
             out.append(h)
         elif h.source == "character_identity":
             out.append(h.clone(

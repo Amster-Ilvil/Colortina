@@ -13,10 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestV2VersionAndFilterPersistence(unittest.TestCase):
-    def test_left_bottom_version_is_v2(self):
+    def test_left_bottom_version_is_v5(self):
         text = (ROOT / 'ui' / 'main_window.py').read_text(encoding='utf-8')
-        self.assertIn('self._version_label = QLabel("V2")', text)
+        config = (ROOT / 'config.py').read_text(encoding='utf-8')
+        self.assertIn('self._version_label = QLabel(Config.APP_VERSION_LABEL)', text)
         self.assertIn('VersionLabel', text)
+        self.assertIn('APP_VERSION_LABEL = "V5"', config)
+        self.assertIn('APP_VERSION = "5.', config)
 
     def test_project_persists_filter_base(self):
         with tempfile.TemporaryDirectory() as td:

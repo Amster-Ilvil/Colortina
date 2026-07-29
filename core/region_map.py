@@ -75,6 +75,33 @@ class RegionMap:
             return np.zeros(self.shape, dtype=np.uint8)
         return np.where(self.labels == int(region_id), 255, 0).astype(np.uint8)
 
+    def region_area(self, region_id: int) -> int:
+        if region_id <= 0:
+            return 0
+        return int(np.count_nonzero(self.labels == int(region_id)))
+
+    def touches_border(self, region_id: int) -> bool:
+        if region_id <= 0:
+            return False
+        rid = int(region_id)
+        return bool(
+            np.any(self.labels[0, :] == rid)
+            or np.any(self.labels[-1, :] == rid)
+            or np.any(self.labels[:, 0] == rid)
+            or np.any(self.labels[:, -1] == rid)
+        )
+
+    def is_background_region(self, region_id: int, *,
+                             max_area_ratio: float = 0.35) -> bool:
+        """Return True for page background or an implausibly large leak."""
+        if region_id <= 0:
+            return True
+        area = self.region_area(region_id)
+        page_area = max(1, int(self.labels.size))
+        ratio = area / float(page_area)
+        return bool(self.touches_border(region_id)
+                    or ratio > float(np.clip(max_area_ratio, 0.01, 1.0)))
+
     def safe_interior(self, region_id: int, margin_px: float = 2.0) -> np.ndarray:
         """Soft interior mask with a boundary safety band."""
         binary = (self.labels == int(region_id)).astype(np.uint8)

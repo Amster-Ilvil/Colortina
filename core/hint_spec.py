@@ -16,6 +16,7 @@ import numpy as np
 HintSource = Literal[
     "manual",          # local model hint; never expands to an entire region
     "manual_region",   # explicit whole-region hint (advanced/legacy only)
+    "eyedropper_hint", # eyedropper-sampled model hint from a colored result
     "character_identity",
     "scene_palette",
     "auto_instance",
@@ -29,6 +30,7 @@ _SOURCE_PRIORITY: dict[str, int] = {
     "character_identity": 70,
     "manual": 100,
     "manual_region": 100,
+    "eyedropper_hint": 100,
 }
 
 _SOURCE_DEFAULT_STRENGTH: dict[str, float] = {
@@ -38,6 +40,7 @@ _SOURCE_DEFAULT_STRENGTH: dict[str, float] = {
     "character_identity": 0.58,
     "manual": 0.72,
     "manual_region": 1.00,
+    "eyedropper_hint": 0.88,
 }
 
 

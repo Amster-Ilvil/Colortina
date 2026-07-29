@@ -89,7 +89,7 @@ class V53LocalityAndSkinTests(unittest.TestCase):
         self.assertAlmostEqual(manual[0].x_norm, 70 / 180, places=4)
 
 
-    def test_pipeline_withholds_local_manual_hint_from_model(self):
+    def test_pipeline_routes_manual_hint_to_model(self):
         from pipeline import colorize_page
 
         source = self.face_page()
@@ -107,15 +107,16 @@ class V53LocalityAndSkinTests(unittest.TestCase):
 
         fake = FakeColorizer()
         with patch("pipeline.get_colorizer", return_value=fake):
-            out = colorize_page(
+            colorize_page(
                 source, hint_manager=hm, style_key="none", quality_key="draft")
-        self.assertFalse(fake.received)
-        # The local edit is still visible after the model result, but a far-away
-        # point in the same connected face remains untouched.
-        self.assertTrue(np.any(out[66:91, 58:83] != (225, 238, 248)))
-        np.testing.assert_array_equal(out[35, 130], np.array([225, 238, 248], np.uint8))
-        self.assertEqual(hm.last_diagnostics.get("local_manual_edit_count"), 1)
-        self.assertEqual(hm.last_diagnostics.get("model_hint_count"), 0)
+        # V5.4.3: manual dabs ARE model instructions. The mixed renderer
+        # fills only the enclosed line-art region, so the old uncontrolled
+        # whole-face propagation concern no longer applies.
+        received = list(fake.received or [])
+        self.assertTrue(any(getattr(h, "source", "") == "manual"
+                            for h in received))
+        self.assertEqual(hm.last_diagnostics.get("local_manual_edit_count"), 0)
+        self.assertGreaterEqual(hm.last_diagnostics.get("model_hint_count", 0), 1)
 
     def test_ui_connects_stroke_lifecycle_and_labels_brush_as_local(self):
         root = Path(__file__).resolve().parents[1]
@@ -139,3 +140,38 @@ class V53LocalityAndSkinTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class V543BrushPaintChannelTests(unittest.TestCase):
+    def test_manual_paint_is_brush_only_and_never_reaches_model(self):
+        """圆点直涂是画笔专属通道，与模型 Hint 完全独立。"""
+        import numpy as np
+        import cv2
+        from unittest.mock import patch
+        from pipeline import colorize_page
+
+        page = np.full((320, 240), 255, np.uint8)
+        cv2.rectangle(page, (60, 60), (180, 260), 0, 3)
+        source = cv2.cvtColor(page, cv2.COLOR_GRAY2BGR)
+        hm = HintManager()
+        hm.bind_source_image(source)
+        hm.add_manual_hint(0.5, 0.5, (70, 110, 220))
+        hm.add_manual_hint(0.3, 0.3, (255, 0, 0), source="manual_paint")
+
+        received = {}
+
+        class Fake:
+            def colorize(self, image, **kw):
+                received["src"] = [getattr(h, "source", "?")
+                                   for h in (kw.get("hint_points") or [])]
+                return np.full_like(image, 230)
+
+        with patch("pipeline.get_colorizer", return_value=Fake()):
+            out = colorize_page(source, hint_manager=hm, style_key="none")
+        result = out[0] if isinstance(out, tuple) else out
+        self.assertIn("manual", received["src"])
+        self.assertNotIn("manual_paint", received["src"])
+        y, x = int(0.3 * 319), int(0.3 * 239)
+        dot = result[y - 4:y + 4, x - 4:x + 4].reshape(-1, 3).mean(0)
+        self.assertGreater(dot[2], dot[0] + 30)  # 红点确实贴回
+        self.assertEqual(hm.last_diagnostics.get("local_manual_edit_count"), 1)

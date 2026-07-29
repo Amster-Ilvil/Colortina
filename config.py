@@ -6,10 +6,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 class Config:
     """Minimal local config. No Flask, no .env parsing — just paths."""
 
+    APP_VERSION = "5.4.0"
+    APP_VERSION_LABEL = "V5"
+
     WEIGHTS_DIR = os.path.join(BASE_DIR, "models", "weights")
     GENERATOR_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "generator.zip")
     EXTRACTOR_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "extractor.pth")
     DENOISER_WEIGHTS_DIR = os.path.join(WEIGHTS_DIR, "denoiser")
+
+    # MangaLineExtraction_PyTorch (MIT) — used only by closed-region
+    # rectangle/lasso detection on the original black-and-white source.
+    MANGA_LINE_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "erika.pth")
+    MANGA_LINE_MODEL_URL = (
+        "https://github.com/ljsabc/MangaLineExtraction_PyTorch/"
+        "releases/download/v1/erika.pth")
+    MANGA_LINE_MAX_SIDE = int(os.environ.get("MANGA_LINE_MAX_SIDE", "1024"))
 
     # "auto" picks CUDA > MPS (Apple Silicon) > CPU
     ML_DEVICE = os.environ.get(
@@ -45,5 +56,8 @@ class Config:
     # resize if the weights aren't present or `realesrgan` isn't
     # installed, so this is never a hard requirement.
     ESRGAN_MODEL_PATH = os.path.join(WEIGHTS_DIR, "realesrgan_anime6b.pth")
+    # Optional local ONNX models (feature degrades gracefully when absent).
+    TEXT_DETECTOR_PATH = os.path.join(WEIGHTS_DIR, "comictextdetector.pt.onnx")
+    CHAR_SEG_PATH = os.path.join(WEIGHTS_DIR, "isnetis.onnx")
     ESRGAN_MODEL_URL = ("https://github.com/xinntao/Real-ESRGAN/releases/"
                         "download/v0.2.5.0/RealESRGAN_x4plus_anime_6B.pth")

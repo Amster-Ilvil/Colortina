@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestV27ManualEditRuntime(unittest.TestCase):
-    def test_region_fill_has_bounded_fallback_on_open_page(self):
+    def test_region_fill_rejects_open_page_instead_of_falling_back(self):
         source = np.full((220, 220, 3), 255, np.uint8)
         # A broken frame deliberately cannot form a reliable enclosed region.
         cv2.line(source, (40, 40), (180, 40), (0, 0, 0), 3)
@@ -21,12 +21,10 @@ class TestV27ManualEditRuntime(unittest.TestCase):
         out, base, mask, changed = apply_region_edit(
             source, result, result.copy(), 110, 110, '#e65070',
             gap_close=0, mode='shift', feather=2)
-        self.assertTrue(changed)
-        self.assertTrue(mask.any())
-        self.assertFalse(np.array_equal(out, result))
-        self.assertFalse(np.array_equal(base, result))
-        # Safety: fallback must not flood the whole page.
-        self.assertLess(np.count_nonzero(mask), int(mask.size * 0.45))
+        self.assertFalse(changed)
+        self.assertFalse(mask.any())
+        self.assertTrue(np.array_equal(out, result))
+        self.assertTrue(np.array_equal(base, result))
 
     def test_manual_edit_survives_filter_reapply(self):
         source = np.full((180, 180, 3), 255, np.uint8)

@@ -95,16 +95,22 @@ class HintManager:
 
     def add_manual_hint(self, x_norm: float, y_norm: float,
                         color: tuple[int, int, int],
-                        radius_norm: float = 0.015) -> bool:
+                        radius_norm: float = 0.015, *,
+                        source: str = "manual",
+                        strength: float | None = None) -> bool:
         x_norm = float(np.clip(x_norm, 0.0, 1.0))
         y_norm = float(np.clip(y_norm, 0.0, 1.0))
         radius_norm = max(0.001, float(radius_norm))
         color = tuple(int(np.clip(v, 0, 255)) for v in color)
+        source = str(source or "manual")
+        if strength is None:
+            strength = 1.0 if source == "manual" else 0.88
+        strength = float(np.clip(strength, 0.0, 1.0))
         region_id = (self._region_map.region_at_norm(x_norm, y_norm) or None
                      if self._region_map is not None else None)
         merge_distance = max(0.003, radius_norm * 0.65)
         for existing in reversed(self.manual_hints[-16:]):
-            if existing.region_id != region_id or existing.color != color:
+            if existing.region_id != region_id or existing.color != color or existing.source != source:
                 continue
             dx, dy = existing.x_norm - x_norm, existing.y_norm - y_norm
             if dx * dx + dy * dy <= merge_distance * merge_distance:
@@ -114,9 +120,17 @@ class HintManager:
                 return False
         self.manual_hints.append(Hint(
             x_norm, y_norm, color, radius_norm=radius_norm, priority=100,
-            region_id=region_id, source="manual", strength=1.00))
+            region_id=region_id, source=source, strength=strength))
         self._thin_region_samples(region_id, color, max_samples=8)
         return True
+
+    def add_eyedropper_hint(self, x_norm: float, y_norm: float,
+                            color: tuple[int, int, int],
+                            radius_norm: float = 0.010, *,
+                            strength: float = 0.88) -> bool:
+        return self.add_manual_hint(
+            x_norm, y_norm, color, radius_norm,
+            source="eyedropper_hint", strength=strength)
 
     def _thin_region_samples(self, region_id: int | None,
                              color: tuple[int, int, int], max_samples: int) -> None:
@@ -131,6 +145,19 @@ class HintManager:
 
     def clear_manual_hints(self) -> None:
         self.manual_hints = []
+
+    def clear_manual_hints_by_source(self, source: str) -> int:
+        source = str(source or "")
+        before = len(self.manual_hints)
+        self.manual_hints = [h for h in self.manual_hints if h.source != source]
+        return before - len(self.manual_hints)
+
+    def last_manual_hint_by_source(self, source: str) -> Hint | None:
+        source = str(source or "")
+        for hint in reversed(self.manual_hints):
+            if hint.source == source:
+                return hint
+        return None
 
     def undo_last_manual(self) -> None:
         if self.manual_hints:

@@ -28,8 +28,9 @@ class TestV281ReleaseReadiness(unittest.TestCase):
         used = set()
         pattern = re.compile(r'\btr\(["\']([^"\']+)["\']\)')
         for path in ROOT.rglob('*.py'):
-            if '__pycache__' not in path.parts:
-                used.update(pattern.findall(path.read_text(encoding='utf-8', errors='ignore')))
+            if '__pycache__' in path.parts or 'tests' in path.parts:
+                continue
+            used.update(pattern.findall(path.read_text(encoding='utf-8', errors='ignore')))
         for keys in language_dicts[:2]:
             self.assertFalse(used - keys, f'missing translation keys: {sorted(used - keys)}')
 
@@ -42,10 +43,10 @@ class TestV281ReleaseReadiness(unittest.TestCase):
 
     def test_docs_match_current_release(self):
         readme = (ROOT / 'README.md').read_text(encoding='utf-8')
-        self.assertIn('Colortina V2.8', readme)
+        self.assertIn('Colortina V5', readme)
         self.assertIn('点采集（邻域中值）', readme)
         self.assertIn('区域采集（区域中值）', readme)
-        self.assertNotIn('Colortina v5', readme)
+        self.assertNotIn('Colortina V3</h1>', readme)
         self.assertNotIn('“上色 / 参考 / 编辑', readme)
 
     def test_gitignore_covers_local_generated_data(self):

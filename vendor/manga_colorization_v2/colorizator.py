@@ -108,7 +108,10 @@ class MangaColorizator:
                 mask = mask / 255.0
             mask = torch.FloatTensor(mask).unsqueeze(0).unsqueeze(0).to(self.device)
 
-        self.current_hint = torch.cat([hint, mask], 1)
+        # Match the original project: only masked pixels carry hint colour.
+        # Without the multiply, unmasked pixels normalize to -1 and act like
+        # a full-page black hint.
+        self.current_hint = torch.cat([hint * mask, mask], 1)
 
     @torch.no_grad()
     def colorize(self):

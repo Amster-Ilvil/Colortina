@@ -27,7 +27,7 @@ class TestV744Light3IntensityPreview(unittest.TestCase):
         main = (ROOT / 'ui' / 'main_window.py').read_text(encoding='utf-8')
         self.assertIn('"light3_intensity": self._light3_intensity_slider.value()', main)
         self.assertIn('settings.get("light3_intensity", 100)', main)
-        self.assertIn('settings.get("manual_match_style", True)', main)
+        self.assertIn('settings.get("manual_match_style", False)', main)
 
 
 if __name__ == '__main__':

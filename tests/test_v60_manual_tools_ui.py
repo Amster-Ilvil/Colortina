@@ -15,17 +15,19 @@ class TestV60ManualToolsAndUi(unittest.TestCase):
         main = (ROOT / 'ui' / 'main_window.py').read_text(encoding='utf-8')
         self.assertNotIn('_brush_color_mode_combo', main)
         self.assertNotIn('edit_grid.addWidget(QLabel(tr("brush_color_mode_label"))', main)
-        body = re.search(r'def _on_color_picked\(self, rgb: tuple\):(.*?)(?:\n    def |\Z)', main, re.S)
+        body = re.search(r'def _on_color_picked\(self, rgb: tuple, x_norm: float, y_norm: float\):(.*?)(?:\n    def |\Z)', main, re.S)
         self.assertIsNotNone(body)
         body_text = body.group(1)
         self.assertNotIn('self._radio_brush.setChecked(True)', body_text)
         self.assertIn('picker_keep_tool_hint', body_text)
+        self.assertIn('picker_model_hint_written', body_text)
 
     def test_gap_ui_and_tooltip_reflect_bigger_means_smaller_region(self):
         main = (ROOT / 'ui' / 'main_window.py').read_text(encoding='utf-8')
         self.assertIn('_GAP_PX_MIN, _GAP_PX_MAX = 0, 24', main)
         i18n = (ROOT / 'ui' / 'i18n.py').read_text(encoding='utf-8')
-        self.assertIn('调大 = 自动补更长的断线，区域更容易被封住，因此选择范围更小', i18n)
+        self.assertIn('只用于区块上色和闭合选区识别', i18n)
+        self.assertIn('不影响普通画笔', i18n)
 
     def test_light_wash_name_cleanup_keeps_colored_builtin_style(self):
         style = get_style('light2')

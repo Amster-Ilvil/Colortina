@@ -37,9 +37,86 @@ from core.lineart_fill import clip_stamp_to_region
 
 def build_hint_arrays(h: int, w: int, size: int,
                       hint_points, label_map=None,
-                      page_gray=None) -> tuple[np.ndarray, np.ndarray]:
-    """Rasterize legacy points or v4 HintSpecs using soft source-aware masks."""
-    from core.hint_rasterizer import rasterize_hint_specs
+                      page_gray=None, render_mode: str = "soft_region") -> tuple[np.ndarray, np.ndarray]:
+    """Rasterize legacy points or v4 HintSpecs into mc-v2 hint channels."""
+    from core.hint_rasterizer import (
+        rasterize_hint_specs,
+        rasterize_hint_specs_legacy,
+    )
+    mode = str(render_mode or "soft_region").lower()
+    if mode in {"legacy", "classic", "original_points", "original-point"}:
+        return rasterize_hint_specs_legacy(
+            h, w, size, hint_points, label_map=label_map, page_gray=page_gray)
+    if mode in {"mixed", "manual_points"}:
+        # mc-v2's colour propagation scales with hint COVERAGE — a single
+        # point barely moves it (measured: r=3 dot colours ~0% of a region,
+        # r=45 only ~18%). So user-placed hints (brush dabs / eyedropper)
+        # are expanded to FILL their enclosed line-art region in the hint
+        # channel at full strength: one dab = "this whole region is blue",
+        # and the model renders it with its own shading. Auto hints stay
+        # soft; dabs that land on lines/huge open areas fall back to a
+        # hard point.
+        from core.hint_spec import HintSpec
+        from core.hint_rasterizer import model_geometry, _resized_labels
+        specs = [HintSpec.from_any(v) for v in (hint_points or [])]
+        hard_sources = {"manual", "eyedropper_hint"}
+        hard = [s for s in specs if str(s.source) in hard_sources]
+        soft = [s for s in specs if str(s.source) not in hard_sources]
+        hint, alpha = rasterize_hint_specs(
+            h, w, size, soft, label_map=label_map, page_gray=page_gray)
+        if hard:
+            ph, pw, rh, rw = model_geometry(h, w, size)
+            labels = _resized_labels(label_map, page_gray, rw, rh, w)
+            max_region = int(rh * rw * 0.35)
+            leftover = []
+            for spec in hard:
+                px = min(rw - 1, max(0, int(round(spec.x_norm * rw))))
+                py = min(rh - 1, max(0, int(round(spec.y_norm * rh))))
+                strength = float(np.clip(spec.effective_strength, 0.0, 1.0))
+                filled = False
+                if labels is not None and strength > 0.01:
+                    rid = int(labels[py, px])
+                    if rid == 0:
+                        # Dab landed on a line/screentone dot — look for a
+                        # region in the immediate neighbourhood.
+                        y1, y2 = max(0, py - 6), min(rh, py + 7)
+                        x1, x2 = max(0, px - 6), min(rw, px + 7)
+                        window = labels[y1:y2, x1:x2]
+                        nonzero = window[window > 0]
+                        if nonzero.size:
+                            rid = int(np.bincount(nonzero).argmax())
+                    if rid > 0:
+                        region = labels == rid
+                        area = int(region.count_nonzero()
+                                   if hasattr(region, "count_nonzero")
+                                   else np.count_nonzero(region))
+                        if 0 < area <= max_region:
+                            eroded = cv2.erode(region.astype(np.uint8),
+                                               np.ones((3, 3), np.uint8))
+                            m = (eroded if int(eroded.sum()) else
+                                 region.astype(np.uint8)).astype(bool)
+                            # ``labels`` / ``m`` cover only the resized content
+                            # area (rh, rw), while ``hint`` and ``alpha`` include
+                            # mc-v2's bottom/right padding (ph, pw).  Index the
+                            # valid content views explicitly; otherwise pages
+                            # whose resized height is not divisible by 32 (for
+                            # example 817 padded to 832) raise a boolean-shape
+                            # IndexError.
+                            hint_valid = hint[:rh, :rw]
+                            alpha_valid = alpha[:rh, :rw]
+                            hint_valid[m] = np.asarray(spec.rgb, dtype=hint.dtype)
+                            alpha_valid[m] = np.maximum(alpha_valid[m], strength)
+                            filled = True
+                if not filled:
+                    leftover.append(spec)
+            if leftover:
+                hard_hint, hard_alpha = rasterize_hint_specs_legacy(
+                    h, w, size, leftover, label_map=label_map,
+                    page_gray=page_gray)
+                m = hard_alpha > 0
+                hint[m] = hard_hint[m].astype(hint.dtype)
+                alpha[m] = np.maximum(alpha[m], hard_alpha[m])
+        return hint, alpha
     return rasterize_hint_specs(
         h, w, size, hint_points, label_map=label_map, page_gray=page_gray)
 
@@ -53,6 +130,7 @@ class MangaColorizer:
                  denoiser_weights_dir: str = ""):
         self._lock = threading.Lock()
         self.device_warning: str | None = None
+        self._requested_device = str(device or "auto")
         self._device = self._resolve_device(device)
         self._generator_path = generator_path
         self._extractor_path = extractor_path
@@ -131,7 +209,7 @@ class MangaColorizer:
     def _colorize_at_size(self, rgb: np.ndarray, size: int,
                           denoise_sigma: int,
                           hint_points=None, label_map=None,
-                          page_gray=None) -> np.ndarray:
+                          page_gray=None, hint_render_mode: str = "soft_region") -> np.ndarray:
         """Run mc-v2 once at *size*, returning float32 RGB [0,1]."""
         # fp16 autocast on CUDA: ~1.5-2x faster on tensor-core GPUs, half VRAM
         with torch.inference_mode(), torch.autocast(
@@ -146,13 +224,15 @@ class MangaColorizer:
                 # learned shading instead of inventing a global wash
                 hint, mask = build_hint_arrays(
                     rgb.shape[0], rgb.shape[1], size, hint_points,
-                    label_map=label_map, page_gray=page_gray)
+                    label_map=label_map, page_gray=page_gray,
+                    render_mode=hint_render_mode)
                 self._model.update_hint(hint, mask)
             return self._model.colorize()
 
     def _safe_colorize(self, rgb: np.ndarray, size: int,
                        denoise_sigma: int, hint_points=None,
-                       label_map=None, page_gray=None) -> np.ndarray:
+                       label_map=None, page_gray=None,
+                       hint_render_mode: str = "soft_region") -> np.ndarray:
         """Robust single-pass colorize with shrink-then-CPU OOM fallback."""
         attempts = [size, max(384, size // 2)]
         last_err: RuntimeError | None = None
@@ -161,7 +241,8 @@ class MangaColorizer:
                 return self._colorize_at_size(rgb, try_size, denoise_sigma,
                                               hint_points=hint_points,
                                               label_map=label_map,
-                                              page_gray=page_gray)
+                                              page_gray=page_gray,
+                                              hint_render_mode=hint_render_mode)
             except RuntimeError as exc:
                 last_err = exc
                 msg = str(exc).lower()
@@ -186,7 +267,8 @@ class MangaColorizer:
             self.device_name = "cpu"
             return self._colorize_at_size(rgb, max(384, size // 2), denoise_sigma,
                                           hint_points=hint_points,
-                                          label_map=label_map)
+                                          label_map=label_map,
+                                          hint_render_mode=hint_render_mode)
 
         raise last_err if last_err else RuntimeError("colorize failed")
 
@@ -203,7 +285,8 @@ class MangaColorizer:
                  deherron: bool = False,
                  deherron_strength: float = 0.6,
                  hint_points=None,
-                 label_map=None) -> np.ndarray:
+                 label_map=None,
+                 hint_render_mode: str = "soft_region") -> np.ndarray:
         """Colorize a single B&W page image.
 
         Parameters
@@ -260,6 +343,7 @@ class MangaColorizer:
                 image, size=size, denoise_sigma=denoise_sigma,
                 tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap,
                 panel_style=panel_style, hint_points=hint_points,
+                hint_render_mode=hint_render_mode,
             )
 
         if tiled:
@@ -267,16 +351,18 @@ class MangaColorizer:
                 image, denoise_sigma=denoise_sigma,
                 tile_size=tile_size, overlap=tile_overlap,
                 hint_points=hint_points,
+                hint_render_mode=hint_render_mode,
             )
 
         return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
-                                     hint_points=hint_points, label_map=label_map)
+                                     hint_points=hint_points, label_map=label_map,
+                                     hint_render_mode=hint_render_mode)
 
     # ── Simple resize-and-go path (legacy) ─────────────────────────────────
 
     def _colorize_simple(self, image: np.ndarray, size: int,
                          denoise_sigma: int, hint_points=None,
-                         label_map=None) -> np.ndarray:
+                         label_map=None, hint_render_mode: str = "soft_region") -> np.ndarray:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = rgb.shape[:2]
 
@@ -288,7 +374,8 @@ class MangaColorizer:
             result = self._safe_colorize(rgb, size, denoise_sigma,
                                          hint_points=hint_points,
                                          label_map=label_map,
-                                         page_gray=page_gray)
+                                         page_gray=page_gray,
+                                         hint_render_mode=hint_render_mode)
 
         result_uint8 = np.clip(result * 255.0, 0, 255).astype(np.uint8)
         result_bgr = cv2.cvtColor(result_uint8, cv2.COLOR_RGB2BGR)
@@ -334,7 +421,8 @@ class MangaColorizer:
     def _colorize_per_panel(self, image: np.ndarray, *,
                             size: int, denoise_sigma: int,
                             tiled: bool, tile_size: int, tile_overlap: int,
-                            panel_style: str, hint_points=None) -> np.ndarray:
+                            panel_style: str, hint_points=None,
+                            hint_render_mode: str = "soft_region") -> np.ndarray:
         """Detect panels, colorize each, composite back into the page."""
         from models.schemas import PanelRegion
 
@@ -349,9 +437,11 @@ class MangaColorizer:
                 return self._colorize_tiled(
                     image, denoise_sigma=denoise_sigma,
                     tile_size=tile_size, overlap=tile_overlap,
-                    hint_points=hint_points)
+                    hint_points=hint_points,
+                    hint_render_mode=hint_render_mode)
             return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
-                                         hint_points=hint_points)
+                                         hint_points=hint_points,
+                                         hint_render_mode=hint_render_mode)
 
         page_h, page_w = image.shape[:2]
         out = image.copy()
@@ -370,11 +460,13 @@ class MangaColorizer:
                     crop, denoise_sigma=denoise_sigma,
                     tile_size=tile_size, overlap=tile_overlap,
                     hint_points=panel_hints,
+                    hint_render_mode=hint_render_mode,
                 )
             else:
                 colored = self._colorize_simple(
                     crop, size=size, denoise_sigma=denoise_sigma,
                     hint_points=panel_hints,
+                    hint_render_mode=hint_render_mode,
                 )
 
             # Composite back, with a small feather at the seam
@@ -407,7 +499,8 @@ class MangaColorizer:
                         denoise_sigma: int,
                         tile_size: int = 768,
                         overlap: int = 96,
-                        hint_points=None) -> np.ndarray:
+                        hint_points=None,
+                        hint_render_mode: str = "soft_region") -> np.ndarray:
         """Colorize at native resolution by tiling.
 
         Each tile is fed to mc-v2 at exactly *tile_size* (the model's
@@ -425,7 +518,8 @@ class MangaColorizer:
         if h <= tile_size and w <= tile_size:
             return self._colorize_simple(
                 image, size=tile_size, denoise_sigma=denoise_sigma,
-                hint_points=hint_points)
+                hint_points=hint_points,
+                hint_render_mode=hint_render_mode)
 
         # Whole-page low-resolution color prior.  It provides consistent hue
         # context to every high-resolution tile without replacing tile linework.
@@ -434,7 +528,8 @@ class MangaColorizer:
             prior_size = min(512, tile_size)
             global_prior = self._colorize_simple(
                 image, size=prior_size, denoise_sigma=denoise_sigma,
-                hint_points=hint_points)
+                hint_points=hint_points,
+                hint_render_mode=hint_render_mode)
         except Exception as exc:
             print(f"[ml_colorizer] global prior unavailable: {exc}")
 
@@ -479,7 +574,8 @@ class MangaColorizer:
                 with self._lock:
                     out = self._safe_colorize(
                         tile_rgb, tile_size, denoise_sigma,
-                        hint_points=tile_hints, page_gray=tile_gray)
+                        hint_points=tile_hints, page_gray=tile_gray,
+                        hint_render_mode=hint_render_mode)
                 out_u8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
                 out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_RGB2BGR)
 

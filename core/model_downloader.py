@@ -115,6 +115,8 @@ def ensure_models_downloaded(weights_dir: str, callback=None):
 
     if callback:
         callback("mc-v2 模型文件准备完成")
+    from core.network_lockdown import lock_when_weights_ready
+    lock_when_weights_ready()
     return generator_path, extractor_path, denoiser_dir
 
 
@@ -157,3 +159,82 @@ def ensure_esrgan_downloaded(config, callback=None):
     urllib.request.urlretrieve(config.ESRGAN_MODEL_URL, dest)
     if callback:
         callback("Downloaded Real-ESRGAN weights")
+
+
+def manga_line_model_ready(weights_path: str) -> bool:
+    """Return True when the official erika.pth weight appears complete."""
+    return _valid_file(weights_path, min_bytes=64 * 1024 * 1024)
+
+
+def _download_http_resume(url: str, dest: str, label: str, callback=None,
+                          min_bytes: int = 1) -> str:
+    """Download a large release asset atomically, resuming a .part file."""
+    import urllib.request
+
+    if _valid_file(dest, min_bytes=min_bytes):
+        if callback:
+            callback(f"已找到 {label}")
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    offset = 0
+    try:
+        offset = os.path.getsize(part) if os.path.isfile(part) else 0
+    except OSError:
+        offset = 0
+    headers = {"User-Agent": "Colortina/3 MangaLineExtraction downloader"}
+    if offset > 0:
+        headers["Range"] = f"bytes={offset}-"
+    request = urllib.request.Request(url, headers=headers)
+    if callback:
+        callback(
+            f"首次使用闭合区域识别：正在下载 {label}"
+            + (f"（从 {offset // (1024 * 1024)} MB 继续）" if offset else ""))
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            status = getattr(response, "status", response.getcode())
+            append = offset > 0 and int(status) == 206
+            if not append:
+                offset = 0
+            total_header = response.headers.get("Content-Length")
+            total = offset + int(total_header) if total_header and total_header.isdigit() else 0
+            mode = "ab" if append else "wb"
+            downloaded = offset
+            last_percent = -1
+            with open(part, mode) as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    if callback and total > 0:
+                        percent = int(downloaded * 100 / total)
+                        if percent >= last_percent + 5:
+                            last_percent = percent
+                            callback(
+                                f"正在下载 {label}：{percent}% "
+                                f"({downloaded // (1024 * 1024)}/{total // (1024 * 1024)} MB)")
+        if not _valid_file(part, min_bytes=min_bytes):
+            raise ModelDownloadError(f"{label} 下载不完整：{part}")
+        os.replace(part, dest)
+    except Exception as exc:  # noqa: BLE001
+        raise ModelDownloadError(f"{label} 下载失败：{exc}") from exc
+    if callback:
+        callback(f"{label} 下载完成")
+    return dest
+
+
+def ensure_manga_line_model_downloaded(config, callback=None) -> str:
+    """Ensure the official MangaLineExtraction ``erika.pth`` is available."""
+    path = config.MANGA_LINE_WEIGHTS_PATH
+    result = _download_http_resume(
+        config.MANGA_LINE_MODEL_URL,
+        path,
+        "漫画结构线模型 erika.pth（约 170 MB）",
+        callback=callback,
+        min_bytes=64 * 1024 * 1024,
+    )
+    from core.network_lockdown import lock_when_weights_ready
+    lock_when_weights_ready()
+    return result

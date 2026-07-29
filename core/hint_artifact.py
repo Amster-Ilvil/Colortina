@@ -28,7 +28,7 @@ def _delta_e_mean(a: np.ndarray, b: np.ndarray) -> float:
 
 def detect_hint_blobs(result_bgr: np.ndarray, hints, *, threshold: float = 14.0) -> HintArtifactReport:
     specs = [HintSpec.from_any(h) for h in (hints or [])
-             if HintSpec.from_any(h).source not in ("manual", "style_only")]
+             if HintSpec.from_any(h).source not in ("manual", "eyedropper_hint", "style_only")]
     if not specs:
         return HintArtifactReport(0.0, 0, 0, threshold)
     lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB)
