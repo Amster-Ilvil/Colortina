@@ -2,155 +2,106 @@
   <img src="assets/icon.png" width="128" alt="Colortina icon">
 </p>
 
-<h1 align="center">Colortina V5.3</h1>
+<h1 align="center">Colortina</h1>
 
 <p align="center">
-  本地运行的黑白漫画 AI 自动上色、自然调色与手动修色工具
+  本地运行的黑白漫画 AI 自动上色桌面工具<br>
+  A fully-local desktop app for AI manga colorization
 </p>
 
-## 当前功能
+---
 
-- 基于 manga-colorization-v2 的本地自动上色。
-- 支持图片、文件夹、PDF 和拖拽导入，可批量处理并跳过已上色页面。
-- 内置三种风格：
-  - 原始 mc-v2
-  - 淡彩水墨
-  - 淡彩水墨（极淡）
-- “上色”界面内提供风格细调：颜色量、亮度、冷暖、亮部保色、柔化、块面感，以及一键重置。
-- 自然图片滤镜采用保边缘明暗基底与细节层分离，支持亮度、对比度、饱和度、冷暖、阴影和高光。
-- 编辑工具：
-  - AI 选区重上色（原始黑白整页推理、严格局部合成）
-  - 非破坏选区黑白预览
-  - 模型 Hint 画笔与选区内 Hint 清除
-  - 区域画笔
-  - 区块上色
-  - 吸管点采集（邻域中值）
-  - 吸管区域采集（区域中值）
-  - 当前颜色与实际风格匹配补色预览
-  - 撤销 / 重做
-- V5 自然色相迁移采用稳定 LAB 后处理，保留 mc-v2 原有明暗与纹理。
-- 自定义颜色倾向使用独立感知 LAB 色场迁移，强度支持 0–200%，低饱和区域也能明显响应，同时保护纸白、线稿和局部纹理。
-- 新增独立“颜色倾向画笔”：使用同类感知颜色迁移，但只作用于实际笔迹；拥有自己的颜色、大小、强度、明暗和保护参数，不影响普通画笔、Hint 或整页颜色倾向。
-- 颜色滤镜使用自然调色而非透明色块叠加，强度支持 0–150%，保留阴影、高光和材质细节。
-- 区域画笔按真实笔迹实时上色，松开后不会贴线、扩区或改变轨迹；矩形“仅闭合区域”接入官方 MangaLineExtraction_PyTorch，只对原始黑白图的矩形局部识别漫画结构线，再生成最终闭合掩膜。
-- 区块上色拒绝页外背景和超过页面 35% 的疑似泄漏区域，降低整页误上色风险。
-- 手动编辑会同步当前结果与滤镜基础层，重新应用滤镜不会覆盖补色。
-- 编辑页按当前工具动态显示相关参数，并支持一键恢复当前工具默认值；区块封口长度只在区块、套索和矩形工具下显示。
-- `.ccproject` 保存页面顺序、上色结果、滤镜基础层、手动提示和界面参数。
-- Windows 一键启动脚本会创建独立运行环境，不污染系统 Python。
+## 功能特性
 
-## 推荐环境
+- **一键自动上色**：基于 [manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2)（U-Net + SEResNeXt），首次运行自动下载权重
+- **智能自动提示**：CLIP 零样本区域识别 → 按高光/中间调/阴影分层生成颜色提示，上色结果更自然
+- **手动引导**：画布上直接涂抹颜色提示，局部重新生成；支持吸色、区域填充、撤销/重做
+- **批量处理**：导入整个文件夹（自然排序）、PDF 自动拆页、拖拽导入图片/PDF/文件夹
+- **硬件友好**：支持 CUDA / Apple Silicon (MPS) / CPU，显存不足自动降级；CUDA 上 fp16 加速
+- **中英文界面**，可随时切换
+## 效果展示
 
-- Python 3.10–3.12
-- macOS Apple Silicon、Windows 10/11 或 Linux
-- 16 GB 内存可运行普通 mc-v2 工作流
-- Apple Silicon 默认优先使用 MPS；NVIDIA GPU 默认优先使用 CUDA；否则使用 CPU
+| 原图 | 自动上色 | 手动干预 |
+|:---:|:---:|:---:|
+| <img width="260" src="https://github.com/user-attachments/assets/818eae63-ad50-41a8-a487-a22eb5728441" /> | <img width="260" src="https://github.com/user-attachments/assets/3a10885f-bdc9-497e-9286-34ae8b94fb3d" /> | <img width="260" src="https://github.com/user-attachments/assets/09f4cfa7-2b2f-4f8e-a7fb-719e70d1a8b2" /> |
 
-## 安装
+## 🚀 安装与启动
 
-### macOS / Linux
+### 🍎 macOS / 🪟 Windows
 
-```bash
-git clone <你的仓库地址>
-cd Colortina
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python main.py
-```
+以下步骤在 macOS 与 Windows 上的说明结构一致，针对各系统给出对应命令：
 
-### Windows
+1. 进入项目目录
 
-可直接双击：
+   macOS:
+   ```bash
+   cd ~/ # 改成你的实际路径
+   ```
+   Windows (CMD 或 PowerShell):
+   ```powershell
+   cd C:\Users\你的用户名\你的实际路径或者直接Start_Colortina.bat
+   ```
 
-```text
-Start_Colortina.bat
-```
+2. 创建并激活虚拟环境
 
-也可以手动安装：
+   macOS:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+   Windows (CMD):
+   ```cmd
+   python -m venv venv
+   venv\Scripts\activate
+   ```
+   Windows (PowerShell):
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\Activate.ps1
+   ```
 
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python main.py
-```
-
-首次自动上色会下载 mc-v2 权重。首次使用矩形“仅填充选区内闭合区域”会另外下载官方 `erika.pth` 漫画结构线权重（约 170 MB）。所有权重都保存于 `models/weights/`，该目录已加入 `.gitignore`。
-
-## 基本使用流程
-
-1. 导入黑白漫画图片、文件夹或 PDF。
-2. 在“上色”页面选择风格和细调参数。
-3. 在上色页面最底部点击“自动上色”。
-4. 打开“编辑”页面：
-   - 选择区域画笔、吸管、区块上色、套索或矩形；
-   - 参数面板会自动切换为当前工具所需项目；
-   - 区域画笔沿真实轨迹实时上色，区块上色点击一个闭合区块立即处理；
-   - 套索和矩形先生成蓝色选区，可继续扩大、擦除或贴线；
-   - 需要 AI 重算时，保留蓝色选区，切换到区域画笔并开启“模型 Hint 画笔”，用目标颜色画 1～3 个提示点；也可用“清除选区内手动/吸管 hint”删除错误提示；
-   - 返回套索或矩形工具，点击“AI 选区重上色”。程序会用原始黑白整页重新运行 mc-v2，并只把选区内结果覆盖回来；
-   - 普通“选区上色”仍是不运行模型的快速色相迁移；
-   - 需要恢复参数时，点击“恢复当前工具默认参数”。
-5. 需要整体调整时，在“图片滤镜”中设置参数并选择当前页或全部已上色页。
-6. 保存项目或导出页面。
-
-## 测试
+3. 安装依赖（可选：使用国内镜像加速）
 
 ```bash
-python -m compileall -q .
-python -m unittest discover -s tests -v
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-当前版本测试结果为 274 项通过、6 项跳过。跳过项与当前纯计算环境缺少 PySide6/真实桌面条件有关。局部重上色已通过完整 pipeline 替身推理、Hint 编译、选区合成、手动颜色锁和像素级不越界检查；上传核心包未包含 mc-v2 权重，因此真实权重、MPS/CUDA 性能和桌面点击视觉效果仍需在安装完整依赖的目标电脑上验收。
+4. 启动程序
 
-可用自有图片执行通用效果验证：
-
+macOS:
 ```bash
-python validate_effect_controls.py page1.png page2.png --output validation.md
+python3 main.py
+```
+Windows:
+```cmd
+python main.py或者直接Start_Colortina.bat
 ```
 
-## 模型与缓存
+首次上色时会自动下载模型权重（约 400 MB，来自 mc-v2 官方发布），存放在 `models/weights/`。
 
-以下内容不应提交到 Git：
-
-- `models/weights/`
-- `runtime/`
-- `__pycache__/`
-- `*.pyc`
-- 用户项目与导出结果
-
-## 已知边界
-
-- 自动上色质量仍受 mc-v2 模型能力和原始线稿质量影响。
-- 断线严重、线稿极淡或大面积无边界区域时，矩形闭合识别仍可能返回空掩膜；程序会取消操作，而不是回退成整框上色。
-- MangaLineExtraction 首次下载约 170 MB，之后仅在勾选矩形闭合区域时对局部裁剪运行；不会参与 mc-v2 自动上色。
-- 完整 GPU/MPS 推理、真实模型权重下载和桌面视觉效果，需要在安装完整依赖的目标电脑上最终验收。
-
-## 许可
-
-仓库包含上游组件的许可证文件：
-
-- `LICENSE_ColorComic_MIT.txt`
-- `LICENSE_lbpcascade_animeface_MIT.txt`
-- `LICENSE_MangaLineExtraction_PyTorch_MIT.txt`
-
-公开发布前，请为你自己的修改部分选择并添加顶层 `LICENSE`，同时遵守模型权重条款和所处理漫画内容的版权要求。
-
-
-## V5.3 AI 选区重上色默认行为
-
-- 默认工具仍是区域画笔；普通模式沿真实笔迹实时上色。
-- 开启“模型 Hint 画笔”后，画笔只记录 mc-v2 提示，不直接改彩图。
-- 蓝色选区在切换到画笔或吸管时保持，不再自动取消。
-- “AI 选区重上色”默认会把蓝色选区外逐步弱化到白色，并保留一圈上下文带；仍然不是硬裁剪，最终只在选区内合成。
-- 关闭“框外弱化后再 AI 重上色”后，可回到完整原始黑白整页输入模式。
-- “选区恢复黑白预览”只影响显示，不破坏当前彩图。
-- 默认只使用选区及 16 px 缓冲带内 Hint；缓冲带不会扩大最终覆盖范围。
-- 选区外像素严格不变；羽化只向选区内部发生。
-- 矩形“仅填充选区内闭合区域”仍在后台运行 MangaLineExtraction；失败时取消，不回退成整框。
+macOS（Apple Silicon）无需额外配置，自动使用 MPS GPU 加速；NVIDIA 显卡请按 [PyTorch 官网](https://pytorch.org/get-started/locally/) 安装对应 CUDA 版本的 torch。
 
 
 
+## 使用
+
+1. 导入图片 / PDF / 文件夹（或直接拖入窗口）
+2. 点击「自动上色」
+3. 对不满意的区域涂抹颜色提示后「重新生成」
+4. 导出单页或全部页面
+
+## 致谢与许可
+
+本项目基于以下开源工作构建：
+
+- [qweasdd/manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2) — 上色核心模型
+- [qweasdd/manga-colorization](https://github.com/qweasdd/manga-colorization) — 手动上色提示
+- [vikast908/ColorComic](https://github.com/vikast908/ColorComic) — 提示点 API、引导式自动提示、分格/分块推理逻辑
+- [xiaogdgenuine/Manga-Colorization-FJ](https://github.com/xiaogdgenuine/Manga-Colorization-FJ) — 跳过已上色页面、权重格式兼容等思路
+
+
+
+
+## 免责声明
+
+本工具仅供个人学习与研究使用。请勿将上色结果用于侵犯原作者版权的用途。
