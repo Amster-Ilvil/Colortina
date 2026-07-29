@@ -92,12 +92,25 @@ macOS（Apple Silicon）无需额外配置，自动使用 MPS GPU 加速；NVIDI
 
 ## 致谢与许可
 
-本项目基于以下开源工作构建：
+Colortina 是一个整合型本地桌面工具，项目中的部分代码、模型结构、
+权重格式兼容逻辑和工程思路参考或改写自多个开源项目。完整第三方清单
+见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-- [qweasdd/manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2) — 上色核心模型
-- [qweasdd/manga-colorization](https://github.com/qweasdd/manga-colorization) — 手动上色提示
-- [vikast908/ColorComic](https://github.com/vikast908/ColorComic) — 提示点 API、引导式自动提示、分格/分块推理逻辑
-- [xiaogdgenuine/Manga-Colorization-FJ](https://github.com/xiaogdgenuine/Manga-Colorization-FJ) — 跳过已上色页面、权重格式兼容等思路
+主要致谢：
+
+- [qweasdd/manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2) — 核心漫画自动上色网络、推理流程与官方 generator/denoiser 权重来源。
+- [qweasdd/manga-colorization](https://github.com/qweasdd/manga-colorization) — 手动颜色提示工作流与早期交互式上色思路。
+- [vikast908/ColorComic](https://github.com/vikast908/ColorComic) — 提示点 API、引导式自动提示、分格/分块推理等工程思路；其 MIT 许可证文本保留在 `LICENSE_ColorComic_MIT.txt`。
+- [xiaogdgenuine/Manga-Colorization-FJ](https://github.com/xiaogdgenuine/Manga-Colorization-FJ) — 跳过已上色页面、权重格式兼容、发布适配等思路。
+- [ljsabc/MangaLineExtraction_PyTorch](https://github.com/ljsabc/MangaLineExtraction_PyTorch) — 矩形/套索区域的漫画结构线提取网络，MIT License。
+- [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) 与 [XPixelGroup/BasicSR](https://github.com/XPixelGroup/BasicSR) — anime6B 超分模型与 RRDBNet/BasicSR 架构参考，分别采用 BSD-3-Clause 与 Apache-2.0。
+- [Matias Tassano 的 FFDNet](https://github.com/cszn/FFDNet) / IPOL FFDNet 相关实现 — mc-v2 denoiser 中包含的 FFDNet 代码声明为 GPLv3-or-later；分发或再利用时请一并遵守其许可证。
+- [nagadomi/lbpcascade_animeface](https://github.com/nagadomi/lbpcascade_animeface) — OpenCV 动漫脸检测级联文件来源，MIT 许可证文本保留在 `LICENSE_lbpcascade_animeface_MIT.txt`。
+
+运行依赖包括 PyTorch / torchvision、PySide6、OpenCV、NumPy、Pillow、
+Transformers、ONNX Runtime、scikit-image、gdown、PyMuPDF、Pydantic 等；
+这些依赖均保留各自许可证。尤其是 PyMuPDF 同时提供 AGPL/commercial 授权，
+重新分发或商业使用前请自行确认合规性。
 
 
 
