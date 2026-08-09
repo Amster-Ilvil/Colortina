@@ -1,6 +1,34 @@
 import os
+import sys
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _runtime_data_dir() -> str:
+    """Return a writable data directory for packaged desktop builds.
+
+    Source checkouts keep the historical in-repository layout.  PyInstaller
+    bundles, especially a macOS app launched from a DMG or /Applications,
+    must not try to download model weights or write project state inside the
+    read-only application bundle.
+    """
+    if not getattr(sys, "frozen", False):
+        return BASE_DIR
+
+    if sys.platform == "darwin":
+        root = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+    else:
+        root = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+
+    path = os.path.join(root, "Colortina")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+DATA_DIR = _runtime_data_dir()
 
 
 class Config:
@@ -9,7 +37,10 @@ class Config:
     APP_VERSION = "5.4.0"
     APP_VERSION_LABEL = "V5"
 
-    WEIGHTS_DIR = os.path.join(BASE_DIR, "models", "weights")
+    # Source runs keep using ./models/weights. Frozen desktop releases use a
+    # per-user writable directory so first-run downloads work from installed
+    # apps as well as directly mounted macOS DMGs.
+    WEIGHTS_DIR = os.path.join(DATA_DIR, "models", "weights")
     GENERATOR_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "generator.zip")
     EXTRACTOR_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "extractor.pth")
     DENOISER_WEIGHTS_DIR = os.path.join(WEIGHTS_DIR, "denoiser")
@@ -48,8 +79,8 @@ class Config:
 
     # Style Engine ("Extract Style" from a color reference page/cover)
     # and Character Memory persistence — one subfolder per project.
-    STYLES_DIR = os.path.join(BASE_DIR, "styles")
-    CHARACTERS_DIR = os.path.join(BASE_DIR, "characters")
+    STYLES_DIR = os.path.join(DATA_DIR, "styles")
+    CHARACTERS_DIR = os.path.join(DATA_DIR, "characters")
 
     # Real-ESRGAN anime weights for the "Ultra" quality preset's 4x
     # upscale pass (core.upscaler). Optional — falls back to a Lanczos
