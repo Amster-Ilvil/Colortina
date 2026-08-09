@@ -1,0 +1,316 @@
+name: Build and publish Colortina releases
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.py"
+      - "requirements*.txt"
+      - "assets/**"
+      - "vendor/**"
+      - "scripts/**"
+      - ".github/workflows/release.yml"
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+    paths:
+      - "config.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: colortina-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  metadata:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path('config.py').read_text(encoding='utf-8')
+          m = re.search(r'^\s*APP_VERSION\s*=\s*["\x27]([^"\x27]+)["\x27]', text, re.M)
+          if not m:
+              raise SystemExit('Config.APP_VERSION not found')
+          print(m.group(1))
+          PY
+          )"
+          TAG="v${VERSION}"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "$TAG" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Config.APP_VERSION ${VERSION}" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Colortina release: $TAG"
+
+  windows:
+    name: Windows x64 (CPU)
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -U pip wheel setuptools pyinstaller
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          pip install -r requirements.txt
+      - name: Compile check
+        shell: pwsh
+        run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
+      - name: Build application
+        shell: pwsh
+        run: python scripts/build_desktop.py --clean
+      - name: Package Windows
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'dist/Colortina' -DestinationPath "Colortina_${env:VERSION}_Windows_x64_CPU.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Colortina-Windows-x64-CPU
+          path: Colortina_${{ env.VERSION }}_Windows_x64_CPU.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  macos:
+    name: macOS ${{ matrix.label }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: AppleSilicon
+            arch: arm64
+          - os: macos-15-intel
+            label: Intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      PRODUCT_NAME: Colortina
+      DMG_BASENAME: Colortina_${{ needs.metadata.outputs.version }}_macOS_${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Architecture: $(uname -m)"
+          test "$(uname -m)" = "$ARCH"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -U pip wheel setuptools pyinstaller
+          pip install -r requirements.txt
+      - name: Compile check
+        shell: bash
+        run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
+      - name: Build application
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: python scripts/build_desktop.py --clean
+      - name: Verify executable architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP='dist/Colortina.app'
+          EXE="$APP/Contents/MacOS/Colortina"
+          test -d "$APP"
+          test -x "$EXE"
+          /usr/bin/file "$EXE"
+          /usr/bin/file "$EXE" | grep -q "$ARCH"
+          plutil -lint "$APP/Contents/Info.plist"
+      - name: Build and verify DMG
+        shell: bash
+        run: bash scripts/build_macos_dmg.sh --skip-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Colortina-macOS-${{ matrix.label }}
+          path: |
+            package/Colortina_${{ env.VERSION }}_macOS_${{ matrix.label }}.dmg
+            package/Colortina_${{ env.VERSION }}_macOS_${{ matrix.label }}.app.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  linux:
+    name: Linux x64 (CPU)
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install Linux GUI libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -U pip wheel setuptools pyinstaller
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          pip install -r requirements.txt
+      - name: Compile check
+        shell: bash
+        run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
+      - name: Build application
+        shell: bash
+        run: python scripts/build_desktop.py --clean
+      - name: Package Linux
+        shell: bash
+        run: tar -C dist -czf "Colortina_${VERSION}_Linux_x64_CPU.tar.gz" Colortina
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Colortina-Linux-x64-CPU
+          path: Colortina_${{ env.VERSION }}_Linux_x64_CPU.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name != 'pull_request'
+    needs: [metadata, windows, macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp "downloaded/Colortina-Windows-x64-CPU/Colortina_${VERSION}_Windows_x64_CPU.zip" release-assets/
+          cp "downloaded/Colortina-macOS-AppleSilicon/Colortina_${VERSION}_macOS_AppleSilicon.dmg" release-assets/
+          cp "downloaded/Colortina-macOS-AppleSilicon/Colortina_${VERSION}_macOS_AppleSilicon.app.zip" release-assets/
+          cp "downloaded/Colortina-macOS-Intel/Colortina_${VERSION}_macOS_Intel.dmg" release-assets/
+          cp "downloaded/Colortina-macOS-Intel/Colortina_${VERSION}_macOS_Intel.app.zip" release-assets/
+          cp "downloaded/Colortina-Linux-x64-CPU/Colortina_${VERSION}_Linux_x64_CPU.tar.gz" release-assets/
+
+          cat > release-assets/BUILD-INFO.txt <<EOF
+          Colortina ${RELEASE_TAG}
+          Repository: ${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
+          Workflow run: ${GITHUB_RUN_ID}
+          Python: 3.11
+          Windows x64: CPU PyTorch build
+          Linux x64: CPU PyTorch build
+          macOS Apple Silicon: native arm64, MPS-capable PyTorch
+          macOS Intel: native x86_64
+          macOS signing: ad-hoc
+          macOS DMG verification: PASS
+          Model weights bundled: no; downloaded on first use
+          EOF
+
+          cd release-assets
+          sha256sum \
+            "Colortina_${VERSION}_Windows_x64_CPU.zip" \
+            "Colortina_${VERSION}_macOS_AppleSilicon.dmg" \
+            "Colortina_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "Colortina_${VERSION}_macOS_Intel.dmg" \
+            "Colortina_${VERSION}_macOS_Intel.app.zip" \
+            "Colortina_${VERSION}_Linux_x64_CPU.tar.gz" \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES=$(mktemp)
+          cat > "$NOTES" <<EOF
+          ## Colortina ${RELEASE_TAG}
+
+          Multi-platform desktop release built from the repository source.
+
+          - macOS Apple Silicon: native arm64 `.dmg` and `.app.zip`, MPS supported.
+          - macOS Intel: native x86_64 `.dmg` and `.app.zip`.
+          - Windows x64: portable CPU build.
+          - Linux x64: portable CPU build.
+          - Model weights are not bundled; Colortina downloads required weights on first use.
+          - Packaged builds store weights and writable app data in the user's application-data directory rather than inside the installed application.
+
+          See `SHA256SUMS.txt` and `BUILD-INFO.txt` for verification details.
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Colortina ${RELEASE_TAG}" --notes-file "$NOTES" --latest
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Colortina ${RELEASE_TAG}" --notes-file "$NOTES" --latest
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for name in \
+            "Colortina_${VERSION}_Windows_x64_CPU.zip" \
+            "Colortina_${VERSION}_macOS_AppleSilicon.dmg" \
+            "Colortina_${VERSION}_macOS_AppleSilicon.app.zip" \
+            "Colortina_${VERSION}_macOS_Intel.dmg" \
+            "Colortina_${VERSION}_macOS_Intel.app.zip" \
+            "Colortina_${VERSION}_Linux_x64_CPU.tar.gz" \
+            SHA256SUMS.txt \
+            BUILD-INFO.txt
+          do
+            grep -qx "$name" <<< "$ASSETS"
+          done
+          gh release view "$RELEASE_TAG" --json url,name,tagName,isDraft,isPrerelease,assets \
+            --jq '{url,name,tagName,isDraft,isPrerelease,assets:[.assets[].name]}'

@@ -5,7 +5,9 @@ Pillow>=10.0
 
 # PyTorch — on Mac this installs the MPS-enabled build automatically,
 # no special index-url needed (unlike CUDA on Linux/Windows).
-torch>=2.3
+# Intel macOS wheels currently top out at torch 2.2.x, which remains
+# compatible with Colortina's mc-v2 inference path.
+torch>=2.2.2
 torchvision>=0.15
 
 # Auto color-hint generation (CLIP zero-shot region labeling)
