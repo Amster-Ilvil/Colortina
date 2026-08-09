@@ -1,0 +1,62 @@
+# Local environments and Python caches
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+credentials*.json
+secrets*.json
+service-account*.json
+*.pem
+*.p12
+*.pfx
+*.key
+
+# Model/runtime data
+.runtime/
+.model-cache/
+.ocr-runtimes/
+.ocr-runtime-state/
+.manual-model-updates/
+.windows-runtime-state/
+model_cache/
+models/cache/
+models/checkpoints/
+models/weights/
+
+# Logs, databases, temporary and generated files
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-*
+logs/
+cache/
+debug/
+tmp/
+temp/
+output/
+outputs/
+exports/
+backups/
+workspaces/
+dist/
+build/
+package/
+*.epub
+*.docx
+*.dmg
+*.app/
+
+# OS metadata
+.DS_Store
+Thumbs.db
