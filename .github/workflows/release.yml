@@ -9,14 +9,19 @@ on:
       - "assets/**"
       - "vendor/**"
       - "scripts/**"
+      - ".gitignore"
       - ".github/workflows/release.yml"
+      - ".github/workflows/privacy-audit.yml"
   push:
     branches: [main]
     tags:
       - "v*"
     paths:
       - "config.py"
+      - "scripts/privacy_audit.py"
+      - ".gitignore"
       - ".github/workflows/release.yml"
+      - ".github/workflows/privacy-audit.yml"
   workflow_dispatch:
 
 permissions:
@@ -28,13 +33,20 @@ concurrency:
 
 jobs:
   metadata:
-    name: Resolve version
+    name: Privacy audit and version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Privacy audit
+        run: python scripts/privacy_audit.py
       - id: version
         shell: bash
         run: |
@@ -248,6 +260,7 @@ jobs:
           Commit: ${GITHUB_SHA}
           Workflow run: ${GITHUB_RUN_ID}
           Python: 3.11
+          Privacy audit: PASS
           Windows x64: CPU PyTorch build
           Linux x64: CPU PyTorch build
           macOS Apple Silicon: native arm64, MPS-capable PyTorch
@@ -276,7 +289,7 @@ jobs:
           cat > "$NOTES" <<EOF
           ## Colortina ${RELEASE_TAG}
 
-          Multi-platform desktop release built from the repository source.
+          Multi-platform desktop release built from a clean GitHub Actions checkout after a mandatory privacy audit.
 
           - macOS Apple Silicon: native arm64 `.dmg` and `.app.zip`, MPS supported.
           - macOS Intel: native x86_64 `.dmg` and `.app.zip`.
@@ -284,6 +297,7 @@ jobs:
           - Linux x64: portable CPU build.
           - Model weights are not bundled; Colortina downloads required weights on first use.
           - Packaged builds store weights and writable app data in the user's application-data directory rather than inside the installed application.
+          - Release publication is blocked if tracked private/local artifacts or common credential patterns are detected.
 
           See `SHA256SUMS.txt` and `BUILD-INFO.txt` for verification details.
           EOF
