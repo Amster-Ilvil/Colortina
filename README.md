@@ -35,12 +35,17 @@
 
    macOS:
    ```bash
-   cd ~/ # 改成你的实际路径
+   cd ~/Colortina
    ```
-   Windows (CMD 或 PowerShell):
+   Windows (CMD):
+   ```cmd
+   cd %USERPROFILE%\Colortina
+   ```
+   Windows (PowerShell):
    ```powershell
-   cd C:\Users\你的用户名\你的实际路径或者直接Start_Colortina.bat
+   Set-Location (Join-Path $HOME 'Colortina')
    ```
+   也可以直接运行 `Start_Colortina.bat`。
 
 2. 创建并激活虚拟环境
 
@@ -74,14 +79,13 @@ python3 main.py
 ```
 Windows:
 ```cmd
-python main.py或者直接Start_Colortina.bat
+python main.py
 ```
+也可以直接运行 `Start_Colortina.bat`。
 
 首次上色时会自动下载模型权重（约 400 MB，来自 mc-v2 官方发布），存放在 `models/weights/`。
 
 macOS（Apple Silicon）无需额外配置，自动使用 MPS GPU 加速；NVIDIA 显卡请按 [PyTorch 官网](https://pytorch.org/get-started/locally/) 安装对应 CUDA 版本的 torch。
-
-
 
 ## 使用
 
@@ -111,9 +115,6 @@ Colortina 是一个整合型本地桌面工具，项目中的部分代码、模�
 Transformers、ONNX Runtime、scikit-image、gdown、PyMuPDF、Pydantic 等；
 这些依赖均保留各自许可证。尤其是 PyMuPDF 同时提供 AGPL/commercial 授权，
 重新分发或商业使用前请自行确认合规性。
-
-
-
 
 ## 免责声明
 
