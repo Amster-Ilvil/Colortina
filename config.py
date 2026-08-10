@@ -34,7 +34,7 @@ DATA_DIR = _runtime_data_dir()
 class Config:
     """Minimal local config. No Flask, no .env parsing — just paths."""
 
-    APP_VERSION = "5.4.0"
+    APP_VERSION = "5.13.27"
     APP_VERSION_LABEL = "V5"
 
     # Source runs keep using ./models/weights. Frozen desktop releases use a
