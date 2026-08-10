@@ -110,3 +110,5 @@ jobs:
       - name: Remove temporary payload branch
         shell: bash
         run: git push origin --delete agent/v5.13.27-source-final-real || true
+
+# Trigger through a server-side PR merge so the main push is guaranteed to enter Actions.
