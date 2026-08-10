@@ -57,6 +57,11 @@ package/
 *.dmg
 *.app/
 
+# One-shot source transport artifacts
+source_sync*/
+_direct_payload/
+.github/v51327-payload/
+
 # OS metadata
 .DS_Store
 Thumbs.db
