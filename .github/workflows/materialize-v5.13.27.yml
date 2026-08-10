@@ -1,0 +1,257 @@
+name: Materialize Colortina v5.13.27 source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/materialize-v5.13.27.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize sanitized source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import base64
+          import io
+          import lzma
+          import os
+          import re
+          import shutil
+          import tarfile
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          repo = Path.cwd()
+          parts = sorted((repo / "source_sync").glob("part-*.b64"))
+          if not parts:
+              raise SystemExit("source_sync/part-*.b64 not found")
+
+          encoded = "".join(p.read_text(encoding="ascii").strip() for p in parts)
+          payload = base64.b64decode(encoded, validate=True)
+          work = Path(tempfile.mkdtemp(prefix="colortina-v51327-"))
+          unpack = work / "unpack"
+          unpack.mkdir()
+
+          def safe_target(root: Path, name: str) -> Path:
+              target = (root / name).resolve()
+              if root.resolve() not in target.parents and target != root.resolve():
+                  raise RuntimeError(f"unsafe archive member: {name}")
+              return target
+
+          def extract_tar(data: bytes) -> bool:
+              try:
+                  with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+                      for member in tf.getmembers():
+                          safe_target(unpack, member.name)
+                      tf.extractall(unpack)
+                  return True
+              except tarfile.TarError:
+                  return False
+
+          extracted = False
+          if payload.startswith(b"\xfd7zXZ\x00"):
+              raw = lzma.decompress(payload)
+              extracted = extract_tar(raw)
+              if not extracted and raw.startswith(b"PK\x03\x04"):
+                  with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                      for name in zf.namelist():
+                          safe_target(unpack, name)
+                      zf.extractall(unpack)
+                  extracted = True
+          elif payload.startswith(b"PK\x03\x04"):
+              with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                  for name in zf.namelist():
+                      safe_target(unpack, name)
+                  zf.extractall(unpack)
+              extracted = True
+          else:
+              extracted = extract_tar(payload)
+
+          if not extracted:
+              raise SystemExit("unable to recognize source_sync archive")
+
+          candidates = [p.parent for p in unpack.rglob("config.py") if (p.parent / "main.py").is_file()]
+          if not candidates:
+              raise SystemExit("materialized archive has no Colortina source root")
+          src = sorted(candidates, key=lambda p: (len(p.parts), str(p)))[0]
+
+          version_text = (src / "config.py").read_text(encoding="utf-8")
+          if 'APP_VERSION = "5.13.27"' not in version_text and "APP_VERSION = '5.13.27'" not in version_text:
+              raise SystemExit("source archive is not Colortina v5.13.27")
+
+          # Require the v5.13.27 UI/core payload to be complete before touching the repo.
+          expected = [
+              "ui/main_window.py", "ui/canvas.py", "ui/worker.py",
+              "core/ai_hair_parser.py", "core/illustrative_inkwash.py",
+              "core/mcv2_region_control.py", "core/character_library.py",
+              "pipeline.py", "main.py", "requirements.txt",
+          ]
+          missing = [name for name in expected if not (src / name).is_file()]
+          if missing:
+              raise SystemExit(f"source archive incomplete: {missing}")
+          if len(list((src / "core").glob("*.py"))) < 60:
+              raise SystemExit("source archive core/ is unexpectedly incomplete")
+
+          # Copy only runtime/source files. Build reports, user fixtures, cached outputs,
+          # model weights and the package README are deliberately not materialized.
+          for dirname in ("core", "models", "ui", "vendor"):
+              source_dir = src / dirname
+              target_dir = repo / dirname
+              if target_dir.exists():
+                  shutil.rmtree(target_dir)
+              shutil.copytree(source_dir, target_dir, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+
+          for name in (
+              "main.py", "pipeline.py", "requirements-macos.lock.txt",
+              "requirements-macos27.txt", "Install_Mac27_MPS.command",
+              "Start_Colortina_Mac.command", "run_colortina.command",
+          ):
+              p = src / name
+              if p.is_file():
+                  shutil.copy2(p, repo / name)
+
+          # Merge latest v5.13.27 config with the repository's packaged-build writable
+          # application-data behavior; do not regress release packaging.
+          cfg = (src / "config.py").read_text(encoding="utf-8")
+          if "import sys" not in cfg:
+              cfg = cfg.replace("import os\n", "import os\nimport sys\n", 1)
+          anchor = "BASE_DIR = os.path.dirname(os.path.abspath(__file__))\n\n\nclass Config:"
+          helper = '''BASE_DIR = os.path.dirname(os.path.abspath(__file__))\n\n\ndef _runtime_data_dir() -> str:\n    """Return a writable data directory for packaged desktop builds."""\n    if not getattr(sys, "frozen", False):\n        return BASE_DIR\n    if sys.platform == "darwin":\n        root = os.path.expanduser("~/Library/Application Support")\n    elif os.name == "nt":\n        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")\n    else:\n        root = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")\n    path = os.path.join(root, "Colortina")\n    os.makedirs(path, exist_ok=True)\n    return path\n\n\nDATA_DIR = _runtime_data_dir()\n\n\nclass Config:'''
+          if "DATA_DIR = _runtime_data_dir()" not in cfg:
+              if anchor not in cfg:
+                  raise SystemExit("config runtime-data merge anchor not found")
+              cfg = cfg.replace(anchor, helper, 1)
+          cfg = cfg.replace('WEIGHTS_DIR = os.path.join(BASE_DIR, "models", "weights")', 'WEIGHTS_DIR = os.path.join(DATA_DIR, "models", "weights")')
+          cfg = cfg.replace('STYLES_DIR = os.path.join(BASE_DIR, "styles")', 'STYLES_DIR = os.path.join(DATA_DIR, "styles")')
+          cfg = cfg.replace('CHARACTERS_DIR = os.path.join(BASE_DIR, "characters")', 'CHARACTERS_DIR = os.path.join(DATA_DIR, "characters")')
+          (repo / "config.py").write_text(cfg, encoding="utf-8")
+
+          # Keep Intel macOS compatibility from the existing release pipeline while
+          # adding the new vendored-denoiser dependency required by v5.13.27.
+          req = (src / "requirements.txt").read_text(encoding="utf-8")
+          req = req.replace("torch>=2.3", "torch>=2.2.2")
+          if "scikit-image" not in req:
+              req += "\n# Vendored mc-v2 denoiser utility dependency\nscikit-image>=0.24\n"
+          (repo / "requirements.txt").write_text(req, encoding="utf-8")
+
+          # README rule from the maintainer: never remove existing text; append only.
+          readme = repo / "README.md"
+          old = readme.read_text(encoding="utf-8")
+          marker = "## Colortina v5.13.27 更新（2026-08-10）"
+          if marker not in old:
+              addition = r'''
+
+---
+
+## Colortina v5.13.27 更新（2026-08-10）
+
+> 本节为新增内容；上方原 README 全部保留，不做删减。
+
+### 本次核心更新
+
+- **输出页重构**：原图 / AI 结果 / 编辑后结果改为清晰的分段式预览切换；尚未生成的版本会直接禁用，不再静默回退到原图。
+- **输出操作分区**：预览、版本恢复与导出拆分为独立区域；“导出全部”依据整个项目是否存在可导出结果判断，不再只看当前页。
+- **头发纠色工作区**：专用头发纠色页底部加入固定“自动上色”入口，并纳入统一忙碌状态与按钮可用性管理。
+- **中央预览精简**：移除预览左上角当前文件名，减少无关信息干扰。
+- **右侧 UI 精装修**：持续统一卡片间距、数值控件宽度、主次操作层级、圆形选择控件以及滚动区域布局。
+- **稳定性加强**：后台任务期间锁定结构性操作，修复控件重建/销毁后的状态更新问题，并保持页选择统计、任务状态和线程退出一致。
+- **AI 头发解析与局部纠色**：保留多后端 AI 头发解析、独立头发选区、选区增减笔、完整上下文检测后裁剪及结果缓存复用。
+- **macOS / Apple Silicon**：继续支持 MPS；macOS 27 专用安装脚本使用兼容依赖组合，打包版本的模型和项目数据写入用户应用数据目录，而不是只读应用包。
+
+### 源码与隐私
+
+仓库根目录现在直接保存可浏览、可构建的 v5.13.27 核心源码（`core/`、`ui/`、`models/`、`vendor/`、`pipeline.py`、`main.py`、`config.py`），不再依赖 Base64 源码分片作为实际开发入口。
+
+公开仓库不包含用户图片、项目文件、导出结果、模型权重、运行缓存、凭据、令牌、私钥或用户主目录路径。模型权重继续按需下载，并由现有隐私审计工作流在提交和发布阶段进行检查。
+
+### 版本
+
+当前核心版本：**v5.13.27**。GitHub Release 由仓库现有多平台发布工作流构建 Windows x64、macOS Apple Silicon、macOS Intel 与 Linux x64 产物，并生成校验文件。
+'''
+              readme.write_text(old + addition, encoding="utf-8")
+
+          # Remove the transport-only encoded source after successful materialization.
+          shutil.rmtree(repo / "source_sync", ignore_errors=True)
+          (repo / ".github/workflows/materialize-v5.13.27.yml").unlink(missing_ok=True)
+
+          # Strict local privacy gate. Upstream author copyright email addresses are
+          # intentionally not treated as maintainer/user secrets.
+          forbidden_names = {".env", ".env.local", "credentials.json", "secrets.json", "service-account.json"}
+          forbidden_dirs = {"__pycache__", ".pytest_cache", ".cache", "cache", "logs", "output", "outputs", "exports", "workspaces", "models/weights"}
+          secret_patterns = [
+              re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+              re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{24,}"),
+              re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"),
+              re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}"),
+              re.compile(r"(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])"),
+          ]
+          home_patterns = [
+              re.compile(r"/Users/(?!Shared(?:/|$)|runner(?:/|$)|<|USER(?:/|$)|username(?:/|$)|yourname(?:/|$)|path(?:/|$))[^/\s\"']+"),
+              re.compile(r"/home/(?!runner(?:/|$)|<|USER(?:/|$)|username(?:/|$)|yourname(?:/|$)|path(?:/|$))[^/\s\"']+"),
+              re.compile(r"(?i)[A-Z]:\\Users\\(?!Public\\|runneradmin\\|<|USER\\|username\\|yourname\\|path\\)[^\\\r\n\"']+"),
+          ]
+          problems = []
+          for p in repo.rglob("*"):
+              if not p.is_file() or ".git" in p.parts:
+                  continue
+              rel = p.relative_to(repo).as_posix()
+              parts_lower = {part.lower() for part in p.parts}
+              if p.name.lower() in forbidden_names:
+                  problems.append(f"forbidden file: {rel}")
+              if any(d in rel.lower().split("/") for d in ("__pycache__", ".pytest_cache", ".cache", "cache", "logs", "outputs", "exports", "workspaces")):
+                  problems.append(f"forbidden generated path: {rel}")
+              if p.suffix.lower() in {".pem", ".p12", ".pfx", ".key", ".log", ".db", ".sqlite", ".sqlite3", ".pyc", ".pyo"}:
+                  problems.append(f"forbidden private/runtime file: {rel}")
+              try:
+                  data = p.read_bytes()
+              except OSError:
+                  continue
+              if b"\x00" in data[:8192] or len(data) > 10 * 1024 * 1024:
+                  continue
+              text = data.decode("utf-8", "ignore")
+              if "/mnt/data/" in text:
+                  problems.append(f"build-container path in public file: {rel}")
+              for pattern in secret_patterns:
+                  if pattern.search(text):
+                      problems.append(f"possible secret in {rel}")
+              for pattern in home_patterns:
+                  if pattern.search(text):
+                      problems.append(f"possible private home path in {rel}")
+          if problems:
+              raise SystemExit("PRIVACY MATERIALIZATION FAILED\n" + "\n".join(sorted(set(problems))))
+
+          print(f"Materialized source root: {src}")
+          print(f"Core files: {len(list((repo / 'core').glob('*.py')))}")
+          print("Privacy materialization scan passed")
+          PY
+
+      - name: Compile source
+        run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
+
+      - name: Run repository privacy audit
+        run: python scripts/privacy_audit.py
+
+      - name: Commit materialized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
+          git commit -m "Materialize Colortina v5.13.27 core source"
+          git push origin HEAD:main
