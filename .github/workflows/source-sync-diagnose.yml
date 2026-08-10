@@ -1,0 +1,43 @@
+name: Diagnose v5.13.27 source transport
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect source transport
+        run: |
+          python - <<'PY'
+          import base64, io, lzma, tarfile
+          from pathlib import Path
+          parts = sorted(Path('source_sync').glob('part-*.b64'))
+          print('parts', len(parts), [p.name for p in parts])
+          encoded = ''.join(p.read_text(encoding='ascii').strip() for p in parts)
+          print('encoded_chars', len(encoded))
+          payload = base64.b64decode(encoded, validate=True)
+          print('payload_bytes', len(payload), 'magic', payload[:16])
+          if payload.startswith(b'\xfd7zXZ\x00'):
+              raw = lzma.decompress(payload)
+              print('decompressed_bytes', len(raw), 'raw_magic', raw[:32])
+              try:
+                  with tarfile.open(fileobj=io.BytesIO(raw), mode='r:*') as tf:
+                      names = tf.getnames()
+                      print('tar_members', len(names))
+                      for n in names[:80]: print(n)
+                      cfg = next((n for n in names if n.endswith('/config.py') or n == 'config.py'), None)
+                      print('config_member', cfg)
+                      if cfg:
+                          f = tf.extractfile(cfg)
+                          text = f.read().decode('utf-8', 'replace') if f else ''
+                          for line in text.splitlines():
+                              if 'APP_VERSION' in line: print('VERSION_LINE', line)
+              except tarfile.TarError as exc:
+                  print('tar_error', repr(exc))
+          PY
