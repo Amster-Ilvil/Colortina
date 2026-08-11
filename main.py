@@ -14,6 +14,12 @@ from config import Config
 from ui.main_window import MainWindow
 
 
+def _resource_path(*parts: str) -> str:
+    """Resolve bundled assets from source or a PyInstaller build."""
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, *parts)
+
+
 def main():
     # 隐私硬锁：模型权重齐全时，在 socket 层禁止本进程一切对外连接
     # （仅回环地址放行）——HF 校验、遥测、任何库的联网行为都被物理拦截。
@@ -42,11 +48,13 @@ def main():
     app.setApplicationVersion(Config.APP_VERSION)
     app.setOrganizationName("Colortina")
 
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")
-    if os.path.isfile(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
+    app_icon = QIcon(_resource_path("assets", "icon.jpg"))
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
 
     window = MainWindow()
+    if not app_icon.isNull():
+        window.setWindowIcon(app_icon)
     window.show()
     sys.exit(app.exec())
 
