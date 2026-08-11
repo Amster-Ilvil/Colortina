@@ -91,7 +91,7 @@ def main() -> None:
         *add_data_args(),
     ]
 
-    icon = ROOT / "assets" / "icon.png"
+    icon = ROOT / "assets" / "icon.jpg"
     if icon.is_file():
         cmd += ["--icon", str(icon)]
 
