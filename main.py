@@ -48,7 +48,7 @@ def main():
     app.setApplicationVersion(Config.APP_VERSION)
     app.setOrganizationName("Colortina")
 
-    app_icon = QIcon(_resource_path("assets", "icon.jpg"))
+    app_icon = QIcon(_resource_path("assets", "icon.png"))
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
 
