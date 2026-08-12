@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/readme-banner.webp" width="100%" alt="Colortina — Manga-Colorization-v2">
+  <img src="assets/colortina_banner.svg" alt="Colortina — Manga-Colorization-v2" width="100%">
 </p>
 
 <h1 align="center">Colortina</h1>
