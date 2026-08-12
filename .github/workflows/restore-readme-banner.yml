@@ -1,0 +1,46 @@
+name: Restore README banner
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".asset-staging/banner2.part*"
+      - ".github/workflows/restore-readme-banner.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Rebuild banner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .asset-staging/banner2.part00 \
+              .asset-staging/banner2.part01 \
+              .asset-staging/banner2.part02 \
+              .asset-staging/banner2.part03 \
+            | base64 -d > assets/readme-banner.jpg
+          test "$(wc -c < assets/readme-banner.jpg | tr -d ' ')" = "292440"
+          echo "13c29e20fde4a6e47195f5aeba7a442908f4b84b3d5a5b70e2ae91d72e0baf05  assets/readme-banner.jpg" | sha256sum -c -
+
+      - name: Commit rebuilt banner
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assets/readme-banner.jpg
+          if git diff --cached --quiet; then
+            echo "Banner already matches the staged source."
+            exit 0
+          fi
+          git commit -m "assets: restore full README banner"
+          git push
