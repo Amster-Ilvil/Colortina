@@ -159,12 +159,3 @@ Colortina 是一个整合型本地桌面工具，项目中的部分代码、模�
 
 本项目原创代码以 [MIT License](LICENSE) 开源。第三方代码、模型、权重和资源仍按各自许可证授权；使用本工具及生成内容时，请遵守适用的第三方许可与原作品版权，不得将其用于侵权用途。
 
-## About 推荐内容
-
-**Description**
-
-> 本地黑白漫画 AI 自动上色工具｜manga-colorization-v2｜手动颜色提示与局部重绘｜macOS / Windows / Linux｜Apple Silicon MPS / CUDA
-
-**Topics**
-
-`manga` `manga-colorization` `comic` `colorization` `ai` `pytorch` `pyside6` `macos` `apple-silicon` `mps` `windows` `linux` `cuda` `local-ai` `image-processing`
