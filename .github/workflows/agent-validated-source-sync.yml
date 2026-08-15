@@ -1,0 +1,129 @@
+name: Agent validated source sync
+
+on:
+  push:
+    branches:
+      - agent/sync-core-20260815
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-and-merge:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Validate exact source scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          BASE=$(git merge-base origin/main HEAD)
+          python - <<'PY'
+          import subprocess, sys
+          allow = set('''Install_Mac27_MPS.command
+          README.md
+          build_update_package.command
+          config.py
+          main.py
+          pipeline.py
+          requirements-macos27.txt
+          requirements.txt
+          run_colortina.command
+          update_colortina.command
+          ui/canvas.py
+          ui/i18n.py
+          ui/main_window.py
+          ui/worker.py
+          core/ai_hair_parser.py
+          core/anime_face_detector.py
+          core/cancellation.py
+          core/character_scope.py
+          core/device_runtime.py
+          core/edit_snapshot.py
+          core/guided_colorist.py
+          core/hair_model_manager.py
+          core/hint_manager.py
+          core/illustrative_inkwash.py
+          core/image_compressor.py
+          core/line_boundary.py
+          core/local_model_recolor.py
+          core/manual_edit.py
+          core/mcv2_region_control.py
+          core/mcv2_semantic_selection.py
+          core/ml_colorizer.py
+          core/model_downloader.py
+          core/network_lockdown.py
+          core/presets.py
+          core/project_store.py
+          core/selection_snap.py
+          core/structural_line_detector.py
+          core/style_post.py
+          core/text_guard.py
+          core/third_party/hair_parsing/__init__.py
+          core/third_party/hair_parsing/anime_face_unet.py
+          core/third_party/hair_parsing/bisenet19.py
+          vendor/manga_colorization_v2/colorizator.py
+          vendor/manga_colorization_v2/denoising/denoiser.py
+          vendor/manga_colorization_v2/networks/models.py'''.splitlines())
+          allow = {x.strip() for x in allow if x.strip()}
+          workflow = '.github/workflows/agent-validated-source-sync.yml'
+          base = subprocess.check_output(['git','merge-base','origin/main','HEAD'], text=True).strip()
+          rows = subprocess.check_output(['git','diff','--name-status',f'{base}...HEAD'], text=True).splitlines()
+          changed=[]
+          for row in rows:
+              parts=row.split('\t')
+              status=parts[0]
+              path=parts[-1]
+              if path == workflow:
+                  continue
+              if status.startswith('D'):
+                  raise SystemExit(f'unexpected deletion: {path}')
+              if path.startswith('.github/source_sync_payload/'):
+                  raise SystemExit(f'transport payload still present: {path}')
+              if path.startswith('Colortina.app/') or path == 'assets/icon.png' or '__pycache__/' in path:
+                  raise SystemExit(f'forbidden generated/binary path: {path}')
+              if path not in allow:
+                  raise SystemExit(f'path outside audited allowlist: {path}')
+              changed.append(path)
+          if not changed:
+              raise SystemExit('no audited source changes found')
+          print(f'validated {len(changed)} changed source files')
+          PY
+          python scripts/privacy_audit.py
+          python -m compileall -q . -x '(^|/)(\.git|\.venv|venv|__pycache__)(/|$)'
+
+      - name: Remove validation workflow from final diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm .github/workflows/agent-validated-source-sync.yml
+          git add -A
+          git commit -m 'Remove temporary source sync validator'
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+      - name: Create and squash merge pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --base main \
+              --title 'Sync audited Colortina core source' \
+              --body 'Incremental sync from Colortina-core-local-20260815.zip. Privacy audit and Python compile check passed. Generated app/cache/private artifacts are excluded; repository-only files are preserved; final diff contains only actual audited source changes.'
+            PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --base main --state open --json number --jq '.[0].number')
+          fi
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --delete-branch
