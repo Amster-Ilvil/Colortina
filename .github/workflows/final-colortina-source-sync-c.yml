@@ -1,0 +1,199 @@
+name: Final verified Colortina source sync
+
+on:
+  push:
+    branches:
+      - agent/final-colortina-sync-20260815c
+    paths:
+      - .github/workflows/final-colortina-source-sync-c.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Fetch main and verified payload branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git fetch origin 'refs/heads/agent/colortina-payload-20260815b:refs/remotes/origin/agent/colortina-payload-20260815b'
+          git rev-parse origin/main > /tmp/main-base.txt
+
+      - name: Reassemble and verify audited archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, hashlib, subprocess
+          REF='origin/agent/colortina-payload-20260815b'
+          ROOT='.github/colortina_payload/'
+          def read(name):
+              return subprocess.check_output(['git','show',f'{REF}:{ROOT}{name}']).decode('ascii')
+          pieces=[]
+          for i in range(8): pieces.append(read(f'part{i:02d}.b64'))
+          pieces.append(read('part08.b64')[:12000])
+          for i in range(9,13): pieces.append(read(f'part{i:02d}.b64'))
+          pieces.append(read('part13.b64'))
+          pieces.append(read('repair_167784_168000.b64'))
+          pieces.append(read('part14.b64'))
+          pieces.append(read('repair_180_192.b64'))
+          pieces.append(read('repair_192_208.b64'))
+          pieces.append(read('repair_208_224.b64'))
+          pieces.append(read('repair_224_240.b64'))
+          for i in range(15,18): pieces.append(read(f'part{i:02d}.b64'))
+          pieces.append(read('part18.b64')[:20000])
+          pieces.append(read('repair_308_end.b64'))
+          text=''.join(pieces)
+          if len(text) != 322604:
+              raise SystemExit(f'base64 length mismatch: {len(text)}')
+          raw=base64.b64decode(text, validate=True)
+          if len(raw) != 241952:
+              raise SystemExit(f'archive size mismatch: {len(raw)}')
+          got=hashlib.sha256(raw).hexdigest()
+          want='192edf5a704a2b83ef23bd03c3a8e5d0cad02a22aa2b3cb63a488a2fffac745c'
+          if got != want:
+              raise SystemExit(f'archive sha256 mismatch: {got}')
+          open('/tmp/colortina-sync.tar.xz','wb').write(raw)
+          print('archive verified:', len(raw), got)
+          PY
+
+      - name: Apply exactly the audited 45-file source delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(cat /tmp/main-base.txt)
+          git reset --hard "$BASE"
+          rm -f .github/workflows/apply-audited-colortina-sync.yml
+          rm -f .github/workflows/build-audited-colortina-sync-branch.yml
+          python - <<'PY'
+          import pathlib, tarfile
+          allow='''Install_Mac27_MPS.command
+          README.md
+          build_update_package.command
+          config.py
+          main.py
+          pipeline.py
+          requirements-macos27.txt
+          requirements.txt
+          run_colortina.command
+          update_colortina.command
+          ui/canvas.py
+          ui/i18n.py
+          ui/main_window.py
+          ui/worker.py
+          core/ai_hair_parser.py
+          core/anime_face_detector.py
+          core/cancellation.py
+          core/character_scope.py
+          core/device_runtime.py
+          core/edit_snapshot.py
+          core/guided_colorist.py
+          core/hair_model_manager.py
+          core/hint_manager.py
+          core/illustrative_inkwash.py
+          core/image_compressor.py
+          core/line_boundary.py
+          core/local_model_recolor.py
+          core/manual_edit.py
+          core/mcv2_region_control.py
+          core/mcv2_semantic_selection.py
+          core/ml_colorizer.py
+          core/model_downloader.py
+          core/network_lockdown.py
+          core/presets.py
+          core/project_store.py
+          core/selection_snap.py
+          core/structural_line_detector.py
+          core/style_post.py
+          core/text_guard.py
+          core/third_party/hair_parsing/__init__.py
+          core/third_party/hair_parsing/anime_face_unet.py
+          core/third_party/hair_parsing/bisenet19.py
+          vendor/manga_colorization_v2/colorizator.py
+          vendor/manga_colorization_v2/denoising/denoiser.py
+          vendor/manga_colorization_v2/networks/models.py'''
+          allow={x.strip() for x in allow.splitlines() if x.strip()}
+          pathlib.Path('/tmp/allow.txt').write_text('\n'.join(sorted(allow))+'\n')
+          root=pathlib.Path.cwd().resolve()
+          with tarfile.open('/tmp/colortina-sync.tar.xz','r:xz') as tf:
+              files=set()
+              for m in tf.getmembers():
+                  dest=(root/m.name).resolve()
+                  if dest != root and root not in dest.parents:
+                      raise SystemExit('unsafe archive path: '+m.name)
+                  if m.issym() or m.islnk():
+                      raise SystemExit('archive links forbidden: '+m.name)
+                  if m.isfile(): files.add(m.name)
+              if files != allow:
+                  raise SystemExit('archive allowlist mismatch')
+              tf.extractall(root)
+          print('archive file set verified:',len(allow))
+          PY
+          chmod +x Install_Mac27_MPS.command build_update_package.command run_colortina.command update_colortina.command
+          git add -A
+          python scripts/privacy_audit.py
+          python -m compileall -q main.py pipeline.py config.py core ui models vendor
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          git add -A
+
+      - name: Validate exact incremental diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import subprocess
+          base=open('/tmp/main-base.txt').read().strip()
+          allow=set(open('/tmp/allow.txt').read().splitlines())
+          helpers={
+            '.github/workflows/apply-audited-colortina-sync.yml',
+            '.github/workflows/build-audited-colortina-sync-branch.yml',
+          }
+          expected_deleted=set()
+          for p in helpers:
+              if subprocess.run(['git','cat-file','-e',f'{base}:{p}'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0:
+                  expected_deleted.add(p)
+          rows=subprocess.check_output(['git','diff','--cached','--no-renames','--name-status',base],text=True).splitlines()
+          changed=set(); deleted=set()
+          for row in rows:
+              status,path=row.split('\t',1)
+              if status.startswith('D'):
+                  deleted.add(path); continue
+              changed.add(path)
+          if changed != allow:
+              raise SystemExit('source diff mismatch; missing='+repr(sorted(allow-changed))+' extra='+repr(sorted(changed-allow)))
+          if deleted != expected_deleted:
+              raise SystemExit('unexpected deletion set: '+repr(sorted(deleted))+' expected='+repr(sorted(expected_deleted)))
+          bad=[p for p in changed if p.startswith('Colortina.app/') or '__pycache__/' in p or p.startswith('.env')]
+          if bad: raise SystemExit('forbidden paths: '+repr(bad))
+          print('exact staged diff verified: 45 source files; helper deletions:',len(deleted))
+          PY
+
+      - name: Commit on top of unchanged current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(cat /tmp/main-base.txt)
+          git fetch origin main
+          NOW=$(git rev-parse origin/main)
+          if [ "$NOW" != "$BASE" ]; then
+            echo "main changed during validation: $BASE -> $NOW" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Sync audited Colortina core source' -m 'Incremental privacy-audited sync from Colortina-core-local-20260815.zip: apply only 45 actual source changes, preserve repository-only files, and remove temporary sync helpers.'
+          COMMIT=$(git rev-parse HEAD)
+          git push origin "$COMMIT":refs/heads/main
+          echo "FINAL_COMMIT=$COMMIT"
