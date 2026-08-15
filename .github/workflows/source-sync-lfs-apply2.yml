@@ -1,0 +1,129 @@
+name: Apply audited source sync payload 2
+on:
+  push:
+    branches: [agent/sync-core-20260815]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-python@v6
+        with: {python-version: '3.12'}
+      - name: Download verified LFS object
+        env: {GH_TOKEN: '${{ github.token }}'}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64,hashlib,json,os,urllib.request
+          oid='c2a07f7623e2d88c61eea33e988f86f0c4541c8d0534da5bfb195648e73c1638'; size=241216
+          token=os.environ['GH_TOKEN']; repo=os.environ['GITHUB_REPOSITORY']
+          body=json.dumps({'operation':'download','transfers':['basic'],'objects':[{'oid':oid,'size':size}]},separators=(',',':')).encode()
+          auth=base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+          req=urllib.request.Request(f'https://github.com/{repo}.git/info/lfs/objects/batch',data=body,headers={'Authorization':'Basic '+auth,'Accept':'application/vnd.git-lfs+json','Content-Type':'application/vnd.git-lfs+json','User-Agent':'Colortina-sync'},method='POST')
+          with urllib.request.urlopen(req,timeout=30) as r: obj=json.load(r)['objects'][0]
+          if obj.get('error'): raise SystemExit('LFS download error')
+          a=(obj.get('actions') or {}).get('download');
+          if not a: raise SystemExit('LFS object unavailable')
+          with urllib.request.urlopen(urllib.request.Request(a['href'],headers=a.get('header') or {}),timeout=60) as r: data=r.read()
+          if len(data)!=size or hashlib.sha256(data).hexdigest()!=oid: raise SystemExit('payload verification failed')
+          open('/tmp/colortina-delta.tar.xz','wb').write(data)
+          PY
+      - name: Build exact clean tree and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          rm -rf .github/source_sync_payload
+          rm -f .github/source_sync_lfs_upload.json .github/source_sync_lfs_upload2.json
+          rm -f .github/workflows/agent-validated-source-sync.yml
+          rm -f .github/workflows/source-sync-lfs-bootstrap.yml .github/workflows/source-sync-lfs-bootstrap2.yml
+          rm -f .github/workflows/source-sync-lfs-apply.yml .github/workflows/source-sync-lfs-apply2.yml
+          python - <<'PY'
+          import pathlib,tarfile
+          root=pathlib.Path.cwd().resolve()
+          with tarfile.open('/tmp/colortina-delta.tar.xz','r:xz') as tf:
+              for m in tf.getmembers():
+                  d=(root/m.name).resolve()
+                  if d!=root and root not in d.parents: raise SystemExit('unsafe tar path')
+                  if m.issym() or m.islnk(): raise SystemExit('links forbidden')
+              tf.extractall(root)
+          PY
+          python scripts/privacy_audit.py
+          python -m compileall -q . -x '(^|/)(\.git|\.venv|venv|__pycache__)(/|$)'
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          git add -A
+          python - <<'PY'
+          import subprocess
+          allow=set('''Install_Mac27_MPS.command
+README.md
+build_update_package.command
+config.py
+main.py
+pipeline.py
+requirements-macos27.txt
+requirements.txt
+run_colortina.command
+update_colortina.command
+ui/canvas.py
+ui/i18n.py
+ui/main_window.py
+ui/worker.py
+core/ai_hair_parser.py
+core/anime_face_detector.py
+core/cancellation.py
+core/character_scope.py
+core/device_runtime.py
+core/edit_snapshot.py
+core/guided_colorist.py
+core/hair_model_manager.py
+core/hint_manager.py
+core/illustrative_inkwash.py
+core/image_compressor.py
+core/line_boundary.py
+core/local_model_recolor.py
+core/manual_edit.py
+core/mcv2_region_control.py
+core/mcv2_semantic_selection.py
+core/ml_colorizer.py
+core/model_downloader.py
+core/network_lockdown.py
+core/presets.py
+core/project_store.py
+core/selection_snap.py
+core/structural_line_detector.py
+core/style_post.py
+core/text_guard.py
+core/third_party/hair_parsing/__init__.py
+core/third_party/hair_parsing/anime_face_unet.py
+core/third_party/hair_parsing/bisenet19.py
+vendor/manga_colorization_v2/colorizator.py
+vendor/manga_colorization_v2/denoising/denoiser.py
+vendor/manga_colorization_v2/networks/models.py'''.splitlines())
+          rows=subprocess.check_output(['git','diff','--cached','--name-status','origin/main'],text=True).splitlines(); changed=[]
+          for row in rows:
+              parts=row.split('\t'); st=parts[0]; path=parts[-1]
+              if st.startswith('D'): raise SystemExit('unexpected deletion: '+path)
+              if path.startswith('.github/source_sync_payload/') or path.startswith('.github/workflows/source-sync-lfs-') or path=='.github/workflows/agent-validated-source-sync.yml' or path.startswith('.github/source_sync_lfs_upload'):
+                  raise SystemExit('temporary transport leak: '+path)
+              if path.startswith('Colortina.app/') or path=='assets/icon.png' or '__pycache__/' in path or path.startswith('.env'):
+                  raise SystemExit('forbidden path: '+path)
+              if path not in allow: raise SystemExit('outside allowlist: '+path)
+              changed.append(path)
+          if not changed: raise SystemExit('no actual source changes')
+          print('validated',len(changed),'source changes')
+          PY
+      - name: Push one clean commit to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          TREE=$(git write-tree); PARENT=$(git rev-parse origin/main)
+          COMMIT=$(printf '%s\n\n%s\n' 'Sync audited Colortina core source' 'Incremental privacy-audited sync from Colortina-core-local-20260815.zip; repository-only files preserved.' | git commit-tree "$TREE" -p "$PARENT")
+          git push origin "$COMMIT":refs/heads/main
+          git push origin --delete agent/sync-core-20260815 || true
