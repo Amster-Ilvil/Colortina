@@ -1,0 +1,254 @@
+name: Final Colortina source sync
+
+on:
+  push:
+    branches:
+      - agent/final-colortina-sync-20260815
+    paths:
+      - .github/workflows/final-colortina-source-sync.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Fetch current main and verified LFS payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git rev-parse origin/main > /tmp/main-base.txt
+          python - <<'PY'
+          import base64, hashlib, json, os, urllib.request
+          oid = 'c2a07f7623e2d88c61eea33e988f86f0c4541c8d0534da5bfb195648e73c1638'
+          size = 241216
+          token = os.environ['GH_TOKEN']
+          repo = os.environ['GITHUB_REPOSITORY']
+          body = json.dumps({
+              'operation': 'download',
+              'transfers': ['basic'],
+              'objects': [{'oid': oid, 'size': size}],
+          }, separators=(',', ':')).encode()
+          auth = base64.b64encode(f'x-access-token:{token}'.encode()).decode()
+          req = urllib.request.Request(
+              f'https://github.com/{repo}.git/info/lfs/objects/batch',
+              data=body,
+              headers={
+                  'Authorization': 'Basic ' + auth,
+                  'Accept': 'application/vnd.git-lfs+json',
+                  'Content-Type': 'application/vnd.git-lfs+json',
+                  'User-Agent': 'Colortina-final-sync',
+              },
+              method='POST',
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              obj = json.load(r)['objects'][0]
+          if obj.get('error'):
+              raise SystemExit(f'LFS download error: {obj["error"]}')
+          action = (obj.get('actions') or {}).get('download')
+          if not action:
+              raise SystemExit('LFS object unavailable')
+          request = urllib.request.Request(action['href'], headers=action.get('header') or {})
+          with urllib.request.urlopen(request, timeout=60) as r:
+              data = r.read()
+          if len(data) != size:
+              raise SystemExit(f'payload size mismatch: {len(data)} != {size}')
+          got = hashlib.sha256(data).hexdigest()
+          if got != oid:
+              raise SystemExit(f'payload sha256 mismatch: {got}')
+          open('/tmp/colortina-delta.tar.xz', 'wb').write(data)
+          print('verified LFS payload', oid, size)
+          PY
+
+      - name: Build clean incremental tree from current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(cat /tmp/main-base.txt)
+          git reset --hard "$BASE"
+          rm -f .github/workflows/apply-audited-colortina-sync.yml
+          rm -f .github/workflows/build-audited-colortina-sync-branch.yml
+
+          python - <<'PY'
+          import pathlib, tarfile
+          allow = set('''Install_Mac27_MPS.command
+          README.md
+          build_update_package.command
+          config.py
+          main.py
+          pipeline.py
+          requirements-macos27.txt
+          requirements.txt
+          run_colortina.command
+          update_colortina.command
+          ui/canvas.py
+          ui/i18n.py
+          ui/main_window.py
+          ui/worker.py
+          core/ai_hair_parser.py
+          core/anime_face_detector.py
+          core/cancellation.py
+          core/character_scope.py
+          core/device_runtime.py
+          core/edit_snapshot.py
+          core/guided_colorist.py
+          core/hair_model_manager.py
+          core/hint_manager.py
+          core/illustrative_inkwash.py
+          core/image_compressor.py
+          core/line_boundary.py
+          core/local_model_recolor.py
+          core/manual_edit.py
+          core/mcv2_region_control.py
+          core/mcv2_semantic_selection.py
+          core/ml_colorizer.py
+          core/model_downloader.py
+          core/network_lockdown.py
+          core/presets.py
+          core/project_store.py
+          core/selection_snap.py
+          core/structural_line_detector.py
+          core/style_post.py
+          core/text_guard.py
+          core/third_party/hair_parsing/__init__.py
+          core/third_party/hair_parsing/anime_face_unet.py
+          core/third_party/hair_parsing/bisenet19.py
+          vendor/manga_colorization_v2/colorizator.py
+          vendor/manga_colorization_v2/denoising/denoiser.py
+          vendor/manga_colorization_v2/networks/models.py'''.splitlines())
+          allow = {x.strip() for x in allow if x.strip()}
+          root = pathlib.Path.cwd().resolve()
+          with tarfile.open('/tmp/colortina-delta.tar.xz', 'r:xz') as tf:
+              file_names = set()
+              for member in tf.getmembers():
+                  dest = (root / member.name).resolve()
+                  if dest != root and root not in dest.parents:
+                      raise SystemExit('unsafe archive path: ' + member.name)
+                  if member.issym() or member.islnk():
+                      raise SystemExit('archive links forbidden: ' + member.name)
+                  if member.isfile():
+                      file_names.add(member.name)
+              if file_names != allow:
+                  raise SystemExit('archive file set does not match audited 45-file allowlist')
+              tf.extractall(root)
+          print('archive allowlist verified:', len(allow), 'files')
+          PY
+
+          chmod +x Install_Mac27_MPS.command build_update_package.command run_colortina.command update_colortina.command
+          git add -A
+          python scripts/privacy_audit.py
+          python -m compileall -q main.py pipeline.py config.py core ui models vendor
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          git add -A
+
+          python - <<'PY'
+          import subprocess
+          allow = set('''Install_Mac27_MPS.command
+          README.md
+          build_update_package.command
+          config.py
+          main.py
+          pipeline.py
+          requirements-macos27.txt
+          requirements.txt
+          run_colortina.command
+          update_colortina.command
+          ui/canvas.py
+          ui/i18n.py
+          ui/main_window.py
+          ui/worker.py
+          core/ai_hair_parser.py
+          core/anime_face_detector.py
+          core/cancellation.py
+          core/character_scope.py
+          core/device_runtime.py
+          core/edit_snapshot.py
+          core/guided_colorist.py
+          core/hair_model_manager.py
+          core/hint_manager.py
+          core/illustrative_inkwash.py
+          core/image_compressor.py
+          core/line_boundary.py
+          core/local_model_recolor.py
+          core/manual_edit.py
+          core/mcv2_region_control.py
+          core/mcv2_semantic_selection.py
+          core/ml_colorizer.py
+          core/model_downloader.py
+          core/network_lockdown.py
+          core/presets.py
+          core/project_store.py
+          core/selection_snap.py
+          core/structural_line_detector.py
+          core/style_post.py
+          core/text_guard.py
+          core/third_party/hair_parsing/__init__.py
+          core/third_party/hair_parsing/anime_face_unet.py
+          core/third_party/hair_parsing/bisenet19.py
+          vendor/manga_colorization_v2/colorizator.py
+          vendor/manga_colorization_v2/denoising/denoiser.py
+          vendor/manga_colorization_v2/networks/models.py'''.splitlines())
+          allow = {x.strip() for x in allow if x.strip()}
+          cleanup = {
+              '.github/workflows/apply-audited-colortina-sync.yml',
+              '.github/workflows/build-audited-colortina-sync-branch.yml',
+          }
+          base = open('/tmp/main-base.txt').read().strip()
+          rows = subprocess.check_output(['git', 'diff', '--cached', '--name-status', base], text=True).splitlines()
+          changed = set()
+          deleted = set()
+          for row in rows:
+              parts = row.split('\t')
+              status = parts[0]
+              path = parts[-1]
+              if status.startswith('D'):
+                  if path not in cleanup:
+                      raise SystemExit('unexpected deletion: ' + path)
+                  deleted.add(path)
+                  continue
+              if path not in allow:
+                  raise SystemExit('path outside audited source allowlist: ' + path)
+              if path.startswith('Colortina.app/') or '__pycache__/' in path or path.startswith('.env'):
+                  raise SystemExit('forbidden artifact: ' + path)
+              changed.add(path)
+          if changed != allow:
+              raise SystemExit('source diff mismatch; missing=' + repr(sorted(allow - changed)) + ' extra=' + repr(sorted(changed - allow)))
+          if deleted != cleanup:
+              raise SystemExit('temporary-workflow cleanup mismatch: ' + repr(sorted(deleted)))
+          print('validated exact final diff: 45 source files + 2 temporary workflow deletions')
+          PY
+
+      - name: Commit directly on top of unchanged current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(cat /tmp/main-base.txt)
+          git fetch origin main
+          NOW=$(git rev-parse origin/main)
+          if [ "$NOW" != "$BASE" ]; then
+            echo "main changed during validation: $BASE -> $NOW" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          TREE=$(git write-tree)
+          COMMIT=$(printf '%s\n\n%s\n' \
+            'Sync audited Colortina core source' \
+            'Incremental privacy-audited sync from Colortina-core-local-20260815.zip; 45 actual source changes applied; repository-only files preserved; temporary sync workflows removed.' \
+            | git commit-tree "$TREE" -p "$BASE")
+          git push origin "$COMMIT":refs/heads/main
+          echo "FINAL_COMMIT=$COMMIT"
