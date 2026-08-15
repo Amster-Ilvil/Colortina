@@ -1,0 +1,68 @@
+name: Source sync LFS bootstrap
+
+on:
+  push:
+    branches:
+      - agent/sync-core-20260815
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Request one-object pre-signed LFS upload URL
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OID='c2a07f7623e2d88c61eea33e988f86f0c4541c8d0534da5bfb195648e73c1638'
+          SIZE=241216
+          python - <<'PY' > /tmp/lfs-request.json
+          import json
+          print(json.dumps({
+            'operation':'upload',
+            'transfers':['basic'],
+            'ref':{'name':'refs/heads/agent/sync-core-20260815'},
+            'objects':[{'oid':'c2a07f7623e2d88c61eea33e988f86f0c4541c8d0534da5bfb195648e73c1638','size':241216}]
+          }, separators=(',',':')))
+          PY
+          curl --fail-with-body -sS \
+            -u "x-access-token:${GH_TOKEN}" \
+            -H 'Accept: application/vnd.git-lfs+json' \
+            -H 'Content-Type: application/vnd.git-lfs+json' \
+            --data-binary @/tmp/lfs-request.json \
+            "https://github.com/${GITHUB_REPOSITORY}.git/info/lfs/objects/batch" \
+            -o /tmp/lfs-response.json
+          python - <<'PY'
+          import json, pathlib
+          r=json.load(open('/tmp/lfs-response.json'))
+          obj=r['objects'][0]
+          if obj.get('error'):
+              raise SystemExit('Git LFS batch error: '+str(obj['error']))
+          upload=(obj.get('actions') or {}).get('upload')
+          out={'oid':'c2a07f7623e2d88c61eea33e988f86f0c4541c8d0534da5bfb195648e73c1638','size':241216}
+          if upload is None:
+              out['already_present']=True
+          else:
+              headers=upload.get('header') or {}
+              if headers:
+                  raise SystemExit('Refusing to persist an LFS upload action that requires authentication headers.')
+              href=upload.get('href')
+              if not href or not href.startswith('https://'):
+                  raise SystemExit('No safe HTTPS pre-signed upload URL returned.')
+              out['href']=href
+          p=pathlib.Path('.github/source_sync_lfs_upload.json')
+          p.write_text(json.dumps(out,separators=(',',':')),encoding='utf-8')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/source_sync_lfs_upload.json
+          git commit -m 'Stage safe LFS source sync upload URL'
+          git push origin HEAD:${GITHUB_REF_NAME}
