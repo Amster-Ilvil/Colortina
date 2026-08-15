@@ -1,0 +1,59 @@
+name: Build audited Colortina sync branch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-audited-colortina-sync-branch.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and verify audited payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 5 --retry-delay 2 \
+            'https://filebin.net/colortina-sync-20260815-final45/colortina.tar.xz' \
+            -o /tmp/colortina.tar.xz
+          curl -fsS --retry 5 --retry-delay 2 \
+            'https://filebin.net/colortina-sync-20260815-final45/colortina.tar.xz.sha256' \
+            -o /tmp/colortina.tar.xz.sha256
+          cd /tmp
+          sha256sum -c colortina.tar.xz.sha256
+
+      - name: Apply audited source and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git switch -C agent/action-source-sync-20260815
+          tar -xJf /tmp/colortina.tar.xz -C .
+          chmod +x Install_Mac27_MPS.command build_update_package.command run_colortina.command update_colortina.command
+
+          rm -f .github/workflows/apply-audited-colortina-sync.yml
+          rm -f .github/workflows/ensure-audited-colortina-sync.yml
+          rm -f .github/workflows/build-audited-colortina-sync-branch.yml
+          rm -rf .github/colortina_payload
+
+          python scripts/privacy_audit.py
+          python -m compileall -q main.py pipeline.py config.py core ui models vendor
+
+          git add -A
+          if git diff --cached --name-only | grep -E '(^|/)(Colortina\.app|__pycache__|\.env)(/|$)'; then
+            echo 'Forbidden artifact staged' >&2
+            exit 1
+          fi
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Sync audited Colortina core source'
+          git push -f origin agent/action-source-sync-20260815
