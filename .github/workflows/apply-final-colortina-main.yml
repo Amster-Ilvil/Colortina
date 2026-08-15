@@ -1,0 +1,142 @@
+name: Apply final verified Colortina source to main
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-final-colortina-main.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/colortina-payload-20260815b
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Reconstruct exact audited archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, tarfile
+          root=Path('.github/colortina_payload')
+          def read(n): return (root/n).read_bytes()
+          def blob_sha(b): return hashlib.sha1(f'blob {len(b)}\0'.encode()+b).hexdigest()
+
+          damaged=read('repair_208_224.b64')
+          want208='07659c7579d5fac287d1051d6584f88d96fa9491'
+          found=[]
+          for i in range(len(damaged)-16000+1):
+              c=damaged[i:i+16000]
+              if blob_sha(c)==want208: found.append((i,c))
+          if len(found)!=1: raise SystemExit(f'208-224 recovery matches={len(found)}')
+          print('208-224 recovered at offset',found[0][0])
+          fixed208=found[0][1]
+
+          short=read('repair_224_240.b64')
+          if len(short)!=15999: raise SystemExit(f'224-240 size={len(short)}')
+          want224='737d4b1a7195c3d5a013647315f1824f45571bad'
+          alphabet=b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+          good=[short+bytes([x]) for x in alphabet if blob_sha(short+bytes([x]))==want224]
+          if len(good)!=1: raise SystemExit(f'224-240 recovery matches={len(good)}')
+          fixed224=good[0]
+          print('224-240 final character recovered')
+
+          pieces=[read(f'part{i:02d}.b64') for i in range(8)]
+          pieces += [read('part08.b64')[:12000]]
+          pieces += [read(f'part{i:02d}.b64') for i in range(9,13)]
+          pieces += [read('part13.b64'),read('repair_167784_168000.b64'),read('part14.b64')]
+          pieces += [read('repair_180_192.b64'),read('repair_192_208.b64'),fixed208,fixed224]
+          pieces += [read(f'part{i:02d}.b64') for i in range(15,18)]
+          pieces += [read('part18.b64')[:20000],read('repair_308_end.b64')]
+          s=b''.join(pieces)
+          if len(s)!=322604: raise SystemExit(f'base64 length={len(s)}')
+          data=base64.b64decode(s,validate=True)
+          got=hashlib.sha256(data).hexdigest()
+          want='192edf5a704a2b83ef23bd03c3a8e5d0cad02a22aa2b3cb63a488a2fffac745c'
+          if got!=want: raise SystemExit(f'archive sha={got}')
+          Path('/tmp/colortina-final.tar.xz').write_bytes(data)
+          with tarfile.open('/tmp/colortina-final.tar.xz','r:xz') as tf:
+              members=[m for m in tf.getmembers() if m.isfile()]
+              if len(members)!=45: raise SystemExit(f'archive file count={len(members)}')
+              names=[m.name for m in members]
+              if len(set(names))!=45: raise SystemExit('duplicate archive paths')
+              Path('/tmp/audited-paths.txt').write_text('\n'.join(names)+'\n')
+          print('verified exact SHA-256',got,'and 45 archive files')
+          PY
+
+      - name: Apply to current main and audit staged diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          PARENT=$(git rev-parse origin/main)
+          echo "$PARENT" >/tmp/main-parent
+          git reset --hard "$PARENT"
+          git clean -fdx
+          python - <<'PY'
+          import pathlib,tarfile
+          root=pathlib.Path.cwd().resolve()
+          with tarfile.open('/tmp/colortina-final.tar.xz','r:xz') as tf:
+              for m in tf.getmembers():
+                  d=(root/m.name).resolve()
+                  if d!=root and root not in d.parents: raise SystemExit('unsafe path '+m.name)
+                  if m.issym() or m.islnk(): raise SystemExit('link forbidden '+m.name)
+              tf.extractall(root)
+          PY
+          chmod +x Install_Mac27_MPS.command build_update_package.command run_colortina.command update_colortina.command
+          rm -f .github/workflows/apply-audited-colortina-sync.yml
+          rm -f .github/workflows/build-audited-colortina-sync-branch.yml
+          rm -f .github/workflows/apply-final-colortina-main.yml
+          python scripts/privacy_audit.py
+          python -m compileall -q main.py pipeline.py config.py core ui vendor
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          git add -A
+          python - <<'PY'
+          import subprocess
+          allow=set(open('/tmp/audited-paths.txt').read().splitlines())
+          deletes={
+            '.github/workflows/apply-audited-colortina-sync.yml',
+            '.github/workflows/build-audited-colortina-sync-branch.yml',
+            '.github/workflows/apply-final-colortina-main.yml',
+          }
+          rows=subprocess.check_output(['git','diff','--cached','--name-status'],text=True).splitlines()
+          actual=[]
+          for row in rows:
+              p=row.split('\t'); st,path=p[0],p[-1]
+              if st.startswith('D'):
+                  if path not in deletes: raise SystemExit('unexpected deletion '+path)
+                  continue
+              if path not in allow: raise SystemExit('outside audited archive '+path)
+              if path.startswith('Colortina.app/') or path=='assets/icon.png' or '__pycache__/' in path or path.startswith('.env'):
+                  raise SystemExit('forbidden path '+path)
+              actual.append(path)
+          if not actual: raise SystemExit('no source changes staged')
+          print('validated source changes',len(actual))
+          print('\n'.join(rows))
+          PY
+
+      - name: Fast-forward main with one clean source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          PARENT=$(cat /tmp/main-parent)
+          git fetch origin main
+          [ "$(git rev-parse origin/main)" = "$PARENT" ] || { echo 'main moved during audit' >&2; exit 1; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          TREE=$(git write-tree)
+          COMMIT=$(printf '%s\n\n%s\n' 'Sync audited Colortina core source' 'Verified 45-file source sync; privacy audit and Python compile checks passed; temporary sync workflows removed.' | git commit-tree "$TREE" -p "$PARENT")
+          git push origin "$COMMIT":refs/heads/main
+          echo "MAIN_COMMIT=$COMMIT"
