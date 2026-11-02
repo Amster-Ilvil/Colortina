@@ -12,12 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SELF = "scripts/privacy_audit.py"
 ALLOWED_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
 FORBIDDEN_NAMES = {".env", ".env.local", ".env.production", ".env.development", ".env.test", "credentials.json", "secrets.json", "service-account.json"}
-FORBIDDEN_DIRS = {".runtime", ".model-cache", ".ocr-runtimes", ".ocr-runtime-state", ".manual-model-updates", ".windows-runtime-state", ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".cache", "cache", "logs", "backups", "debug", "output", "outputs", "exports", "workspaces"}
-FORBIDDEN_SUFFIXES = {".log", ".db", ".sqlite", ".sqlite3", ".pem", ".p12", ".pfx", ".key"}
+FORBIDDEN_DIRS = {"runtime", "data", "user_data", ".runtime", ".model-cache", ".ocr-runtimes", ".ocr-runtime-state", ".manual-model-updates", ".windows-runtime-state", ".venv", "venv", "env", "__pycache__", ".pytest_cache", ".cache", "cache", "logs", "backups", "debug", "output", "outputs", "exports", "workspaces"}
+FORBIDDEN_SUFFIXES = {".log", ".db", ".sqlite", ".sqlite3", ".pem", ".p12", ".pfx", ".key", ".ccproject", ".ccpalette", ".ccscene", ".ccstyle", ".jsonl", ".npy", ".npz", ".ckpt", ".safetensors", ".onnx", ".b64", ".zip", ".tar", ".rar", ".7z", ".pdf", ".mp4", ".mov"}
+MEDIA_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
+PUBLIC_ASSETS = {"assets/icon.png", "assets/icon.jpg", "assets/icon.ico", "assets/colortina_banner.svg"}
 MODEL_SUFFIXES = {".pth", ".pt", ".ckpt", ".safetensors"}
 MODEL_DIR_HINTS = {"models", "weights", "checkpoints", "model_cache", ".model-cache"}
 SECRET_PATTERNS = [
     ("private key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+    ("URL embedded credential", re.compile(r"https?://[^/\\s:@]{1,80}:[^@\\s/]{1,100}@")),
     ("OpenAI key", re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{24,}")),
     ("Anthropic key", re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}")),
     ("GitHub token", re.compile(r"(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}")),
@@ -45,13 +48,15 @@ def path_violations(paths: list[str]) -> list[str]:
         if name in FORBIDDEN_NAMES: problems.append(f"forbidden tracked credential/local file: {raw}")
         if parts & FORBIDDEN_DIRS: problems.append(f"forbidden tracked runtime/generated path: {raw}")
         if p.suffix.lower() in FORBIDDEN_SUFFIXES: problems.append(f"forbidden tracked private/runtime file: {raw}")
+        if p.suffix.lower() in MEDIA_SUFFIXES and raw not in PUBLIC_ASSETS: problems.append(f"unreviewed image tracked outside public-asset allowlist: {raw}")
+        if name.lower() == "generator.zip": problems.append(f"generator model must not be tracked: {raw}")
         if p.suffix.lower() in MODEL_SUFFIXES and parts & MODEL_DIR_HINTS: problems.append(f"model weight/cache must not be tracked: {raw}")
     return problems
 
 def text_violations(paths: list[str]) -> list[str]:
     problems=[]
     for raw in paths:
-        if raw == SELF or raw.endswith("/privacy_scan.py") or raw.endswith("/privacy_audit.py"): continue
+        if raw.endswith("/privacy_scan.py"): continue
         path=ROOT/raw
         try:
             if not path.is_file() or path.stat().st_size > 10*1024*1024: continue
