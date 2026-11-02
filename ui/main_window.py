@@ -5737,7 +5737,7 @@ class MainWindow(QMainWindow):
         if ink_fidelity is not None:
             ink_fidelity.setEnabled(key not in {"light2_git_legacy", "light3_git_legacy"})
             ink_fidelity.setToolTip(
-                "旧 Git 风格走原始分级，跳过新版线稿保真与水墨渲染，便于原样对照。"
+                "旧版风格走原始分级，跳过新版线稿保真与水墨渲染，便于原样对照。"
                 if key in {"light2_git_legacy", "light3_git_legacy"} else
                 "保留原稿墨线、网点与细部纹理，可关闭。")
         for widget in (getattr(self, "_light3_intensity_label", None),

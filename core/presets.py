@@ -211,8 +211,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
     # Generator-first ink-wash renderer. See GIT_LEGACY_STYLE_KEYS below.
     "light2_git_legacy": StylePreset(
         key="light2_git_legacy",
-        label="淡彩水墨（Git 旧版）",
-        description="Git main 原版 light2 参数，使用旧 apply_style_grade 调色路径。",
+        label="淡彩水墨（旧版）",
+        description="原版 light2 参数，使用旧 apply_style_grade 调色路径。",
         saturation_boost=0.85,
         white_threshold=221,
         black_threshold=24,
@@ -229,8 +229,8 @@ STYLE_PRESETS: dict[str, StylePreset] = {
     ),
     "light3_git_legacy": StylePreset(
         key="light3_git_legacy",
-        label="淡彩水墨（极淡·Git 旧版）",
-        description="Git main 原版 light3 参数，使用旧 apply_style_grade 调色路径。",
+        label="淡彩水墨（极淡·旧版）",
+        description="原版 light3 参数，使用旧 apply_style_grade 调色路径。",
         saturation_boost=0.26,
         l_blend_alpha=0.0,
         l_gamma=0.90,
