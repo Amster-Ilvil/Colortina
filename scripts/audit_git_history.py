@@ -75,7 +75,7 @@ def inspect_data(path: str, data: bytes, categories: Counter) -> None:
             for match in pattern.finditer(data):
                 # Legacy README examples use a literal Chinese placeholder,
                 # not a real Windows user account (C:\\Users\\你的实际路径).
-                if "你的实际路径" in match.group(0).decode("utf-8", "ignore"):
+                if any(placeholder in match.group(0).decode("utf-8", "ignore") for placeholder in ("你的实际路径", "你的用户名", "实际路径", "用户名")):
                     continue
                 start = data.rfind(b"\n", 0, match.start()) + 1
                 line = data[start:data.find(b"\n", match.end()) if b"\n" in data[match.end():] else len(data)]
