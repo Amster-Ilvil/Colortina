@@ -65,3 +65,44 @@ _direct_payload/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Explicitly forbid project sessions, exported media and encoded source payloads
+runtime/
+data/
+user_data/
+*_assets/
+*.ccproject
+*.ccpalette
+*.ccscene
+*.ccstyle
+*.jsonl
+*.npy
+*.npz
+*.ckpt
+*.safetensors
+*.onnx
+*.b64
+*.zip
+*.tar
+*.tar.gz
+*.tar.xz
+*.7z
+*.rar
+*.pdf
+*.mp4
+*.mov
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.gif
+
+# Public application branding is explicitly allowed
+!assets/
+!assets/icon.png
+!assets/icon.jpg
+!assets/icon.ico
+!assets/colortina_banner.svg
