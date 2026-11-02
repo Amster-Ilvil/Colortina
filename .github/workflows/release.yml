@@ -18,7 +18,7 @@ on:
       - "v*"
     paths:
       - "config.py"
-      - "scripts/privacy_audit.py"
+      - "scripts/**"
       - ".gitignore"
       - ".github/workflows/release.yml"
       - ".github/workflows/privacy-audit.yml"
