@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import os
 import tempfile
 from unittest.mock import patch
 import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.model_downloader import (
     ModelDownloadError, ensure_models_downloaded, generator_file_ready,
