@@ -8,10 +8,13 @@ from __future__ import annotations
 import gc
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.model_downloader import models_ready
 from vendor.manga_colorization_v2.colorizator import MangaColorizator
