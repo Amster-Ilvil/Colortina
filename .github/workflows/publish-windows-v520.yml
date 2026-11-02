@@ -1,0 +1,66 @@
+name: Publish verified v5.20.0 Windows portable asset
+
+on:
+  push:
+    paths:
+      - ".github/workflows/publish-windows-v520.yml"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish-windows:
+    name: Publish Windows artifact from verified build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download verified Windows artifact from source-main build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p windows-release
+          gh run download 41450224150 \
+            --repo "$GITHUB_REPOSITORY" \
+            --name Colortina-Windows-x64-CPU \
+            --dir windows-release
+          test -s "windows-release/Colortina_5.20.0_Windows_x64_CPU.zip"
+          (cd windows-release && sha256sum Colortina_5.20.0_Windows_x64_CPU.zip > SHA256SUMS-Windows.txt)
+          cat windows-release/SHA256SUMS-Windows.txt
+
+      - name: Publish the verified Windows package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          ## Colortina v5.20.0
+
+          Rebuilt from the latest main branch.
+
+          - Windows x64 CPU portable release is a multi-file Python source-layout build, not a single giant EXE.
+          - app/ includes editable sources; runtime/ includes the Python interpreter and installed dependencies.
+          - models/weights/ is user-writable. Place the trusted mc-v2 generator.zip there without extracting.
+          - Run_Colortina.bat starts fully offline by default; separate download launcher allows confirmed downloads.
+          - Basic colorization requires only generator.zip; missing optional models do not block the core generator.
+          - Other platform assets will follow their independent validated build jobs.
+
+          Full build tests: https://github.com/Amster-Ilvil/Colortina/actions/runs/41450224150
+          EOF
+          if gh release view v5.20.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release tag already exists; preserving its notes and uploading verified Windows artifact."
+          else
+            gh release create v5.20.0 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target dae7debc2af205120573e215c3e3b490bb559ede \
+              --title "Colortina v5.20.0" --notes-file release-notes.md --latest
+          fi
+          gh release upload v5.20.0 \
+            windows-release/Colortina_5.20.0_Windows_x64_CPU.zip \
+            windows-release/SHA256SUMS-Windows.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view v5.20.0 --repo "$GITHUB_REPOSITORY" --json url,assets \
+            --jq '{url:url,assets:[.assets[].name]}'
