@@ -110,6 +110,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Embedded runtime import failed' }
           & $exe scripts/test_windows_offline.py
           if ($LASTEXITCODE -ne 0) { throw 'Embedded generator-only offline test failed' }
+          & $exe scripts/test_generator_only_inference.py
+          if ($LASTEXITCODE -ne 0) { throw 'Embedded generator-only forward inference failed' }
       - name: Package Windows
         shell: pwsh
         run: |
