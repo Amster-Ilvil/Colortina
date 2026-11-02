@@ -63,4 +63,4 @@ jobs:
             windows-release/SHA256SUMS-Windows.txt \
             --repo "$GITHUB_REPOSITORY" --clobber
           gh release view v5.20.0 --repo "$GITHUB_REPOSITORY" --json url,assets \
-            --jq '{url:url,assets:[.assets[].name]}'
+            --jq '{url:.url,assets:[.assets[].name]}'
