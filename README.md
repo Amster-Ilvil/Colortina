@@ -27,7 +27,7 @@
 - Linux x64
 - SHA-256 校验文件
 
-当前发布核心版本：**v5.13.27**
+当前主分支版本：**v5.20.0**（Windows 可编辑源码便携包，首次运行可完全离线）
 
 ## 主要特性
 
@@ -42,7 +42,15 @@
 - **中英文界面**：可在应用内切换语言。
 - **本地处理**：图片、项目和导出结果默认只在本机处理，不上传到第三方服务。
 
-## v5.13.27 更新重点
+## v5.20.0 更新重点
+
+- **Windows 多文件源码布局**：Release ZIP 包含可编辑的 app/ Python 源码、runtime/ 已安装依赖，而非一个很大的单文件 EXE。
+- **手动模型安装**：Windows 解压后双击 Open_Models_Folder.bat，放入 models/weights/generator.zip（不要解压）。
+- **离线首选**：Run_Colortina.bat 默认完全离线；仅 generator.zip 就能进行基础自动上色，不依赖可选 extractor、FFDNet、CLIP、发色解析或 ESRGAN 权重。
+- **按需联网**：Run_Colortina_Allow_Download.bat 启动后仍只允许用户明确确认的模型下载；失败不会阻止使用已经安装的 generator.zip。
+- **Windows 使用说明**：[docs/WINDOWS_OFFLINE.md](docs/WINDOWS_OFFLINE.md)。
+
+### 继承 v5.13.27 的功能与修复
 
 - **输出页重构**：原图 / AI 结果 / 编辑后三段式预览切换；不可用版本会明确禁用，不再静默回退到原图。
 - **输出操作分区**：预览、版本恢复和导出采用独立卡片；“导出全部”根据整个项目是否存在结果启用，而不是只看当前页。
@@ -76,6 +84,10 @@ python3 main.py
 Apple Silicon 会自动优先使用 MPS GPU 加速。
 
 ### Windows
+
+从 Releases 下载 Windows_x64_CPU.zip 后，完整解压；便携版请直接双击 Run_Colortina.bat（离线），或 Run_Colortina_Allow_Download.bat（按需确认下载）。模型可单独放在 models/weights/generator.zip。完整说明见 docs/WINDOWS_OFFLINE.md。
+
+若使用 Git 源码开发环境：
 
 ```powershell
 git clone https://github.com/Amster-Ilvil/Colortina.git

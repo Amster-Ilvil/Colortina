@@ -31,7 +31,7 @@ class Config:
     """Minimal local config. No Flask, no .env parsing — just paths."""
 
     APP_VERSION = "5.20.0"
-    APP_VERSION_LABEL = "V5.20.0 RC"
+    APP_VERSION_LABEL = "V5.20.0"
 
     WEIGHTS_DIR = os.path.abspath(os.environ.get(
         "COLORTINA_WEIGHTS_DIR",

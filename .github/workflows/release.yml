@@ -70,7 +70,7 @@ jobs:
           echo "Colortina release: $TAG"
 
   windows:
-    name: Windows x64 (CPU)
+    name: Windows x64 (CPU, source-layout portable)
     needs: metadata
     runs-on: windows-latest
     timeout-minutes: 90
@@ -87,19 +87,35 @@ jobs:
       - name: Install dependencies
         shell: pwsh
         run: |
-          python -m pip install -U pip wheel setuptools pyinstaller
+          python -m pip install -U pip wheel setuptools
           pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
           pip install -r requirements.txt
       - name: Compile check
         shell: pwsh
         run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
-      - name: Build application
+      - name: Validate offline generator-only path (source)
         shell: pwsh
-        run: python scripts/build_desktop.py --clean
+        run: python scripts/test_windows_offline.py
+      - name: Build editable source-layout portable Windows package
+        shell: pwsh
+        run: python scripts/build_windows_portable.py --clean
+      - name: Verify bundled Python, source files, and offline regression
+        shell: pwsh
+        run: |
+          $exe = '.\dist\Colortina\runtime\python.exe'
+          if (!(Test-Path $exe)) { throw 'Portable Python missing' }
+          if (!(Test-Path '.\dist\Colortina\app\core\ml_colorizer.py')) { throw 'Editable sources missing' }
+          if (!(Test-Path '.\dist\Colortina\models\weights\PLACE_GENERATOR_ZIP_HERE.txt')) { throw 'Manual model folder missing' }
+          & $exe -c "import torch, cv2, PySide6.QtWidgets; import pipeline; print('Portable Python dependencies: OK')"
+          if ($LASTEXITCODE -ne 0) { throw 'Embedded runtime import failed' }
+          & $exe scripts/test_windows_offline.py
+          if ($LASTEXITCODE -ne 0) { throw 'Embedded generator-only offline test failed' }
+          & $exe scripts/test_generator_only_inference.py
+          if ($LASTEXITCODE -ne 0) { throw 'Embedded generator-only forward inference failed' }
       - name: Package Windows
         shell: pwsh
         run: |
-          Compress-Archive -Path 'dist/Colortina' -DestinationPath "Colortina_${env:VERSION}_Windows_x64_CPU.zip"
+          python -c "import shutil; shutil.make_archive('Colortina_${env:VERSION}_Windows_x64_CPU', 'zip', root_dir='dist', base_dir='Colortina')"
       - uses: actions/upload-artifact@v4
         with:
           name: Colortina-Windows-x64-CPU
@@ -147,7 +163,17 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -U pip wheel setuptools pyinstaller
-          pip install -r requirements.txt
+          if [[ "$ARCH" == "x86_64" ]]; then
+            # Official macOS Intel PyTorch wheels stopped at 2.2.x. Pin the
+            # compatible NumPy 1.x + torchvision stack only on Intel, leaving
+            # Apple Silicon and Windows free to use newer native builds.
+            grep -vE '^(numpy|opencv-contrib-python|torch|torchvision|transformers)[>=< ]' requirements.txt > /tmp/colortina-intel-requirements.txt
+            pip install 'numpy==1.26.4' 'opencv-contrib-python==4.10.0.84' \
+              'torch==2.2.2' 'torchvision==0.17.2' 'transformers>=4.40,<5'
+            pip install -r /tmp/colortina-intel-requirements.txt
+          else
+            pip install -r requirements.txt
+          fi
       - name: Compile check
         shell: bash
         run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
@@ -261,13 +287,13 @@ jobs:
           Workflow run: ${GITHUB_RUN_ID}
           Python: 3.11
           Privacy audit: PASS
-          Windows x64: CPU PyTorch build
+          Windows x64: editable source-layout portable CPU Python runtime
           Linux x64: CPU PyTorch build
           macOS Apple Silicon: native arm64, MPS-capable PyTorch
           macOS Intel: native x86_64
           macOS signing: ad-hoc
           macOS DMG verification: PASS
-          Model weights bundled: no; downloaded on first use
+          Model weights bundled: no; manual generator.zip and optional confirmed downloads
           EOF
 
           cd release-assets
@@ -293,10 +319,10 @@ jobs:
 
           - macOS Apple Silicon: native arm64 `.dmg` and `.app.zip`, MPS supported.
           - macOS Intel: native x86_64 `.dmg` and `.app.zip`.
-          - Windows x64: portable CPU build.
+          - Windows x64: source-layout portable CPU build (editable app/ Python, standalone runtime/, manual models/weights/).
           - Linux x64: portable CPU build.
-          - Model weights are not bundled; Colortina downloads required weights on first use.
-          - Packaged builds store weights and writable app data in the user's application-data directory rather than inside the installed application.
+          - Model weights are not bundled. Windows offline launch works with only models/weights/generator.zip; optional weights are not required for basic coloring.
+          - Windows portable defaults to writable models/weights/ beside the launchers; macOS bundles use the user application-data directory. Windows offers offline and explicitly confirmed-download launchers.
           - Release publication is blocked if tracked private/local artifacts or common credential patterns are detected.
 
           See `SHA256SUMS.txt` and `BUILD-INFO.txt` for verification details.
