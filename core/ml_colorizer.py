@@ -13,14 +13,10 @@ import sys
 import os
 import threading
 
-# Some ops the generator/denoiser use aren't implemented on Apple's MPS
-# backend in every torch version (varies release to release). Without
-# this, those ops raise `NotImplementedError` and colorization on Mac
-# fails outright; with it, torch transparently runs just that op on CPU
-# and continues on MPS for everything else. Must be set before torch
-# touches the MPS backend, so this needs to happen at import time here,
-# before `import torch` below and before any MangaColorizer is built.
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+# Configure MPS before importing torch.  main.py also calls this before UI
+# imports, while this local call keeps library/CLI use safe.
+from core.device_runtime import configure_torch_environment
+configure_torch_environment()
 
 import cv2
 import numpy as np
@@ -33,6 +29,8 @@ from vendor.manga_colorization_v2.colorizator import MangaColorizator
 from core.masks import deherron_screentones
 from core.panel_detector import detect_panels, extract_panel_image
 from core.lineart_fill import clip_stamp_to_region
+from core.device_runtime import resolve_torch_device
+from core.cancellation import OperationCancelled, check_cancelled
 
 
 def build_hint_arrays(h: int, w: int, size: int,
@@ -44,6 +42,10 @@ def build_hint_arrays(h: int, w: int, size: int,
         rasterize_hint_specs_legacy,
     )
     mode = str(render_mode or "soft_region").lower()
+    if mode in {"native_soft", "original_soft", "generator_soft"}:
+        # Native five-channel generator hint with no connected-region filling.
+        from core.native_soft_hints import rasterize_native_soft_hints
+        return rasterize_native_soft_hints(h, w, size, hint_points)
     if mode in {"legacy", "classic", "original_points", "original-point"}:
         return rasterize_hint_specs_legacy(
             h, w, size, hint_points, label_map=label_map, page_gray=page_gray)
@@ -67,7 +69,14 @@ def build_hint_arrays(h: int, w: int, size: int,
         if hard:
             ph, pw, rh, rw = model_geometry(h, w, size)
             labels = _resized_labels(label_map, page_gray, rw, rh, w)
-            max_region = int(rh * rw * 0.35)
+            # An unreviewed manual dab must not flood a face, backdrop or
+            # panel-wide white component. Connected regions touching the edge
+            # are particularly unsafe on cropped manga pages. Explicit large-
+            # area editing is provided by the separate manual-region tool.
+            max_region = max(1, int(rh * rw * 0.06))
+            border_ids = set(np.unique(np.concatenate((
+                labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1],
+            ))).tolist()) if labels is not None else set()
             leftover = []
             for spec in hard:
                 px = min(rw - 1, max(0, int(round(spec.x_norm * rw))))
@@ -90,7 +99,7 @@ def build_hint_arrays(h: int, w: int, size: int,
                         area = int(region.count_nonzero()
                                    if hasattr(region, "count_nonzero")
                                    else np.count_nonzero(region))
-                        if 0 < area <= max_region:
+                        if 0 < area <= max_region and rid not in border_ids:
                             eroded = cv2.erode(region.astype(np.uint8),
                                                np.ones((3, 3), np.uint8))
                             m = (eroded if int(eroded.sum()) else
@@ -127,20 +136,33 @@ class MangaColorizer:
     def __init__(self, device: str = "auto",
                  generator_path: str = "",
                  extractor_path: str = "",
-                 denoiser_weights_dir: str = ""):
+                 denoiser_weights_dir: str = "",
+                 region_adapter_path: str = "",
+                 tunnel2_adapter_path: str = ""):
         self._lock = threading.Lock()
         self.device_warning: str | None = None
         self._requested_device = str(device or "auto")
-        self._device = self._resolve_device(device)
+        self._device, self.device_report = resolve_torch_device(
+            self._requested_device, torch_module=torch, smoke_test=True)
+        if self.device_report.selected == "cpu" and self._requested_device != "cpu":
+            self.device_warning = self.device_report.reason
         self._generator_path = generator_path
         self._extractor_path = extractor_path
         self._denoiser_weights_dir = denoiser_weights_dir
+        self._region_adapter_path = region_adapter_path
+        self._tunnel2_adapter_path = tunnel2_adapter_path
+        self._denoiser_device = self._choose_denoiser_device(self._device)
+        self.last_runtime_warning: str | None = None
+        self.last_native_hint_spot_report: dict | None = None
         try:
             self._model = MangaColorizator(
                 device=self._device,
                 generator_path=generator_path,
                 extractor_path=extractor_path,
                 denoiser_weights_dir=denoiser_weights_dir,
+                region_adapter_path=region_adapter_path,
+                denoiser_device=self._denoiser_device,
+                tunnel2_adapter_path=tunnel2_adapter_path,
             )
         except Exception as exc:
             if self._device.type == "mps":
@@ -152,65 +174,208 @@ class MangaColorizer:
                 print(f"[ml_colorizer] MPS failed to load ({exc}); falling back to CPU")
                 self.device_warning = f"MPS 加载失败，已回退到 CPU：{exc}"
                 self._device = torch.device("cpu")
+                self._denoiser_device = torch.device("cpu")
                 self._model = MangaColorizator(
                     device=self._device,
                     generator_path=generator_path,
                     extractor_path=extractor_path,
                     denoiser_weights_dir=denoiser_weights_dir,
+                    region_adapter_path=region_adapter_path,
+                    denoiser_device=torch.device("cpu"),
+                    tunnel2_adapter_path=tunnel2_adapter_path,
                 )
             else:
                 raise
         self.device_name = str(self._device)
         self.cuda_available = torch.cuda.is_available()
+        self._generator_semantic_runtime = None
+        self._generator_semantic_runtime_key = None
 
     @staticmethod
     def _resolve_device(device: str):
-        if device == "auto":
-            if torch.cuda.is_available():
-                return torch.device("cuda")
-            # Apple Silicon GPU via Metal Performance Shaders. Both
-            # is_built() (torch itself compiled with MPS support) and
-            # is_available() (the current machine/macOS actually has a
-            # usable MPS device) need to be true — checking only
-            # is_available() still throws on some non-Apple-Silicon or
-            # very old torch builds where the mps backend attribute
-            # exists but querying it isn't safe.
-            try:
-                mps_backend = getattr(torch.backends, "mps", None)
-                if (mps_backend is not None
-                        and mps_backend.is_built()
-                        and mps_backend.is_available()):
-                    return torch.device("mps")
-            except Exception as exc:  # noqa: BLE001 — never let device probing crash startup
-                print(f"[ml_colorizer] MPS probe failed ({exc}); using CPU")
-            return torch.device("cpu")
-        return torch.device(device)
+        target, _report = resolve_torch_device(
+            str(device or "auto"), torch_module=torch, smoke_test=True)
+        return target
+
+    @staticmethod
+    def _choose_denoiser_device(generator_device):
+        """Keep the legacy FFDNet on CPU by default when generator uses MPS."""
+        if torch.device(generator_device).type != "mps":
+            return torch.device(generator_device)
+        requested = str(os.environ.get("COLORTINA_MPS_DENOISER", "cpu")).lower()
+        if requested == "mps":
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    @staticmethod
+    def _is_mps_runtime_error(exc: BaseException) -> bool:
+        if isinstance(exc, NotImplementedError):
+            return True
+        msg = str(exc).lower()
+        markers = (
+            "mps", "metal", "not implemented", "placeholder storage",
+            "command buffer", "failed to synchronize", "invalid resource",
+            "mpsgraph", "unsupported data type", "does not have a device",
+        )
+        return any(token in msg for token in markers)
+
+    def _reload_on_cpu(self, reason: str) -> None:
+        """Permanently move this process to CPU after a hard MPS failure."""
+        self.last_runtime_warning = f"MPS 运行失败，已回退 CPU：{reason}"
+        self.device_warning = self.last_runtime_warning
+        print(f"[ml_colorizer] {self.last_runtime_warning}")
+        self._device = torch.device("cpu")
+        self._denoiser_device = torch.device("cpu")
+        self._model = MangaColorizator(
+            device=self._device,
+            generator_path=self._generator_path,
+            extractor_path=self._extractor_path,
+            denoiser_weights_dir=self._denoiser_weights_dir,
+            region_adapter_path=self._region_adapter_path,
+            denoiser_device=self._denoiser_device,
+            tunnel2_adapter_path=self._tunnel2_adapter_path,
+        )
+        self.device_name = "cpu"
+        self._generator_semantic_runtime = None
+        self._generator_semantic_runtime_key = None
 
     def to_device(self, device: str) -> None:
         """Move the loaded model between devices without reloading weights."""
-        target = self._resolve_device(device)
+        target, report = resolve_torch_device(
+            str(device or "auto"), torch_module=torch, smoke_test=True)
         if str(target) == self.device_name:
             return
         with self._lock:
+            denoiser_target = self._choose_denoiser_device(target)
             self._model.colorizer.to(target)
-            self._model.denoiser.to(target)
+            self._model.denoiser.to(denoiser_target)
+            if self._model.tunnel2_semantic_adapter is not None:
+                self._model.tunnel2_semantic_adapter.to(target)
             self._model.device = target
+            self._model.denoiser_device = denoiser_target
             # Drop any staged tensors from the old device
             self._model.current_image = None
             self._model.current_hint = None
+            self._model._control_context = None
             self._device = target
+            self._denoiser_device = denoiser_target
+            self.device_report = report
             self.device_name = str(target)
+            self.device_warning = None if report.usable else report.reason
+            if self._generator_semantic_runtime is not None:
+                self._generator_semantic_runtime.to(target)
 
     def switch_device(self, device: str) -> None:
         self.to_device(device)
+
+    def extract_region_embeddings(self, image: np.ndarray, labels: np.ndarray,
+                                  *, size: int = 576) -> dict[int, np.ndarray]:
+        """Expose mc-v2's own line-structure representation for region fusion.
+
+        This is a read-only side route: generator.zip remains byte-compatible and
+        its normal RGB inference is unchanged.  The returned embeddings are used
+        only to decide whether fragmented line-art regions belong to the same
+        semantic object (for example, separate locks of the same hairstyle).
+        """
+        work = np.asarray(image)
+        if work.ndim == 2:
+            work = cv2.cvtColor(work.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        elif work.shape[2] == 4:
+            work = cv2.cvtColor(work, cv2.COLOR_BGRA2BGR)
+        rgb = cv2.cvtColor(work.astype(np.uint8), cv2.COLOR_BGR2RGB)
+        safe_size = max(256, int(size))
+        safe_size += (-safe_size) % 32
+        with self._lock:
+            try:
+                return self._model.extract_region_embeddings(
+                    rgb, np.asarray(labels, dtype=np.int32), size=safe_size)
+            except Exception as exc:
+                if self._device.type == "mps" and self._is_mps_runtime_error(exc):
+                    self._reload_on_cpu(f"Generator semantic feature extraction: {exc}")
+                    return self._model.extract_region_embeddings(
+                        rgb, np.asarray(labels, dtype=np.int32), size=safe_size)
+                raise
+
+    def semantic_head_available(self, weights_path: str) -> bool:
+        return bool(weights_path and os.path.isfile(str(weights_path)))
+
+    def prepare_control_context(self):
+        """Return the cached generator context for the current page.
+
+        ``set_image`` and ``update_hint`` invalidate this context. Repeated
+        semantic predictions or target-colour edits reuse the same x1..x4 and
+        base decoder state.
+        """
+        with self._lock:
+            return self._model.prepare_control_context()
+
+    def predict_generator_semantics(self, image: np.ndarray, *, weights_path: str,
+                                    size: int = 576, confidence_threshold: float = 0.45,
+                                    class_thresholds: dict | None = None):
+        """Predict semantic masks from one cached stock-generator encoder pass."""
+        if not self.semantic_head_available(weights_path):
+            raise FileNotFoundError(str(weights_path or "generator_semantic_head.pth"))
+        work = np.asarray(image)
+        if work.ndim == 2:
+            work = cv2.cvtColor(work.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        elif work.ndim == 3 and work.shape[2] == 4:
+            work = cv2.cvtColor(work.astype(np.uint8), cv2.COLOR_BGRA2BGR)
+        if work.ndim != 3 or work.shape[2] != 3:
+            raise ValueError("semantic input must be HxW or HxWx3")
+        rgb = cv2.cvtColor(work.astype(np.uint8), cv2.COLOR_BGR2RGB)
+        safe_size = max(256, int(size))
+        safe_size += (-safe_size) % 32
+        key = (os.path.abspath(str(weights_path)), str(self._device), safe_size)
+        with self._lock:
+            try:
+                from core.generator_semantic_runtime import GeneratorSemanticRuntime
+                if (self._generator_semantic_runtime is None or
+                        self._generator_semantic_runtime_key != key):
+                    self._generator_semantic_runtime = GeneratorSemanticRuntime(
+                        str(weights_path), device=self._device)
+                    self._generator_semantic_runtime_key = key
+                self._model.set_image(rgb, size=safe_size,
+                                      apply_denoise=False, denoise_sigma=0)
+                context = self._model.prepare_control_context()
+                features = tuple(context["features"])
+                model_h, model_w = [int(v) for v in self._model.current_image.shape[-2:]]
+                pad_h, pad_w = [int(v) for v in (self._model.current_pad or (0, 0))]
+                valid_h, valid_w = max(1, model_h - pad_h), max(1, model_w - pad_w)
+                return self._generator_semantic_runtime.predict_from_features(
+                    features, model_hw=(model_h, model_w),
+                    valid_hw=(valid_h, valid_w), output_hw=work.shape[:2],
+                    confidence_threshold=float(confidence_threshold),
+                    class_thresholds=class_thresholds)
+            except Exception as exc:
+                if self._device.type == "mps" and self._is_mps_runtime_error(exc):
+                    self._reload_on_cpu(f"Generator semantic-head inference: {exc}")
+                    from core.generator_semantic_runtime import GeneratorSemanticRuntime
+                    self._generator_semantic_runtime = GeneratorSemanticRuntime(
+                        str(weights_path), device=self._device)
+                    self._generator_semantic_runtime_key = key
+                    self._model.set_image(rgb, size=safe_size,
+                                          apply_denoise=False, denoise_sigma=0)
+                    context = self._model.prepare_control_context()
+                    model_h, model_w = [int(v) for v in self._model.current_image.shape[-2:]]
+                    pad_h, pad_w = [int(v) for v in (self._model.current_pad or (0, 0))]
+                    return self._generator_semantic_runtime.predict_from_features(
+                        tuple(context["features"]), model_hw=(model_h, model_w),
+                        valid_hw=(max(1, model_h - pad_h), max(1, model_w - pad_w),),
+                        output_hw=work.shape[:2],
+                        confidence_threshold=float(confidence_threshold),
+                        class_thresholds=class_thresholds)
+                raise
 
     # ── Core single-pass colorize at fixed model size ─────────────────────
 
     def _colorize_at_size(self, rgb: np.ndarray, size: int,
                           denoise_sigma: int,
                           hint_points=None, label_map=None,
-                          page_gray=None, hint_render_mode: str = "soft_region") -> np.ndarray:
+                          page_gray=None, hint_render_mode: str = "soft_region",
+                          region_control=None, cancel_check=None) -> np.ndarray:
         """Run mc-v2 once at *size*, returning float32 RGB [0,1]."""
+        check_cancelled(cancel_check)
+        self.last_native_hint_spot_report = None
         # fp16 autocast on CUDA: ~1.5-2x faster on tensor-core GPUs, half VRAM
         with torch.inference_mode(), torch.autocast(
                 device_type="cuda", dtype=torch.float16,
@@ -218,6 +383,7 @@ class MangaColorizer:
             self._model.set_image(rgb, size=size,
                                   apply_denoise=denoise_sigma > 0,
                                   denoise_sigma=denoise_sigma)
+            check_cancelled(cancel_check)
             if hint_points:
                 # Feed the guided-coloring palette into the model's native
                 # hint channel — it propagates these colors with its own
@@ -227,50 +393,101 @@ class MangaColorizer:
                     label_map=label_map, page_gray=page_gray,
                     render_mode=hint_render_mode)
                 self._model.update_hint(hint, mask)
-            return self._model.colorize()
+            result = self._model.colorize(region_control=region_control)
+            check_cancelled(cancel_check)
+            # A circular hint may make an equally circular spot in mc-v2's
+            # output even with gaussian alpha. Never label this as a better
+            # colourization. Compare against the exact unhinted inference,
+            # preserving the already-loaded image/denoiser context.
+            if (str(hint_render_mode or '').lower() == 'native_soft'
+                    and hint_points and not (region_control and bool(region_control.get('enabled', False)))):
+                from core.native_soft_hints import inspect_hint_spots
+                candidate = result
+                saved_hint = self._model.current_hint
+                check_cancelled(cancel_check)
+                try:
+                    self._model.current_hint = torch.zeros_like(saved_hint)
+                    self._model._control_context = None
+                    reference = self._model.colorize(region_control=None)
+                finally:
+                    self._model.current_hint = saved_hint
+                    self._model._control_context = None
+                check_cancelled(cancel_check)
+                report = inspect_hint_spots(reference, candidate, hint_points)
+                self.last_native_hint_spot_report = report
+                if report['reject']:
+                    print('[ml_colorizer] native_soft candidate rejected: '
+                          f"{report['spots']} visible spot(s) across "
+                          f"{report['hints_checked']} hints; using original generator output")
+                    return reference
+            return result
 
     def _safe_colorize(self, rgb: np.ndarray, size: int,
                        denoise_sigma: int, hint_points=None,
                        label_map=None, page_gray=None,
-                       hint_render_mode: str = "soft_region") -> np.ndarray:
-        """Robust single-pass colorize with shrink-then-CPU OOM fallback."""
-        attempts = [size, max(384, size // 2)]
-        last_err: RuntimeError | None = None
+                       hint_render_mode: str = "soft_region",
+                       region_control=None, cancel_check=None) -> np.ndarray:
+        """Robust inference with MPS error/OOM recovery and CPU fallback."""
+        attempts = []
+        for candidate in (int(size), max(384, int(size) // 2)):
+            if candidate not in attempts:
+                attempts.append(candidate)
+        last_err: BaseException | None = None
+
         for try_size in attempts:
+            check_cancelled(cancel_check)
             try:
-                return self._colorize_at_size(rgb, try_size, denoise_sigma,
-                                              hint_points=hint_points,
-                                              label_map=label_map,
-                                              page_gray=page_gray,
-                                              hint_render_mode=hint_render_mode)
-            except RuntimeError as exc:
+                return self._colorize_at_size(
+                    rgb, try_size, denoise_sigma, hint_points=hint_points,
+                    label_map=label_map, page_gray=page_gray,
+                    hint_render_mode=hint_render_mode,
+                    region_control=region_control, cancel_check=cancel_check)
+            except OperationCancelled:
+                raise
+            except Exception as exc:  # RuntimeError + MPS NotImplementedError
                 last_err = exc
                 msg = str(exc).lower()
-                if "out of memory" not in msg:
-                    raise
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                elif self._device.type == "mps" and hasattr(torch.mps, "empty_cache"):
-                    torch.mps.empty_cache()
-                gc.collect()
-                continue
+                is_oom = "out of memory" in msg or "mps backend out of memory" in msg
+                is_mps_failure = (self._device.type == "mps" and
+                                  self._is_mps_runtime_error(exc))
 
-        # All GPU attempts OOM'd — fall back to CPU
+                if is_oom:
+                    try:
+                        if self._device.type == "cuda" and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        elif self._device.type == "mps" and hasattr(torch, "mps"):
+                            torch.mps.empty_cache()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    # Retry once at the smaller size before leaving the GPU.
+                    continue
+
+                if is_mps_failure:
+                    # Unsupported/driver failures are generally deterministic for
+                    # this process. Preserve the user's job by reloading on CPU.
+                    self._reload_on_cpu(f"{type(exc).__name__}: {exc}")
+                    return self._colorize_at_size(
+                        rgb, max(384, try_size // 2), denoise_sigma,
+                        hint_points=hint_points, label_map=label_map,
+                        page_gray=page_gray,
+                        hint_render_mode=hint_render_mode,
+                        region_control=region_control, cancel_check=cancel_check)
+                raise
+
+        # All accelerator attempts OOM'd — fall back to CPU once.
         if self.device_name != "cpu":
-            self._device = torch.device("cpu")
-            self._model = MangaColorizator(
-                device=self._device,
-                generator_path=self._generator_path,
-                extractor_path=self._extractor_path,
-                denoiser_weights_dir=self._denoiser_weights_dir,
-            )
-            self.device_name = "cpu"
-            return self._colorize_at_size(rgb, max(384, size // 2), denoise_sigma,
-                                          hint_points=hint_points,
-                                          label_map=label_map,
-                                          hint_render_mode=hint_render_mode)
+            self._reload_on_cpu(
+                f"显存/统一内存不足：{type(last_err).__name__}: {last_err}")
+            return self._colorize_at_size(
+                rgb, max(384, int(size) // 2), denoise_sigma,
+                hint_points=hint_points, label_map=label_map,
+                page_gray=page_gray, hint_render_mode=hint_render_mode,
+                region_control=region_control, cancel_check=cancel_check)
 
-        raise last_err if last_err else RuntimeError("colorize failed")
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("colorize failed")
 
     # ── Public colorize ────────────────────────────────────────────────────
 
@@ -286,7 +503,8 @@ class MangaColorizer:
                  deherron_strength: float = 0.6,
                  hint_points=None,
                  label_map=None,
-                 hint_render_mode: str = "soft_region") -> np.ndarray:
+                 hint_render_mode: str = "soft_region",
+                 region_control=None, cancel_check=None) -> np.ndarray:
         """Colorize a single B&W page image.
 
         Parameters
@@ -311,6 +529,7 @@ class MangaColorizer:
             Simple, panel and tiled paths all preserve/remap hints; local
             crops rebuild their region map from area-resized line art.
         """
+        check_cancelled(cancel_check)
         # Ensure 3 channels (mc-v2 expects RGB)
         if image.ndim == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -318,12 +537,14 @@ class MangaColorizer:
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
 
         if deherron:
+            check_cancelled(cancel_check)
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             cleaned = deherron_screentones(gray, strength=deherron_strength)
             image = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
 
         # Tiled / per-panel paths: denoise the whole page ONCE up front
         # instead of re-denoising every (overlapping) tile or panel.
+        check_cancelled(cancel_check)
         if (tiled or per_panel) and denoise_sigma > 0:
             try:
                 with torch.autocast(device_type="cuda", dtype=torch.float16,
@@ -331,6 +552,7 @@ class MangaColorizer:
                     image = self._model.denoiser.get_denoised_image(
                         image, sigma=denoise_sigma, max_edge=None)
                 denoise_sigma = 0
+                check_cancelled(cancel_check)
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower():
                     raise
@@ -344,6 +566,8 @@ class MangaColorizer:
                 tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap,
                 panel_style=panel_style, hint_points=hint_points,
                 hint_render_mode=hint_render_mode,
+                region_control=region_control,
+                cancel_check=cancel_check,
             )
 
         if tiled:
@@ -352,17 +576,23 @@ class MangaColorizer:
                 tile_size=tile_size, overlap=tile_overlap,
                 hint_points=hint_points,
                 hint_render_mode=hint_render_mode,
+                region_control=region_control,
+                cancel_check=cancel_check,
             )
 
         return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
                                      hint_points=hint_points, label_map=label_map,
-                                     hint_render_mode=hint_render_mode)
+                                     hint_render_mode=hint_render_mode,
+                                     region_control=region_control,
+                                     cancel_check=cancel_check)
 
     # ── Simple resize-and-go path (legacy) ─────────────────────────────────
 
     def _colorize_simple(self, image: np.ndarray, size: int,
                          denoise_sigma: int, hint_points=None,
-                         label_map=None, hint_render_mode: str = "soft_region") -> np.ndarray:
+                         label_map=None, hint_render_mode: str = "soft_region",
+                         region_control=None, cancel_check=None) -> np.ndarray:
+        check_cancelled(cancel_check)
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = rgb.shape[:2]
 
@@ -375,8 +605,11 @@ class MangaColorizer:
                                          hint_points=hint_points,
                                          label_map=label_map,
                                          page_gray=page_gray,
-                                         hint_render_mode=hint_render_mode)
+                                         hint_render_mode=hint_render_mode,
+                                         region_control=region_control,
+                                         cancel_check=cancel_check)
 
+        check_cancelled(cancel_check)
         result_uint8 = np.clip(result * 255.0, 0, 255).astype(np.uint8)
         result_bgr = cv2.cvtColor(result_uint8, cv2.COLOR_RGB2BGR)
 
@@ -387,6 +620,34 @@ class MangaColorizer:
         return result_bgr
 
     # ── Per-panel path ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _control_for_crop(region_control, crop_x: int, crop_y: int,
+                          crop_w: int, crop_h: int, *,
+                          canvas_w: int | None = None,
+                          canvas_h: int | None = None):
+        if not region_control or not bool(region_control.get("enabled", False)):
+            return None
+        mask = region_control.get("mask")
+        if mask is None:
+            return None
+        work = np.asarray(mask)
+        if work.ndim == 3:
+            work = np.max(work, axis=2)
+        crop = work[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+        if crop.size == 0 or not np.any(crop):
+            return None
+        canvas_w = int(canvas_w or crop_w)
+        canvas_h = int(canvas_h or crop_h)
+        if (canvas_h, canvas_w) != crop.shape:
+            padded = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+            use_h = min(canvas_h, crop.shape[0])
+            use_w = min(canvas_w, crop.shape[1])
+            padded[:use_h, :use_w] = np.where(crop[:use_h, :use_w] > 0, 255, 0)
+            crop = padded
+        out = dict(region_control)
+        out["mask"] = np.where(crop > 0, 255, 0).astype(np.uint8)
+        return out
 
     @staticmethod
     def _hints_for_crop(hint_points, crop_x: int, crop_y: int,
@@ -422,8 +683,10 @@ class MangaColorizer:
                             size: int, denoise_sigma: int,
                             tiled: bool, tile_size: int, tile_overlap: int,
                             panel_style: str, hint_points=None,
-                            hint_render_mode: str = "soft_region") -> np.ndarray:
+                            hint_render_mode: str = "soft_region",
+                            region_control=None, cancel_check=None) -> np.ndarray:
         """Detect panels, colorize each, composite back into the page."""
+        check_cancelled(cancel_check)
         from models.schemas import PanelRegion
 
         try:
@@ -438,14 +701,18 @@ class MangaColorizer:
                     image, denoise_sigma=denoise_sigma,
                     tile_size=tile_size, overlap=tile_overlap,
                     hint_points=hint_points,
-                    hint_render_mode=hint_render_mode)
+                    hint_render_mode=hint_render_mode,
+                    region_control=region_control, cancel_check=cancel_check)
             return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
                                          hint_points=hint_points,
-                                         hint_render_mode=hint_render_mode)
+                                         hint_render_mode=hint_render_mode,
+                                         region_control=region_control,
+                                         cancel_check=cancel_check)
 
         page_h, page_w = image.shape[:2]
         out = image.copy()
         for panel in panels:
+            check_cancelled(cancel_check)
             crop = extract_panel_image(image, panel)
             if crop.size == 0:
                 continue
@@ -454,6 +721,8 @@ class MangaColorizer:
                 continue
 
             panel_hints = self._hints_for_panel(hint_points, panel, page_w, page_h)
+            panel_control = self._control_for_crop(
+                region_control, panel.x, panel.y, panel.width, panel.height)
 
             if tiled and max(ph, pw) > tile_size:
                 colored = self._colorize_tiled(
@@ -461,14 +730,19 @@ class MangaColorizer:
                     tile_size=tile_size, overlap=tile_overlap,
                     hint_points=panel_hints,
                     hint_render_mode=hint_render_mode,
+                    region_control=panel_control,
+                    cancel_check=cancel_check,
                 )
             else:
                 colored = self._colorize_simple(
                     crop, size=size, denoise_sigma=denoise_sigma,
                     hint_points=panel_hints,
                     hint_render_mode=hint_render_mode,
+                    region_control=panel_control,
+                    cancel_check=cancel_check,
                 )
 
+            check_cancelled(cancel_check)
             # Composite back, with a small feather at the seam
             seam = self._panel_feather(ph, pw, feather=8)
             target = out[panel.y:panel.y + ph, panel.x:panel.x + pw].astype(np.float32)
@@ -500,7 +774,8 @@ class MangaColorizer:
                         tile_size: int = 768,
                         overlap: int = 96,
                         hint_points=None,
-                        hint_render_mode: str = "soft_region") -> np.ndarray:
+                        hint_render_mode: str = "soft_region",
+                        region_control=None, cancel_check=None) -> np.ndarray:
         """Colorize at native resolution by tiling.
 
         Each tile is fed to mc-v2 at exactly *tile_size* (the model's
@@ -508,6 +783,7 @@ class MangaColorizer:
         ``overlap`` pixels and are composited with a feathered alpha so
         seams disappear.
         """
+        check_cancelled(cancel_check)
         h, w = image.shape[:2]
 
         # Round tile size to /32 (mc-v2 requirement)
@@ -519,17 +795,22 @@ class MangaColorizer:
             return self._colorize_simple(
                 image, size=tile_size, denoise_sigma=denoise_sigma,
                 hint_points=hint_points,
-                hint_render_mode=hint_render_mode)
+                hint_render_mode=hint_render_mode,
+                region_control=region_control, cancel_check=cancel_check)
 
         # Whole-page low-resolution color prior.  It provides consistent hue
         # context to every high-resolution tile without replacing tile linework.
         global_prior = None
         try:
             prior_size = min(512, tile_size)
+            check_cancelled(cancel_check)
             global_prior = self._colorize_simple(
                 image, size=prior_size, denoise_sigma=denoise_sigma,
                 hint_points=hint_points,
-                hint_render_mode=hint_render_mode)
+                hint_render_mode=hint_render_mode,
+                region_control=region_control, cancel_check=cancel_check)
+        except OperationCancelled:
+            raise
         except Exception as exc:
             print(f"[ml_colorizer] global prior unavailable: {exc}")
 
@@ -554,7 +835,9 @@ class MangaColorizer:
         feather = self._tile_feather(tile_size, tile_size, overlap)
 
         for y in ys:
+            check_cancelled(cancel_check)
             for x in xs:
+                check_cancelled(cancel_check)
                 tile_bgr = image[y:y + tile_size, x:x + tile_size]
                 # Pad if at edge (model wants exactly tile_size)
                 ph = tile_size - tile_bgr.shape[0]
@@ -568,6 +851,9 @@ class MangaColorizer:
                 tile_hints = self._hints_for_crop(
                     hint_points, x, y, use_w, use_h, w, h,
                     canvas_w=tile_size, canvas_h=tile_size)
+                tile_control = self._control_for_crop(
+                    region_control, x, y, use_w, use_h,
+                    canvas_w=tile_size, canvas_h=tile_size)
                 tile_rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
                 tile_gray = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2GRAY) \
                     if tile_hints else None
@@ -575,7 +861,9 @@ class MangaColorizer:
                     out = self._safe_colorize(
                         tile_rgb, tile_size, denoise_sigma,
                         hint_points=tile_hints, page_gray=tile_gray,
-                        hint_render_mode=hint_render_mode)
+                        hint_render_mode=hint_render_mode,
+                        region_control=tile_control, cancel_check=cancel_check)
+                check_cancelled(cancel_check)
                 out_u8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
                 out_bgr = cv2.cvtColor(out_u8, cv2.COLOR_RGB2BGR)
 
@@ -592,6 +880,7 @@ class MangaColorizer:
                 accum[y:y + use_h, x:x + use_w] += out_bgr.astype(np.float32) * tile_alpha
                 weight[y:y + use_h, x:x + use_w] += tile_alpha
 
+        check_cancelled(cancel_check)
         weight = np.maximum(weight, 1e-6)
         return np.clip(accum / weight, 0, 255).astype(np.uint8)
 

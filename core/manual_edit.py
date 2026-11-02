@@ -86,8 +86,80 @@ def apply_brush_edit(source_bw_bgr: np.ndarray,
                      gap_close: int = 4,
                      mode: str = "shift",
                      snap_to_lineart: bool = True,
-                     pupil_blend: bool = False):
-    """Apply one brush dab atomically to visible and filter-base layers."""
+                     pupil_blend: bool = False,
+                     compact_mask: bool = False):
+    """Apply one brush dab atomically to visible and filter-base layers.
+
+    The ordinary V5 brush disables region snapping.  For that hot path, process
+    only the small brush ROI and write it back in place instead of copying two
+    complete manga pages and allocating two full-resolution float masks for
+    every mouse-move event.  Snapped/legacy callers retain the original path.
+    """
+    if (result_bgr is not None and not snap_to_lineart and region_map is None):
+        h, w = result_bgr.shape[:2]
+        x = int(np.clip(x, 0, max(0, w - 1)))
+        y = int(np.clip(y, 0, max(0, h - 1)))
+        radius = max(1, int(radius_px))
+        x1, y1 = max(0, x - radius), max(0, y - radius)
+        x2, y2 = min(w, x + radius + 1), min(h, y + radius + 1)
+        if x1 >= x2 or y1 >= y2:
+            empty = None if compact_mask else np.zeros((h, w), np.float32)
+            return result_bgr, filter_base_bgr, empty, False
+
+        source = source_bw_bgr
+        if source.shape[:2] != (h, w):
+            source = cv2.resize(source, (w, h), interpolation=cv2.INTER_AREA)
+        source_crop = source[y1:y2, x1:x2]
+        local_x, local_y = x - x1, y - y1
+
+        # Establish the stable filter base before mutating the visible result.
+        base = filter_base_bgr
+        if base is None or base.shape != result_bgr.shape:
+            base = result_bgr.copy()
+        elif np.shares_memory(base, result_bgr):
+            base = base.copy()
+
+        before_crop = result_bgr[y1:y2, x1:x2].copy()
+        edited_crop, local_mask = apply_local_brush_recolor(
+            source_crop, before_crop, local_x, local_y, radius, rgb,
+            opacity=opacity, region_map=None, gap_close=0, mode=mode,
+            snap_to_lineart=False, pupil_blend=pupil_blend)
+        changed = (_image_changed(before_crop, edited_crop) and
+                   float(local_mask.max()) > 1e-5)
+        if not changed:
+            edited_crop, local_mask = _fallback_local_recolor(
+                source_crop, before_crop, local_x, local_y, radius, rgb,
+                opacity, mode, pupil_blend)
+            changed = (_image_changed(before_crop, edited_crop) and
+                       float(local_mask.max()) > 1e-5)
+        if changed:
+            result_bgr[y1:y2, x1:x2] = edited_crop
+
+        base_before_crop = base[y1:y2, x1:x2].copy()
+        base_edited_crop, base_local_mask = apply_local_brush_recolor(
+            source_crop, base_before_crop, local_x, local_y, radius, rgb,
+            opacity=opacity, region_map=None, gap_close=0, mode=mode,
+            snap_to_lineart=False, pupil_blend=pupil_blend)
+        base_changed = (_image_changed(base_before_crop, base_edited_crop) and
+                        float(base_local_mask.max()) > 1e-5)
+        if not base_changed:
+            base_edited_crop, base_local_mask = _fallback_local_recolor(
+                source_crop, base_before_crop, local_x, local_y, radius, rgb,
+                opacity, mode, pupil_blend)
+            base_changed = (_image_changed(base_before_crop, base_edited_crop) and
+                            float(base_local_mask.max()) > 1e-5)
+        if base_changed:
+            base[y1:y2, x1:x2] = base_edited_crop
+
+        if compact_mask:
+            mask = (x1, y1, x2, y2, local_mask)
+        else:
+            mask = np.zeros((h, w), np.float32)
+            mask[y1:y2, x1:x2] = local_mask
+        return result_bgr, base, mask, bool(changed)
+
+    # Legacy/snap-to-region route.  Keep byte-for-byte behavior for callers
+    # that depend on a full-page line-art region map.
     before = result_bgr.copy()
     edited, mask = apply_local_brush_recolor(
         source_bw_bgr, result_bgr, x, y, radius_px, rgb,

@@ -66,6 +66,19 @@ class StylePreset:
     # When true, all pixels outside the detected person mask are restored to
     # the original page grayscale after grading. Used by character-only pastel.
     force_environment_grayscale: bool = False
+    # Ink-wash stabilization for manga pages with heavy screentones / dark fills.
+    preserve_screentones: float = 0.0
+    background_neutral_guard: float = 0.0
+    background_chroma_cap: float = 0.0
+    hue_stabilize: float = 0.0
+    panel_aware_environment: bool = False
+    # Additional cast suppression for inkwash backgrounds.
+    green_cast_suppression: float = 0.0
+    cyan_cast_suppression: float = 0.0
+    background_target_a: float = 0.0
+    background_target_b: float = 0.0
+    low_detail_bg_neutralize: float = 0.0
+    low_detail_bg_chroma_cap: float = 0.0
 
 
 STYLE_PRESETS: dict[str, StylePreset] = {
@@ -95,6 +108,64 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         neutral_fade_floor=0.09,
         denoise_sigma=20,
         diffusion_steps=16,
+        preserve_screentones=0.94,
+        background_neutral_guard=0.90,
+        background_chroma_cap=5.2,
+        hue_stabilize=0.54,
+        panel_aware_environment=True,
+        semantic_mode="inkwash",
+        person_chroma_scale=0.78,
+        skin_chroma_scale=0.90,
+        hair_chroma_scale=0.90,
+        eye_chroma_scale=0.94,
+        clothing_chroma_scale=0.84,
+        environment_chroma_scale=0.06,
+        unknown_chroma_scale=0.03,
+        green_cast_suppression=0.92,
+        cyan_cast_suppression=0.82,
+        background_target_a=1.0,
+        background_target_b=1.9,
+        low_detail_bg_neutralize=0.74,
+        low_detail_bg_chroma_cap=4.2,
+    ),
+    "light2_soft": StylePreset(
+        key="light2_soft",
+        label="淡彩水墨（淡）",
+        description=("Intermediate pale watercolor / ink-wash preset between "
+                     "淡彩水墨 and 淡彩水墨（极淡）. It keeps visible, coherent "
+                     "colour across the page while using a lighter, quieter wash."),
+        saturation_boost=0.52,
+        white_threshold=220,
+        black_threshold=27,
+        neutral_transition=29,
+        l_blend_alpha=0.04,
+        l_gamma=0.96,
+        guided_filter_radius=4,
+        guided_filter_eps=0.029,
+        chroma_warm_shift=0.36,
+        cel_flatten=0.020,
+        neutral_fade_floor=0.24,
+        denoise_sigma=18,
+        diffusion_steps=16,
+        preserve_screentones=0.90,
+        background_neutral_guard=0.80,
+        background_chroma_cap=6.6,
+        hue_stabilize=0.48,
+        panel_aware_environment=True,
+        semantic_mode="inkwash",
+        person_chroma_scale=0.84,
+        skin_chroma_scale=0.92,
+        hair_chroma_scale=0.92,
+        eye_chroma_scale=0.95,
+        clothing_chroma_scale=0.86,
+        environment_chroma_scale=0.08,
+        unknown_chroma_scale=0.04,
+        green_cast_suppression=0.86,
+        cyan_cast_suppression=0.76,
+        background_target_a=1.2,
+        background_target_b=2.2,
+        low_detail_bg_neutralize=0.64,
+        low_detail_bg_chroma_cap=5.0,
     ),
     "light2": StylePreset(
         key="light2",
@@ -115,21 +186,78 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         neutral_fade_floor=0.45,
         denoise_sigma=15,
         diffusion_steps=16,
+        preserve_screentones=0.84,
+        background_neutral_guard=0.70,
+        background_chroma_cap=7.8,
+        hue_stabilize=0.42,
+        panel_aware_environment=True,
+        semantic_mode="inkwash",
+        person_chroma_scale=0.88,
+        skin_chroma_scale=0.94,
+        hair_chroma_scale=0.94,
+        eye_chroma_scale=0.97,
+        clothing_chroma_scale=0.88,
+        environment_chroma_scale=0.10,
+        unknown_chroma_scale=0.05,
+        green_cast_suppression=0.80,
+        cyan_cast_suppression=0.68,
+        background_target_a=1.4,
+        background_target_b=2.5,
+        low_detail_bg_neutralize=0.56,
+        low_detail_bg_chroma_cap=5.8,
     ),
 
+    # Original GitHub light2/light3 style presets, isolated from the current
+    # Generator-first ink-wash renderer. See GIT_LEGACY_STYLE_KEYS below.
+    "light2_git_legacy": StylePreset(
+        key="light2_git_legacy",
+        label="淡彩水墨（Git 旧版）",
+        description="Git main 原版 light2 参数，使用旧 apply_style_grade 调色路径。",
+        saturation_boost=0.85,
+        white_threshold=221,
+        black_threshold=24,
+        neutral_transition=28,
+        l_blend_alpha=0.08,
+        l_gamma=1.02,
+        guided_filter_radius=3,
+        guided_filter_eps=0.025,
+        chroma_warm_shift=0.76,
+        cel_flatten=0.047,
+        neutral_fade_floor=0.45,
+        denoise_sigma=15,
+        diffusion_steps=16,
+    ),
+    "light3_git_legacy": StylePreset(
+        key="light3_git_legacy",
+        label="淡彩水墨（极淡·Git 旧版）",
+        description="Git main 原版 light3 参数，使用旧 apply_style_grade 调色路径。",
+        saturation_boost=0.26,
+        l_blend_alpha=0.0,
+        l_gamma=0.90,
+        guided_filter_radius=4,
+        guided_filter_eps=0.032,
+        cel_flatten=0.0,
+        neutral_fade_floor=0.09,
+        denoise_sigma=20,
+        diffusion_steps=16,
+    ),
 }
+
+# These keys always run the original Git grading code. Never remap legacy
+# keys to the new light2/light3 independent renderer.
+GIT_LEGACY_STYLE_KEYS = frozenset({"light2_git_legacy", "light3_git_legacy"})
 
 
 def get_style(key: Optional[str]) -> StylePreset:
     """Return a style preset by key, falling back to neutral.
 
-    Legacy compatibility: the removed old "light" preset now resolves to
-    the built-in 淡彩水墨 style (light2).
+    Legacy compatibility: removed style keys resolve to the built-in
+    淡彩水墨 style (light2).
     """
     if not key:
         return STYLE_PRESETS["none"]
     key_norm = key.lower()
-    if key_norm == "light":
+    if key_norm in {"light", "light2_illustrative"}:
         key_norm = "light2"
     return STYLE_PRESETS.get(key_norm, STYLE_PRESETS["none"])
 
@@ -179,12 +307,24 @@ QUALITY_PRESETS: dict[str, QualityPreset] = {
         jpeg_quality=85,
         seconds_per_page_estimate=2.0,
     ),
+    "standard": QualityPreset(
+        key="standard", label="精细 · 768",
+        description="Higher internal resolution for intricate manga line work.",
+        model_size=768, tiled_inference=False, per_panel=False,
+        output_format="png", seconds_per_page_estimate=6.0,
+    ),
+    "detail": QualityPreset(
+        key="detail", label="高清 · 960（实验）",
+        description="More internal detail at higher CPU/RAM cost.",
+        model_size=960, tiled_inference=False, per_panel=False,
+        output_format="png", seconds_per_page_estimate=12.0,
+    ),
 }
 
 
 def get_quality(key: Optional[str]) -> QualityPreset:
-    """Return the only supported quality preset: the fastest draft mode."""
-    return QUALITY_PRESETS["draft"]
+    """Return an explicitly selected model input resolution (32-aligned)."""
+    return QUALITY_PRESETS.get(str(key or "draft"), QUALITY_PRESETS["draft"])
 
 
 def all_styles_json() -> list[dict]:

@@ -21,8 +21,10 @@ import threading
 import time
 import zlib
 import os
+import hashlib
 
 import numpy as np
+import cv2
 
 from config import Config
 from core.hint_manager import HintManager
@@ -31,6 +33,8 @@ from core.ml_colorizer import MangaColorizer
 from core.presets import get_quality, get_style
 from core.style_post import apply_style_grade
 from core.image_filter import apply_image_filter
+from core.cancellation import check_cancelled
+from core.mcv2_region_control import region_control_signature
 
 _colorizer: MangaColorizer | None = None  # legacy/current mc-v2 cache
 _colorizer_load_lock = threading.Lock()  # guards engine construction
@@ -48,12 +52,21 @@ _PAGE_CONTEXT_CACHE_MAX_ITEMS = 16
 
 
 def _image_fingerprint(image_bgr: np.ndarray) -> tuple:
-    """Cheap, stable fingerprint for an immutable source page."""
-    h, w = image_bgr.shape[:2]
-    sy = max(1, h // 24)
-    sx = max(1, w // 24)
-    sample = np.ascontiguousarray(image_bgr[::sy, ::sx][:24, :24])
-    return (id(image_bgr), h, w, str(image_bgr.dtype), int(zlib.adler32(sample.tobytes())))
+    """Collision-resistant fingerprint for an immutable source page.
+
+    The old key combined ``id(image)`` with a tiny 24x24 sample. During long
+    batches Python can reuse an array id after the previous page is released,
+    while manga pages often share almost-identical white-border samples. That
+    allowed a raw mc-v2 result from page N to be reused for page N+1, which
+    looked like mc-v2 and ink-wash styles being mixed on a few pages. Hashing
+    the complete source buffer is still tiny compared with model inference and
+    makes cross-page reuse impossible unless the pages are byte-identical.
+    """
+    contiguous = np.ascontiguousarray(image_bgr)
+    h, w = contiguous.shape[:2]
+    digest = hashlib.blake2b(
+        memoryview(contiguous).cast("B"), digest_size=16).digest()
+    return (h, w, str(contiguous.dtype), digest)
 
 
 def _hint_signature(specs: list) -> tuple:
@@ -80,13 +93,16 @@ def _label_map_signature(label_map) -> tuple | None:
 
 
 def _raw_cache_key(image_bgr: np.ndarray, quality, denoise_sigma: int,
-                   model_specs: list, label_map) -> tuple:
+                   model_specs: list, label_map, region_control=None,
+                   hint_render_mode: str = "mixed") -> tuple:
     return (
         _image_fingerprint(image_bgr),
         int(quality.model_size), bool(quality.tiled_inference),
         int(quality.tile_size), int(quality.tile_overlap), bool(quality.per_panel),
         int(denoise_sigma),
         _hint_signature(model_specs), _label_map_signature(label_map),
+        region_control_signature(region_control),
+        str(hint_render_mode or "").strip().lower(),
     )
 
 
@@ -123,6 +139,23 @@ def clear_raw_result_cache() -> None:
     with _raw_result_cache_lock:
         _raw_result_cache.clear()
         _raw_result_cache_bytes = 0
+
+
+def clear_page_context_cache() -> None:
+    """Drop page-sized segmentation and semantic analysis objects."""
+    with _page_context_cache_lock:
+        _page_context_cache.clear()
+
+
+def clear_transient_page_caches() -> None:
+    """Release page pixel caches while keeping loaded neural model weights."""
+    clear_raw_result_cache()
+    clear_page_context_cache()
+    try:
+        from core.ai_hair_parser import clear_cache as clear_ai_hair_cache
+        clear_ai_hair_cache()
+    except Exception:
+        pass
 
 def _page_context_cache_get(key: tuple):
     with _page_context_cache_lock:
@@ -234,8 +267,21 @@ def get_colorizer(cfg: Config = Config, *, ensure_weights: bool = True,
             generator_path=cfg.GENERATOR_WEIGHTS_PATH,
             extractor_path=cfg.EXTRACTOR_WEIGHTS_PATH,
             denoiser_weights_dir=cfg.DENOISER_WEIGHTS_DIR,
+            region_adapter_path=getattr(cfg, "REGION_ADAPTER_WEIGHTS_PATH", ""),
+            tunnel2_adapter_path=(
+                getattr(cfg, "TUNNEL2_SEMANTIC_ADAPTER_PATH", "")
+                if getattr(cfg, "TUNNEL2_SEMANTIC_ADAPTER_ENABLED", True)
+                else ""),
         )
-        print(f"[pipeline] mc-v2 loaded on device: {_colorizer.device_name}")
+        detail = _colorizer.device_name
+        if _colorizer.device_name == "mps":
+            detail += "（mc-v2 生成器；FFDNet 降噪在 CPU）"
+        print(f"[pipeline] mc-v2 loaded on device: {detail}")
+        if status_callback:
+            if _colorizer.device_warning:
+                status_callback(_colorizer.device_warning)
+            else:
+                status_callback(f"mc-v2 已加载：{detail}")
         return _colorizer
 
 
@@ -316,13 +362,21 @@ def build_auto_hints(image_bgr: np.ndarray, cfg: Config = Config,
 
 
 def _effective_job_quality(style, quality, *, needs_guided: bool, model_specs: list):
-    """Always force the fastest generation mode."""
-    effective_quality = replace(quality, key='draft', label='Fast', model_size=576,
-                                tiled_inference=False, per_panel=False,
-                                tile_size=576, tile_overlap=64)
+    """Honor the user-selected 32-aligned inference resolution.
+
+    Older builds exposed a quality value but forced 576 for every job.  Keep
+    tiling/per-panel disabled for stable checkpoint-compatible inference,
+    without misreporting larger resolution requests as completed.
+    """
+    size = int(getattr(quality, "model_size", 576))
+    if size <= 0 or size % 32:
+        raise ValueError(f"mc-v2 inference size must be divisible by 32: {size}")
+    effective_quality = replace(quality, tiled_inference=False, per_panel=False)
     effective_denoise = 15
-    optimizations = ['force_fastest_quality', 'disable_guided_analysis',
-                     'disable_per_panel', 'disable_tiled_inference']
+    optimizations = [f"model_resolution_{size}", 'disable_per_panel',
+                     'disable_tiled_inference']
+    if not needs_guided:
+        optimizations.append('skip_guided_analysis')
     if not model_specs:
         optimizations.append('skip_hint_retry_no_model_hints')
     return effective_quality, effective_denoise, optimizations
@@ -497,6 +551,31 @@ def _post_only_context(hint_manager: HintManager, diagnostics: dict):
     return context
 
 
+
+
+def _normalize_auto_black_hair_guard_setting(mode) -> tuple[bool, str]:
+    if isinstance(mode, str):
+        key = mode.strip().lower()
+        if key in {"", "0", "false", "off", "disabled", "none"}:
+            return False, "off"
+        if key in {"strict", "conservative", "conservative_black"}:
+            return True, "conservative"
+        return True, "normal"
+    return (bool(mode), "normal" if bool(mode) else "off")
+
+
+
+
+def _normalize_auto_black_hair_guard_scope(scope) -> str:
+    if isinstance(scope, str):
+        key = scope.strip().lower()
+        if key in {"face", "near_face", "character", "character_only"}:
+            return "near_face"
+        if key in {"selection", "mask", "selected", "selected_region"}:
+            return "selection"
+    return "page"
+
+
 def colorize_page(image_bgr: np.ndarray,
                    hint_manager: HintManager | None = None,
                    cfg: Config = Config,
@@ -517,15 +596,41 @@ def colorize_page(image_bgr: np.ndarray,
                    learn_identity: bool = True,
                    return_filter_base: bool = False,
                    hint_render_mode: str = "mixed",
-                   protect_text: bool = True):
+                   protect_text: bool = True,
+                   region_control=None,
+                   two_stage_identity: bool | None = None,
+                   suppress_non_character_purple: bool | None = None,
+                   auto_black_hair_guard: bool | str = False,
+                   auto_black_hair_guard_scope: str = "page",
+                   auto_black_hair_guard_limit_mask: np.ndarray | None = None,
+                   auto_black_hair_guard_target_rgb: tuple[int, int, int] | None = None,
+                   ai_hair_parser_enabled: bool = True,
+                   ai_hair_parser_backend: str = "auto",
+                   ai_hair_parser_allow_download: bool = False,
+                   semantic_mask_controls: dict | None = None,
+                   ink_fidelity: bool = False,
+                   cancel_check=None):
     """Run the full Auto pipeline on one page.
 
     """
+    check_cancelled(cancel_check)
     if hint_manager is None:
         hint_manager = HintManager()
     style_strength = float(np.clip(style_strength, 0.0, 1.0))
+    auto_black_hair_guard_enabled, auto_black_hair_guard_mode = _normalize_auto_black_hair_guard_setting(auto_black_hair_guard)
+    auto_black_hair_guard_scope = _normalize_auto_black_hair_guard_scope(auto_black_hair_guard_scope)
+    semantic_mask_controls = dict(semantic_mask_controls or {})
+    semantic_mask_enabled = bool(semantic_mask_controls.get("enabled", False))
+    semantic_hair_authoritative = bool(
+        semantic_mask_enabled and
+        dict(semantic_mask_controls.get("hair") or {}).get("enabled", False))
     reference_strength = float(np.clip(reference_strength, 0.0, 1.0))
     manual_strength = float(np.clip(manual_strength, 0.0, 1.0))
+    if two_stage_identity is None:
+        two_stage_identity = bool(getattr(cfg, "ENABLE_TWO_STAGE_IDENTITY", True))
+    if suppress_non_character_purple is None:
+        suppress_non_character_purple = bool(
+            getattr(cfg, "SUPPRESS_NON_CHARACTER_PURPLE", True))
     # Region maps are built lazily only when a model hint actually needs them.
 
     style_key_normalized = (style_key or "").lower()
@@ -548,6 +653,15 @@ def colorize_page(image_bgr: np.ndarray,
     style = (_adjustable_original_style() if (original_style_selected and not default_style_tuning)
              else get_style(style_key))
     style = _apply_pastel_tuning(style, pastel_tuning)
+    # The ink-wash renderer is a final, hue-faithful treatment of the native
+    # generator output, not a second colourizer. Do not grade/desaturate the
+    # same colours first using the legacy heuristic ink-wash style engine.
+    native_wash_style = str(getattr(style, "key", "")) in {
+        "light2", "light2_soft", "light3"}
+    # Git legacy: the original light2/light3 grade rather than the new final
+    # Generator-first ink-wash. They remain independently selectable.
+    from core.presets import GIT_LEGACY_STYLE_KEYS
+    git_legacy_wash_style = str(getattr(style, "key", "")) in GIT_LEGACY_STYLE_KEYS
     quality = get_quality(quality_key)
 
     needs_guided = _need_guided_context(
@@ -557,17 +671,20 @@ def colorize_page(image_bgr: np.ndarray,
         has_manual_region=has_manual_region)
 
     if needs_guided:
+        check_cancelled(cancel_check)
         page_context = build_page_context(
             image_bgr, cfg=cfg, style_profile=effective_profile,
             character_memories=character_memories, character_library=character_library,
             scene_palette=scene_palette, style_strength=style_strength,
             reference_strength=reference_strength, forced_matches=forced_matches)
+        check_cancelled(cancel_check)
         if regenerate_auto or (not hint_manager.auto_hints and not preserve_empty_auto_hints):
             hint_manager.set_auto_hints(build_auto_hints(
                 image_bgr, cfg=cfg, style_profile=effective_profile,
                 character_memories=character_memories, character_library=character_library,
                 scene_palette=scene_palette, style_strength=style_strength,
                 reference_strength=reference_strength, forced_matches=forced_matches))
+            check_cancelled(cancel_check)
     else:
         page_context = _post_only_context(hint_manager, {
             "plain_auto": bool(is_none_style),
@@ -577,6 +694,7 @@ def colorize_page(image_bgr: np.ndarray,
         if regenerate_auto or (not hint_manager.auto_hints and not preserve_empty_auto_hints):
             hint_manager.set_auto_hints([])
 
+    check_cancelled(cancel_check)
     descriptor = getattr(effective_profile, "_descriptor", None) if effective_profile is not None else None
     merged_specs = hint_manager.merge_specs(
         image_bgr=image_bgr, style_descriptor=descriptor,
@@ -596,6 +714,7 @@ def colorize_page(image_bgr: np.ndarray,
 
     label_map = None
     if model_specs:
+        check_cancelled(cancel_check)
         region_map = hint_manager.region_map
         if region_map is None:
             hint_manager.bind_source_image(image_bgr)
@@ -605,9 +724,11 @@ def colorize_page(image_bgr: np.ndarray,
     effective_quality, effective_denoise, job_optimizations = _effective_job_quality(
         style, quality, needs_guided=needs_guided, model_specs=model_specs)
 
+    check_cancelled(cancel_check)
     model_started = time.perf_counter()
     raw_key = _raw_cache_key(
-        image_bgr, effective_quality, effective_denoise, model_specs, label_map)
+        image_bgr, effective_quality, effective_denoise, model_specs, label_map,
+        region_control=region_control, hint_render_mode=hint_render_mode)
     raw_result = _raw_cache_get(raw_key)
     raw_cache_hit = raw_result is not None
     if raw_cache_hit:
@@ -625,8 +746,12 @@ def colorize_page(image_bgr: np.ndarray,
             hint_points=model_specs or None,
             label_map=label_map,
             hint_render_mode=hint_render_mode,
+            region_control=region_control,
+            cancel_check=cancel_check,
         )
+        check_cancelled(cancel_check)
         _raw_cache_put(raw_key, raw_result)
+    check_cancelled(cancel_check)
     model_seconds = time.perf_counter() - model_started
 
     # A single automatic degradation retry is cheaper and safer than adding
@@ -641,6 +766,7 @@ def colorize_page(image_bgr: np.ndarray,
             retry_specs = degrade_for_retry(model_specs)
             if retry_specs != model_specs:
                 colorizer = get_colorizer(cfg)
+                check_cancelled(cancel_check)
                 raw_result = colorizer.colorize(
                     image_bgr,
                     size=effective_quality.model_size,
@@ -652,10 +778,14 @@ def colorize_page(image_bgr: np.ndarray,
                     hint_points=retry_specs or None,
                     label_map=label_map,
                     hint_render_mode=hint_render_mode,
+                    region_control=region_control,
+                    cancel_check=cancel_check,
                 )
+                check_cancelled(cancel_check)
                 model_specs = retry_specs
                 retry_key = _raw_cache_key(
-                    image_bgr, effective_quality, effective_denoise, model_specs, label_map)
+                    image_bgr, effective_quality, effective_denoise, model_specs, label_map,
+                    region_control=region_control, hint_render_mode=hint_render_mode)
                 _raw_cache_put(retry_key, raw_result)
                 artifact_report = detect_hint_blobs(raw_result, model_specs)
                 retried = True
@@ -663,34 +793,57 @@ def colorize_page(image_bgr: np.ndarray,
         from types import SimpleNamespace
         artifact_report = SimpleNamespace(score=0.0, suspicious=False, should_retry=False)
 
+    check_cancelled(cancel_check)
+
+    # Stage 1: make the reference palette the input to style grading.  This
+    # prevents the style pass from learning a different hair/eye/skin colour.
+    identity_base_result = raw_result
+    identity_base_lock_applied = False
+    check_cancelled(cancel_check)
+    if (two_stage_identity and character_library is not None and
+            reference_strength > 0.0 and page_context is not None):
+        from core.character_consistency import apply_character_palette_lock
+        check_cancelled(cancel_check)
+        identity_base_result = apply_character_palette_lock(
+            raw_result, image_bgr, character_library,
+            strength=reference_strength,
+            assignments=page_context.identity_assignments,
+            segmentation=page_context.segmentation)
+        identity_base_lock_applied = identity_base_result is not raw_result
+
     grade_preset = style
     grade_seconds = 0.0
-    if is_none_style:
-        result_bgr = raw_result
+    if is_none_style or native_wash_style:
+        result_bgr = identity_base_result
     else:
         grade_preset = style
         grade_started = time.perf_counter()
-        graded = apply_style_grade(raw_result, image_bgr, grade_preset, context=page_context)
+        check_cancelled(cancel_check)
+        graded = apply_style_grade(identity_base_result, image_bgr, grade_preset, context=page_context)
+        check_cancelled(cancel_check)
         grade_seconds = time.perf_counter() - grade_started
         if style_strength >= 0.999:
             result_bgr = graded
         elif style_strength <= 0.001:
-            result_bgr = raw_result
+            result_bgr = identity_base_result
         else:
             result_bgr = np.clip(
-                raw_result.astype(np.float32) * (1.0 - style_strength) +
+                identity_base_result.astype(np.float32) * (1.0 - style_strength) +
                 graded.astype(np.float32) * style_strength,
                 0, 255).astype(np.uint8)
 
     # Hints guide the model; this deterministic lock guarantees identity
     # colours across pages for matched hair, skin, eyes and clothing regions.
-    if character_library is not None and reference_strength > 0.0 and page_context is not None:
+    post_style_identity_lock_applied = False
+    if (character_library is not None and reference_strength > 0.0 and
+            page_context is not None):
         from core.character_consistency import apply_character_palette_lock
         result_bgr = apply_character_palette_lock(
             result_bgr, image_bgr, character_library,
             strength=reference_strength,
             assignments=page_context.identity_assignments,
             segmentation=page_context.segmentation)
+        post_style_identity_lock_applied = True
 
     if (not is_none_style and
             bool(getattr(grade_preset, "force_environment_grayscale", False))):
@@ -698,11 +851,13 @@ def colorize_page(image_bgr: np.ndarray,
         result_bgr = enforce_character_only_color(
             result_bgr, image_bgr, context=page_context)
 
+    check_cancelled(cancel_check)
     if local_manual_specs:
         from core.local_brush import apply_local_brush_recolor
         region_map = hint_manager.region_map
         h, w = result_bgr.shape[:2]
         for spec in local_manual_specs:
+            check_cancelled(cancel_check)
             ix = min(w - 1, max(0, int(round(spec.x_norm * (w - 1)))))
             iy = min(h - 1, max(0, int(round(spec.y_norm * (h - 1)))))
             radius_px = max(1, int(round(spec.radius_norm * w)))
@@ -712,6 +867,7 @@ def colorize_page(image_bgr: np.ndarray,
                 region_map=region_map,
                 gap_close=getattr(region_map, "gap_close", 4) if region_map is not None else 4)
 
+    check_cancelled(cancel_check)
     if custom_color_bias and custom_color_bias.get("enabled"):
         from core.custom_color_bias import apply_global_color_bias
         bias_rgb = tuple(custom_color_bias.get("rgb") or (255, 160, 160))
@@ -726,12 +882,14 @@ def colorize_page(image_bgr: np.ndarray,
             protect_saturated=bool(custom_color_bias.get("protect_saturated", True)),
         )
 
+    check_cancelled(cancel_check)
     if protect_text:
         # 文字气泡保护：把原始黑白页合成回检测到的文字像素，
         # 对话框保持纸白、字保持墨黑。模型缺失时自动跳过。
         from core.text_guard import protect_text_regions
         result_bgr = protect_text_regions(result_bgr, image_bgr)
 
+    check_cancelled(cancel_check)
     filter_base_bgr = result_bgr.copy()
     result_bgr = apply_image_filter(
         result_bgr, filter_tuning,
@@ -739,11 +897,182 @@ def colorize_page(image_bgr: np.ndarray,
         is_styled=not is_none_style,
         source_bw_bgr=image_bgr)
 
+    # Filters are allowed to soften the page, but must not undo the palette
+    # contract established by the two-stage pass.
+    post_filter_identity_lock_applied = False
+    if (two_stage_identity and character_library is not None and
+            reference_strength > 0.0 and page_context is not None):
+        from core.character_consistency import apply_character_palette_lock
+        result_bgr = apply_character_palette_lock(
+            result_bgr, image_bgr, character_library,
+            strength=reference_strength,
+            assignments=page_context.identity_assignments,
+            segmentation=page_context.segmentation)
+        post_filter_identity_lock_applied = True
+
+    purple_guard_applied = False
+    check_cancelled(cancel_check)
+    if (suppress_non_character_purple and not is_none_style
+            and not native_wash_style and not git_legacy_wash_style):
+        from core.style_post import suppress_non_character_purple
+        result_bgr = suppress_non_character_purple(
+            result_bgr, image_bgr, context=page_context,
+            strength=float(getattr(cfg, "PURPLE_GUARD_STRENGTH", 0.62)))
+        purple_guard_applied = True
+
+    water_harmonized = False
+    check_cancelled(cancel_check)
+    if not is_none_style and not native_wash_style and not git_legacy_wash_style:
+        from core.style_post import harmonize_water_color
+        water_result = harmonize_water_color(
+            result_bgr, image_bgr, context=page_context, strength=0.82)
+        water_harmonized = water_result is not result_bgr
+        result_bgr = water_result
+
+    # Automatic mode can misread a large ink-filled hairstyle as orange/red.
+    # Run this after the global style, identity, purple and water passes so
+    # later processing cannot warm the corrected hair again. Explicit character
+    # and region identities remain authoritative inside the guard itself.
+    auto_black_hair_mask = None
+    auto_black_hair_diagnostics = {
+        "enabled": bool(auto_black_hair_guard_enabled), "applied": False,
+        "mode": auto_black_hair_guard_mode,
+        "reason": "style_or_identity_gate",
+    }
+    effective_style_name = str(getattr(grade_preset, "key", style_key or "none"))
+    ink_guard_styles = {
+        "light2", "light2_soft", "light3",
+    }
+    explicit_region_identity = bool(
+        region_control and region_control.get("enabled", False))
+    explicit_library_identity = bool(
+        character_library is not None and page_context is not None and
+        getattr(page_context, "identity_assignments", None))
+    check_cancelled(cancel_check)
+    if (bool(auto_black_hair_guard_enabled) and
+            not semantic_hair_authoritative and
+            effective_style_name in ink_guard_styles):
+        from core.illustrative_inkwash import apply_auto_ink_black_hair_guard
+        result_bgr, auto_black_hair_mask, auto_black_hair_diagnostics = (
+            apply_auto_ink_black_hair_guard(
+                result_bgr, image_bgr, semantic_color_bgr=raw_result,
+                strength=1.0, mode=auto_black_hair_guard_mode,
+                scope=auto_black_hair_guard_scope,
+                limit_mask=auto_black_hair_guard_limit_mask,
+                target_rgb=auto_black_hair_guard_target_rgb,
+                parser_enabled=bool(ai_hair_parser_enabled),
+                parser_backend=str(ai_hair_parser_backend or "auto"),
+                parser_allow_download=bool(ai_hair_parser_allow_download)))
+        if protect_text and auto_black_hair_mask is not None and np.any(auto_black_hair_mask):
+            from core.text_guard import protect_text_regions
+            result_bgr = protect_text_regions(
+                result_bgr, image_bgr, use_fallback=True,
+                vicinity_mask=auto_black_hair_mask)
+
+    # Build semantic masks at source resolution before optional upscale, then
+    # apply them at the very end as authoritative binary replacements.  This
+    # keeps mc-v2/style/upscale free to do their normal work while guaranteeing
+    # that the final hair/iris/background pixels obey the user's mask layer.
+    semantic_masks = None
+    semantic_mask_diagnostics = {
+        "enabled": bool(semantic_mask_enabled), "applied": False,
+        "composition": "hard_replace",
+    }
+    if semantic_mask_enabled:
+        check_cancelled(cancel_check)
+        try:
+            from core.semantic_mask_layers import build_semantic_masks
+            fusion_cfg = dict(semantic_mask_controls.get("fusion") or {})
+            use_generator_features = bool(fusion_cfg.get("use_generator_features", True))
+            generator_feature_provider = None
+            if use_generator_features:
+                def generator_feature_provider(region_labels):
+                    return get_colorizer(cfg).extract_region_embeddings(
+                        image_bgr, region_labels, size=effective_quality.model_size)
+
+            use_generator_semantic_head = bool(
+                fusion_cfg.get("use_generator_semantic_head", True) and
+                getattr(cfg, "GENERATOR_SEMANTIC_HEAD_ENABLED", True))
+            generator_semantic_provider = None
+            if use_generator_semantic_head:
+                semantic_head_path = str(getattr(
+                    cfg, "GENERATOR_SEMANTIC_HEAD_PATH", "") or "")
+                semantic_head_size = int(getattr(
+                    cfg, "GENERATOR_SEMANTIC_HEAD_SIZE", effective_quality.model_size))
+                semantic_head_conf = float(getattr(
+                    cfg, "GENERATOR_SEMANTIC_HEAD_CONFIDENCE", 0.45))
+
+                def generator_semantic_provider(semantic_source):
+                    return get_colorizer(cfg).predict_generator_semantics(
+                        semantic_source, weights_path=semantic_head_path,
+                        size=semantic_head_size,
+                        confidence_threshold=semantic_head_conf)
+
+                try:
+                    semantic_mtime = (os.path.getmtime(semantic_head_path)
+                                      if semantic_head_path else 0.0)
+                except OSError:
+                    semantic_mtime = 0.0
+                generator_semantic_provider.cache_token = (
+                    semantic_head_path, round(float(semantic_mtime), 3),
+                    int(semantic_head_size), round(float(semantic_head_conf), 4))
+            semantic_masks = build_semantic_masks(
+                result_bgr, image_bgr,
+                parser_backend=str(ai_hair_parser_backend or "auto"),
+                parser_allow_download=bool(ai_hair_parser_allow_download),
+                manual_masks=dict(semantic_mask_controls.get("manual_masks") or {}),
+                generator_feature_provider=generator_feature_provider,
+                generator_semantic_provider=generator_semantic_provider,
+                use_region_fusion=bool(fusion_cfg.get("enabled", True)),
+                use_trappedball=bool(fusion_cfg.get("use_trappedball", True)),
+                use_clip_regions=bool(fusion_cfg.get("use_clip_regions", True)),
+                clip_allow_download=bool(fusion_cfg.get("clip_allow_download", False)),
+                use_cache=bool(fusion_cfg.get("use_cache", True)))
+        except Exception as exc:
+            semantic_mask_diagnostics = {
+                "enabled": True, "applied": False,
+                "composition": "hard_replace",
+                "reason": f"mask_build_error:{type(exc).__name__}:{exc}",
+            }
+
+    check_cancelled(cancel_check)
     if quality.use_upscale:
         from core.upscaler import upscale
         result_bgr = upscale(result_bgr, scale=4,
                              weights_path=getattr(cfg, "ESRGAN_MODEL_PATH", None))
 
+    if semantic_mask_enabled and semantic_masks is not None:
+        check_cancelled(cancel_check)
+        try:
+            from core.semantic_mask_layers import (
+                apply_semantic_mask_overrides, build_character_semantic_overrides)
+            character_semantic_overrides = None
+            if (bool(semantic_mask_controls.get("use_character_library_colors", False)) and
+                    character_library is not None and page_context is not None):
+                character_semantic_overrides = build_character_semantic_overrides(
+                    page_context, character_library, semantic_masks, result_bgr.shape[:2])
+            result_bgr, semantic_masks, semantic_mask_diagnostics = apply_semantic_mask_overrides(
+                result_bgr, image_bgr, semantic_mask_controls,
+                parser_backend=str(ai_hair_parser_backend or "auto"),
+                parser_allow_download=False, masks=semantic_masks,
+                character_overrides=character_semantic_overrides)
+            # Text/balloon restoration stays above every colour layer.
+            if protect_text and semantic_mask_diagnostics.get("applied", False):
+                from core.text_guard import protect_text_regions
+                source_for_guard = image_bgr
+                if source_for_guard.shape[:2] != result_bgr.shape[:2]:
+                    source_for_guard = cv2.resize(
+                        source_for_guard, (result_bgr.shape[1], result_bgr.shape[0]),
+                        interpolation=cv2.INTER_CUBIC)
+                result_bgr = protect_text_regions(result_bgr, source_for_guard)
+        except Exception as exc:
+            semantic_mask_diagnostics = {
+                "enabled": True, "applied": False,
+                "composition": "hard_replace",
+                "reason": f"mask_apply_error:{type(exc).__name__}:{exc}",
+            }
+
+    check_cancelled(cancel_check)
     learned_identity_updates = 0
     if (learn_identity and character_library is not None and page_context is not None
             and reference_strength > 0.0):
@@ -766,6 +1095,19 @@ def colorize_page(image_bgr: np.ndarray,
             identity_drift_alerts = 0
             identity_drift_max = 0.0
 
+    check_cancelled(cancel_check)
+    native_model = getattr(getattr(_colorizer, "_model", None), "colorizer", None)
+    native_generator = getattr(native_model, "generator", None)
+    native_adapter = getattr(getattr(_colorizer, "_model", None),
+                             "tunnel2_semantic_adapter", None)
+    native_head_diag = dict(
+        dict(semantic_mask_diagnostics or {}).get("generator_semantic_head") or {})
+    native_hair_pixels = int(
+        dict(semantic_mask_diagnostics or {}).get("hair_pixels", 0) or 0)
+    native_control_enabled = bool(
+        region_control and region_control.get("enabled", False) and
+        str(region_control.get("generator_control_mode", "direct_tunnel2")).lower()
+        in {"direct_tunnel2", "direct", "tunnel2"})
     diagnostics = dict(getattr(page_context, "diagnostics", {}) or {})
     diagnostics.update({
         "composed_hint_count": len(merged_specs),
@@ -778,13 +1120,132 @@ def colorize_page(image_bgr: np.ndarray,
         "effective_per_panel": bool(effective_quality.per_panel),
         "effective_tiled": bool(effective_quality.tiled_inference),
         "effective_denoise_sigma": int(effective_denoise),
+        "effective_style_key": str(getattr(grade_preset, "key", style_key or "none")),
+        "git_legacy_inkwash": bool(git_legacy_wash_style),
+        "effective_style_strength": round(float(style_strength), 3),
         "job_optimizations": list(job_optimizations),
         "raw_cache_hit": bool(raw_cache_hit),
         "model_seconds": round(float(model_seconds), 3),
         "grade_seconds": round(float(grade_seconds), 3),
         "identity_drift_alerts": int(identity_drift_alerts),
         "identity_drift_max_delta_e": round(float(identity_drift_max), 1),
+        "two_stage_identity": bool(two_stage_identity),
+        "identity_base_lock_applied": bool(identity_base_lock_applied),
+        "post_style_identity_lock_applied": bool(post_style_identity_lock_applied),
+        "post_filter_identity_lock_applied": bool(post_filter_identity_lock_applied),
+        "non_character_purple_guard": bool(purple_guard_applied),
+        "water_color_harmonized": bool(water_harmonized),
+        "auto_black_hair_guard_enabled": bool(auto_black_hair_guard_enabled),
+        "auto_black_hair_guard_mode": auto_black_hair_guard_mode,
+        "auto_black_hair_guard_scope": auto_black_hair_guard_scope,
+        "auto_black_hair_guard_limit_mask": bool(auto_black_hair_guard_limit_mask is not None and np.any(auto_black_hair_guard_limit_mask)),
+        "auto_black_hair_guard_target_rgb": (tuple(int(v) for v in auto_black_hair_guard_target_rgb) if auto_black_hair_guard_target_rgb is not None else (24, 24, 24)),
+        "ai_hair_parser_enabled": bool(ai_hair_parser_enabled),
+        "ai_hair_parser_backend": str(ai_hair_parser_backend or "auto"),
+        "ai_hair_parser_allow_download": bool(ai_hair_parser_allow_download),
+        "semantic_mask_layers_enabled": bool(semantic_mask_enabled),
+        "semantic_mask_hair_authoritative": bool(semantic_hair_authoritative),
+        "semantic_mask_layers": dict(semantic_mask_diagnostics),
+        "auto_hair_recolor_overrode_region_identity": bool(auto_black_hair_guard_enabled and explicit_region_identity),
+        "auto_hair_recolor_overrode_library_identity": bool(auto_black_hair_guard_enabled and explicit_library_identity),
+        "auto_black_hair_guard_applied": bool(
+            auto_black_hair_diagnostics.get("applied", False)),
+        "auto_black_hair_guard": dict(auto_black_hair_diagnostics),
+        "region_control_enabled": bool(region_control and region_control.get("enabled", False)),
+        "region_control_target_rgb": tuple(region_control.get("target_rgb", ())) if region_control else (),
+        "region_control_dual_route": bool(region_control and region_control.get("enabled", False)),
+        "region_control_feature_gain": float(region_control.get("feature_gain", 0.0)) if region_control else 0.0,
+        "region_control_adapter_requested": bool(region_control and region_control.get("use_adapter", False)),
+        "generator_native_control": {
+            "enabled": native_control_enabled,
+            "semantic_backend": native_head_diag.get("backend", "legacy_or_unavailable"),
+            "control_backend": "tunnel2_adapter" if native_adapter is not None else "tunnel2_residual",
+            "injection_point": "tunnel2" if native_control_enabled else None,
+            "adapter_loaded": bool(native_adapter is not None),
+            "adapter_load_error": getattr(
+                getattr(_colorizer, "_model", None),
+                "tunnel2_semantic_adapter_error", None),
+            "encoder_forward_count": (int(getattr(native_generator,
+                                                    "encoder_forward_count", 0))
+                                       if native_generator is not None else None),
+            "hair_pixels": native_hair_pixels,
+            "hair_color_coverage": dict(semantic_mask_diagnostics or {}).get(
+                "hair_color_coverage"),
+            "outside_changed_pixels": dict(semantic_mask_diagnostics or {}).get(
+                "outside_changed_pixels"),
+        },
     })
+    check_cancelled(cancel_check)
+    if ink_fidelity and not native_wash_style and not git_legacy_wash_style:
+        from core.ink_fidelity import restore_ink_fidelity
+        check_cancelled(cancel_check)
+        result_bgr = restore_ink_fidelity(image_bgr, result_bgr)
+        if filter_base_bgr is not None and return_filter_base:
+            filter_base_bgr = restore_ink_fidelity(image_bgr, filter_base_bgr)
+        diagnostics["ink_fidelity_applied"] = True
+    else:
+        diagnostics["ink_fidelity_applied"] = False
+    # Ink-wash is now the primary render path for the three pale manga presets.
+    # The original mc-v2 mode ('none') never passes through this renderer.
+    ink_style = str(getattr(grade_preset, "key", style_key or "none"))
+    if ink_style in {"light2", "light2_soft", "light3"}:
+        from core.inkwash_render import render_inkwash
+        ink_strength = float(np.clip(
+            float((pastel_tuning or {}).get("inkwash_strength", 78)) / 100.0,
+            0.0, 1.0))
+        check_cancelled(cancel_check)
+        ink_light3_intensity = float(np.clip(
+            float((pastel_tuning or {}).get("light3_intensity", 100)) / 100.0,
+            0.0, 2.0))
+        if ink_strength > 0:
+            # Explicit semantic/character recolours have higher priority than
+            # paper-wash aesthetics. Preserve these exact edited pixels.
+            preserve_mask = None
+            if semantic_mask_enabled and semantic_masks is not None and semantic_mask_diagnostics.get("applied"):
+                preserve_mask = np.zeros(result_bgr.shape[:2], dtype=np.uint8)
+                for name, attr in (("hair", "hair_mask"), ("iris", "iris_mask"),
+                                   ("garment", "cloth_mask"),
+                                   ("background", "background_mask")):
+                    layer = dict(semantic_mask_controls.get(name) or {})
+                    if not layer.get("enabled", False):
+                        continue
+                    semantic_mask = getattr(semantic_masks, attr, None)
+                    if semantic_mask is None:
+                        continue
+                    if semantic_mask.shape[:2] != preserve_mask.shape:
+                        semantic_mask = cv2.resize(
+                            semantic_mask.astype(np.uint8),
+                            (preserve_mask.shape[1], preserve_mask.shape[0]),
+                            interpolation=cv2.INTER_NEAREST)
+                    preserve_mask[np.asarray(semantic_mask) > 0] = 255
+            src_ink = image_bgr
+            if src_ink.shape[:2] != result_bgr.shape[:2]:
+                src_ink = cv2.resize(src_ink, (result_bgr.shape[1], result_bgr.shape[0]),
+                                     interpolation=cv2.INTER_CUBIC)
+            # Work with the native, ungraded generator result PLUS any explicit
+            # later user recolours/filters. Previous code used the early
+            # identity_base_result, silently discarding manual edits here.
+            inkwash_base_bgr = result_bgr
+            if inkwash_base_bgr.shape[:2] != result_bgr.shape[:2]:
+                inkwash_base_bgr = cv2.resize(
+                    inkwash_base_bgr, (result_bgr.shape[1], result_bgr.shape[0]),
+                    interpolation=cv2.INTER_CUBIC)
+            result_bgr = render_inkwash(src_ink, inkwash_base_bgr,
+                                        preset=ink_style, strength=ink_strength,
+                                        preserve_mask=preserve_mask,
+                                        light3_intensity=ink_light3_intensity)
+            if return_filter_base and filter_base_bgr is not None:
+                filter_base_bgr = render_inkwash(
+                    src_ink, filter_base_bgr, preset=ink_style, strength=ink_strength,
+                    preserve_mask=preserve_mask,
+                    light3_intensity=ink_light3_intensity)
+            diagnostics["inkwash_base"] = "native_generator_plus_explicit_edits"
+        diagnostics["inkwash_strength"] = round(ink_strength, 3)
+        if ink_style == "light3":
+            diagnostics["light3_intensity_effective"] = round(ink_light3_intensity, 3)
+        diagnostics["inkwash_render_applied"] = ink_strength > 0
+    else:
+        diagnostics["inkwash_render_applied"] = False
     hint_manager.last_diagnostics = diagnostics
     hint_manager.last_page_context = page_context
     if return_filter_base:

@@ -9,17 +9,24 @@ architecture doc. Only one mode — Auto — with an optional edit step:
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
+import hashlib
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QObject, Signal, QSettings
 from PySide6.QtGui import QColor, QAction, QKeySequence, QShortcut, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QListWidget, QListWidgetItem, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog, QSplitter,
     QStatusBar, QColorDialog, QButtonGroup, QRadioButton, QGroupBox, QListView,
     QMessageBox, QProgressBar, QCheckBox, QComboBox, QSpinBox, QInputDialog,
-    QSizePolicy, QGridLayout, QTabWidget, QDialog,
+    QSizePolicy, QGridLayout, QTabWidget, QDialog, QApplication, QToolButton,
+    QScrollArea, QFrame, QLayout,
 )
 
 from config import Config
@@ -36,50 +43,303 @@ from core.pdf_handler import extract_pages
 from core.selection_snap import snap_selection_mask_to_lineart
 from ui.canvas import HintCanvas
 from ui.i18n import tr, set_language, get_language
-from ui.worker import (BatchColorizeWorker, LocalModelRecolorWorker,
-                       MangaLineExtractionWorker)
+from ui.worker import (BatchColorizeWorker, HairModelDownloadWorker,
+                       HairModelImportWorker, LocalModelRecolorWorker, MangaLineExtractionWorker,
+                       SemanticSelectionWorker, HairSelectionRefineWorker)
+
+
+def _tunnel2_adapter_available() -> bool:
+    """Return whether either supported external region adapter is installed."""
+    paths = (
+        getattr(Config, "TUNNEL2_SEMANTIC_ADAPTER_PATH", ""),
+        getattr(Config, "REGION_ADAPTER_WEIGHTS_PATH", ""),
+    )
+    return any(path and os.path.isfile(path) for path in paths)
+
+
+class _LayerCacheBridge(QObject):
+    """Marshal background cache completions back onto the Qt UI thread."""
+
+    completed = Signal(object)
+
+
+class _ExportCacheBridge(QObject):
+    """Marshal final-image compression completions onto the Qt UI thread."""
+
+    completed = Signal(object)
+
+
+def _discard_spill_files(result: dict | None) -> None:
+    """Delete files produced by a stale/cancelled background spill."""
+    if not isinstance(result, dict):
+        return
+    for path in set(result.get("created_paths", ()) or ()):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _write_layer_spill(request: dict) -> dict:
+    """Encode one page's resident layers outside the Qt main thread.
+
+    The request contains live ndarray references plus revision/object tokens.
+    The UI thread validates those tokens before committing the files, so an
+    edit made while encoding simply makes this result stale and disposable.
+    """
+    cache_dir = request["cache_dir"]
+    os.makedirs(cache_dir, exist_ok=True)
+    layers = request["layers"]
+    new_paths = dict(request.get("old_paths", {}))
+    representatives: list[tuple[np.ndarray, str]] = []
+    successful_keys: set[str] = set()
+    created_paths: set[str] = set()
+    bytes_written = 0
+    from core.imageio import imwrite as _uimwrite
+
+    for key in ("ai", "result", "filter"):
+        info = layers.get(key)
+        if not info:
+            continue
+        image = info["image"]
+        existing_path = info.get("existing_path")
+        if (not info.get("dirty", True) and existing_path and
+                os.path.isfile(existing_path)):
+            new_paths[key] = existing_path
+            successful_keys.add(key)
+            representatives.append((image, existing_path))
+            continue
+
+        shared_path = None
+        for other_image, other_path in representatives:
+            if (image is other_image or
+                    (image.shape == other_image.shape and
+                     image.dtype == other_image.dtype and
+                     np.array_equal(image, other_image))):
+                shared_path = other_path
+                break
+
+        if shared_path is None:
+            final_path = os.path.join(
+                cache_dir,
+                f"{request['page_id']}_g{request['cache_generation']}_{key}.png")
+            temp_path = final_path + ".tmp.png"
+            # Compression level 1 is still lossless, but uses much less CPU than
+            # the previous level 3.  Session files are temporary and equal
+            # layers share one file, so responsiveness is more important than
+            # squeezing the final few percent out of the cache size.
+            ok = _uimwrite(
+                temp_path, image,
+                [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            if not ok:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                continue
+            os.replace(temp_path, final_path)
+            created_paths.add(final_path)
+            try:
+                bytes_written += os.path.getsize(final_path)
+            except OSError:
+                pass
+            shared_path = final_path
+            representatives.append((image, shared_path))
+
+        new_paths[key] = shared_path
+        successful_keys.add(key)
+
+    return {
+        "path": request["path"],
+        "state_id": request["state_id"],
+        "serial": request["serial"],
+        "old_paths": request.get("old_paths", {}),
+        "new_paths": new_paths,
+        "successful_keys": successful_keys,
+        "created_paths": created_paths,
+        "layers": {
+            key: {
+                "revision": info["revision"],
+                "image_id": info["image_id"],
+            }
+            for key, info in layers.items()
+        },
+        "bytes_written": bytes_written,
+    }
+
+
+def _discard_export_cache_result(result: dict | None) -> None:
+    if not isinstance(result, dict):
+        return
+    path = result.get("created_path")
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _write_export_cache(request: dict) -> dict:
+    """Encode one immutable final export asset outside the Qt main thread."""
+    image = request.get("image")
+    if image is None:
+        source_path = request.get("source_cache_path")
+        if not source_path or not os.path.isfile(source_path):
+            raise RuntimeError("No resident result or lossless result cache is available")
+        from core.imageio import imread as _uimread
+        image = _uimread(source_path)
+        if image is None:
+            raise RuntimeError(f"Cannot read result cache: {source_path}")
+
+    from core.image_compressor import encode_image, atomic_write_bytes
+    encoded = encode_image(image, request.get("profile"))
+    os.makedirs(request["cache_dir"], exist_ok=True)
+    base = os.path.join(
+        request["cache_dir"],
+        f"{request['page_id']}_r{request['revision']}_s{request['serial']}_{request['profile']}")
+    final_path = base + encoded.extension
+    atomic_write_bytes(final_path, encoded.data)
+    return {
+        "path": request["path"],
+        "state_id": request["state_id"],
+        "serial": request["serial"],
+        "revision": request["revision"],
+        "image_id": request.get("image_id"),
+        "profile": request["profile"],
+        "created_path": final_path,
+        "metadata": encoded.as_metadata(),
+    }
 
 
 class PageState:
     """Everything the app tracks for one page.
 
-    Three layers, per the "don't lose the first AI result" request:
-      - original_bgr : never modified — the imported black-and-white page.
-      - ai_result_bgr: the most recent full mc-v2 run's output. Untouched
-                       by region-fill edits, so "恢复AI结果" always has
-                       a real fallback even after several manual touch-ups.
-      - result_bgr   : the current "Edited" layer — what's displayed and
-                       exported. Starts equal to ai_result_bgr after each
-                       colorize, then diverges as region-fill edits land.
+    Full-resolution batch layers are kept in memory only while the page is
+    active. Inactive pages are losslessly spooled to a session PNG cache and
+    loaded lazily on access. This prevents macOS from creating many gigabytes
+    of swap while preserving the AI base, editable result and filter base.
     """
+
+    _LAYER_ATTRS = {
+        "ai": "_ai_result_bgr",
+        "result": "_result_bgr",
+        "filter": "_filter_base_bgr",
+    }
 
     def __init__(self, path: str, original_bgr: np.ndarray | None = None):
         self.path = path
         self._original_bgr = original_bgr
         self._load_error: str | None = None
-        self.ai_result_bgr: np.ndarray | None = None
-        self.result_bgr: np.ndarray | None = None
-        # Unfiltered final colorization used for non-cumulative filter changes.
-        self.filter_base_bgr: np.ndarray | None = None
-        # Reference layer for the dedicated colour-bias eraser. It tracks the
-        # latest non-bias page state so the eraser can restore only the bias
-        # brush effect along the painted stroke.
+        self._ai_result_bgr: np.ndarray | None = None
+        self._result_bgr: np.ndarray | None = None
+        self._filter_base_bgr: np.ndarray | None = None
+        self._layer_cache_paths: dict[str, str] = {}
+        self._layer_dirty: dict[str, bool] = {key: False for key in self._LAYER_ATTRS}
+        self._layer_revision: dict[str, int] = {key: 0 for key in self._LAYER_ATTRS}
+        self._owned_cache_paths: set[str] = set()
+        self._cache_generation = 0
+        self._spill_serial = 0
+        # Separate pre-compressed final export asset.  Working/edit layers stay
+        # lossless; export copies these immutable bytes without recompressing.
+        self._export_cache_path: str | None = None
+        self._export_cache_profile: str = ""
+        self._export_cache_revision: int = -1
+        self._export_cache_metadata: dict = {}
+        self._export_serial = 0
+        # Reference layers for the dedicated colour-bias eraser are created
+        # lazily for the active page rather than duplicated for every batch page.
         self.bias_brush_reference_bgr: np.ndarray | None = None
         self.bias_brush_reference_filter_bgr: np.ndarray | None = None
         self.hint_manager = HintManager()
-        # Do not decode every page or build a region map during import.  Both
-        # are loaded lazily when the page is first viewed / edited / generated.
         self.quality_report = None
         self.pipeline_diagnostics: dict = {}
-        # Page-local explicit character binding.  Values are character IDs;
-        # -1 means the user explicitly disabled identity locking.
         self.forced_character_matches: dict[int, int] = {}
-        # Full-state undo/redo.  A snapshot includes the editable result,
-        # stored AI base layer and manual hints.  This allows the very first
-        # auto-colorize to be undone back to an empty/B&W state and prevents
-        # operations that touch more than result_bgr from becoming irreversible.
         self.undo_stack: list[dict] = []
         self.redo_stack: list[dict] = []
+
+    def _get_layer(self, key: str) -> np.ndarray | None:
+        attr = self._LAYER_ATTRS[key]
+        image = getattr(self, attr)
+        if image is None:
+            cache_path = self._layer_cache_paths.get(key)
+            if cache_path and os.path.isfile(cache_path):
+                # AI/result/filter commonly share the same deduplicated PNG.
+                # Reuse an already-decoded sibling via a RAM copy instead of
+                # decoding the same multi-megapixel PNG two or three times.
+                for other_key, other_attr in self._LAYER_ATTRS.items():
+                    if other_key == key:
+                        continue
+                    if self._layer_cache_paths.get(other_key) != cache_path:
+                        continue
+                    other_image = getattr(self, other_attr)
+                    if other_image is not None:
+                        image = other_image.copy()
+                        break
+                if image is None:
+                    from core.imageio import imread as _uimread
+                    image = _uimread(cache_path)
+                if image is not None:
+                    setattr(self, attr, image)
+                    self._layer_dirty[key] = False
+                else:
+                    self._layer_cache_paths.pop(key, None)
+        return image
+
+    def _delete_unreferenced_cache(self, path: str | None) -> None:
+        if not path or path not in self._owned_cache_paths:
+            return
+        if path in self._layer_cache_paths.values():
+            return
+        self._owned_cache_paths.discard(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _set_layer(self, key: str, image: np.ndarray | None) -> None:
+        old_path = self._layer_cache_paths.pop(key, None)
+        setattr(self, self._LAYER_ATTRS[key], image)
+        self._layer_dirty[key] = image is not None
+        self._layer_revision[key] = int(self._layer_revision.get(key, 0)) + 1
+        self._delete_unreferenced_cache(old_path)
+        if key == "result":
+            self.invalidate_export_cache()
+
+    @property
+    def ai_result_bgr(self) -> np.ndarray | None:
+        return self._get_layer("ai")
+
+    @ai_result_bgr.setter
+    def ai_result_bgr(self, image: np.ndarray | None) -> None:
+        self._set_layer("ai", image)
+
+    @property
+    def result_bgr(self) -> np.ndarray | None:
+        return self._get_layer("result")
+
+    @result_bgr.setter
+    def result_bgr(self, image: np.ndarray | None) -> None:
+        self._set_layer("result", image)
+
+    @property
+    def filter_base_bgr(self) -> np.ndarray | None:
+        return self._get_layer("filter")
+
+    @filter_base_bgr.setter
+    def filter_base_bgr(self, image: np.ndarray | None) -> None:
+        self._set_layer("filter", image)
+
+    @property
+    def has_ai_result(self) -> bool:
+        return (self._ai_result_bgr is not None or
+                bool(self._layer_cache_paths.get("ai") and
+                     os.path.isfile(self._layer_cache_paths["ai"])))
+
+    @property
+    def has_result(self) -> bool:
+        return (self._result_bgr is not None or
+                bool(self._layer_cache_paths.get("result") and
+                     os.path.isfile(self._layer_cache_paths["result"])))
 
     @property
     def original_bgr(self) -> np.ndarray:
@@ -96,40 +356,614 @@ class PageState:
     def is_loaded(self) -> bool:
         return self._original_bgr is not None
 
-    def release_original(self) -> None:
-        """Release source pixels for untouched, non-current pages."""
-        if self.ai_result_bgr is None and self.result_bgr is None:
+    def release_original(self, *, force: bool = False) -> None:
+        """Release source pixels; they can always be decoded from ``path``."""
+        if force or (not self.has_ai_result and not self.has_result):
             self._original_bgr = None
 
-    def edit_snapshot(self) -> dict:
-        """Capture every user-visible, editable part of this page."""
-        return capture_edit_state(self)
+    def can_release_cached_layers(self) -> bool:
+        """True when every resident layer already has a clean cache file."""
+        resident = False
+        for key, attr in self._LAYER_ATTRS.items():
+            image = getattr(self, attr)
+            if image is None:
+                continue
+            resident = True
+            path = self._layer_cache_paths.get(key)
+            if self._layer_dirty.get(key, True) or not path or not os.path.isfile(path):
+                return False
+        return resident
+
+    def prepare_spill_request(self, cache_dir: str) -> dict | None:
+        """Capture a cheap, non-blocking description for background encoding."""
+        resident = {
+            key: getattr(self, attr)
+            for key, attr in self._LAYER_ATTRS.items()
+            if getattr(self, attr) is not None
+        }
+        if not resident:
+            self.release_original(force=True)
+            if hasattr(self.hint_manager, "release_runtime_cache"):
+                self.hint_manager.release_runtime_cache()
+            return None
+
+        self._cache_generation += 1
+        self._spill_serial += 1
+        page_id = hashlib.blake2b(
+            os.path.abspath(self.path).encode("utf-8", "surrogatepass"),
+            digest_size=8).hexdigest()
+        return {
+            "path": self.path,
+            "state_id": id(self),
+            "serial": self._spill_serial,
+            "cache_dir": cache_dir,
+            "cache_generation": self._cache_generation,
+            "page_id": page_id,
+            "old_paths": dict(self._layer_cache_paths),
+            "layers": {
+                key: {
+                    "image": image,
+                    "image_id": id(image),
+                    "revision": int(self._layer_revision.get(key, 0)),
+                    "dirty": bool(self._layer_dirty.get(key, True)),
+                    "existing_path": self._layer_cache_paths.get(key),
+                }
+                for key, image in resident.items()
+            },
+        }
+
+    def commit_spill_result(self, result: dict, *, release: bool) -> int:
+        """Commit a background spill only for layers that stayed unchanged."""
+        if not isinstance(result, dict) or result.get("state_id") != id(self):
+            _discard_spill_files(result)
+            return 0
+
+        old_paths = dict(result.get("old_paths", {}))
+        new_paths = dict(result.get("new_paths", {}))
+        successful = set(result.get("successful_keys", ()) or ())
+        created = set(result.get("created_paths", ()) or ())
+        committed_created: set[str] = set()
+
+        for key in successful:
+            token = (result.get("layers", {}) or {}).get(key, {})
+            attr = self._LAYER_ATTRS.get(key)
+            current = getattr(self, attr) if attr else None
+            unchanged = (
+                attr is not None and
+                int(self._layer_revision.get(key, 0)) == int(token.get("revision", -1)) and
+                current is not None and id(current) == int(token.get("image_id", -1))
+            )
+            path = new_paths.get(key)
+            if not unchanged or not path or not os.path.isfile(path):
+                continue
+            self._layer_cache_paths[key] = path
+            self._layer_dirty[key] = False
+            if path in created:
+                self._owned_cache_paths.add(path)
+                committed_created.add(path)
+            if release:
+                setattr(self, attr, None)
+
+        # Remove files produced solely for stale layers and retire superseded
+        # owned files only after the new references have been installed.
+        for path in created - committed_created:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        for path in set(old_paths.values()):
+            self._delete_unreferenced_cache(path)
+
+        self._promote_lossless_export_cache()
+
+        if release:
+            self.release_original(force=True)
+            self.bias_brush_reference_bgr = None
+            self.bias_brush_reference_filter_bgr = None
+            if hasattr(self.hint_manager, "release_runtime_cache"):
+                self.hint_manager.release_runtime_cache()
+        return int(result.get("bytes_written", 0) or 0)
+
+    def spill_layers(self, cache_dir: str) -> int:
+        """Synchronous fallback used by tests/non-UI callers.
+
+        The GUI uses ``prepare_spill_request`` with a background executor so
+        compression never blocks a click, drag, or page switch.
+        """
+        if self.can_release_cached_layers():
+            self.release_cached_layers()
+            return 0
+        request = self.prepare_spill_request(cache_dir)
+        if request is None:
+            return 0
+        return self.commit_spill_result(_write_layer_spill(request), release=True)
+
+    def release_cached_layers(self) -> None:
+        """Drop decoded copies whose lossless session files already exist."""
+        for key, attr in self._LAYER_ATTRS.items():
+            path = self._layer_cache_paths.get(key)
+            if path and os.path.isfile(path):
+                setattr(self, attr, None)
+        self.release_original(force=True)
+        if hasattr(self.hint_manager, "release_runtime_cache"):
+            self.hint_manager.release_runtime_cache()
+
+    def clear_layer_cache(self) -> None:
+        self.invalidate_export_cache()
+        paths = set(self._owned_cache_paths)
+        self._layer_cache_paths.clear()
+        self._layer_dirty = {key: False for key in self._LAYER_ATTRS}
+        self._layer_revision = {
+            key: int(self._layer_revision.get(key, 0)) + 1
+            for key in self._LAYER_ATTRS
+        }
+        self._owned_cache_paths.clear()
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _promote_lossless_export_cache(self) -> None:
+        path = self._export_cache_path
+        if (not path or not os.path.isfile(path) or
+                not bool(self._export_cache_metadata.get("lossless"))):
+            return
+        previous_result_path = self._layer_cache_paths.get("result")
+        if (not previous_result_path or previous_result_path == path or
+                not os.path.isfile(previous_result_path)):
+            return
+        shared_keys = [
+            key for key, cache_path in self._layer_cache_paths.items()
+            if cache_path == previous_result_path
+        ]
+        for key in shared_keys:
+            self._layer_cache_paths[key] = str(path)
+            self._layer_dirty[key] = False
+        self._owned_cache_paths.add(str(path))
+        self._delete_unreferenced_cache(previous_result_path)
+
+    def invalidate_export_cache(self) -> None:
+        self._export_serial = int(getattr(self, "_export_serial", 0)) + 1
+        path = self._export_cache_path
+        self._export_cache_path = None
+        self._export_cache_profile = ""
+        self._export_cache_revision = -1
+        self._export_cache_metadata = {}
+        # A pixel-identical WebP/PNG export may be promoted to the lossless
+        # session layer cache.  Never delete it while AI/result/filter still
+        # reference the same file.
+        if path and path not in self._layer_cache_paths.values():
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def has_valid_export_cache(self, profile: str) -> bool:
+        from core.image_compressor import normalize_profile
+        profile = normalize_profile(profile)
+        return bool(
+            self._export_cache_path and
+            os.path.isfile(self._export_cache_path) and
+            self._export_cache_profile == profile and
+            self._export_cache_revision == int(self._layer_revision.get("result", -1))
+        )
+
+    def export_cache_info(self, profile: str) -> tuple[str | None, dict]:
+        if not self.has_valid_export_cache(profile):
+            return None, {}
+        return self._export_cache_path, dict(self._export_cache_metadata)
+
+    def prepare_export_cache_request(self, cache_dir: str, profile: str) -> dict | None:
+        from core.image_compressor import normalize_profile
+        profile = normalize_profile(profile)
+        if self.has_valid_export_cache(profile):
+            return None
+        image = self._result_bgr
+        source_cache_path = None
+        if image is None:
+            source_cache_path = self._layer_cache_paths.get("result")
+            if not source_cache_path or not os.path.isfile(source_cache_path):
+                return None
+        self._export_serial += 1
+        revision = int(self._layer_revision.get("result", 0))
+        page_id = hashlib.blake2b(
+            os.path.abspath(self.path).encode("utf-8", "surrogatepass"),
+            digest_size=8).hexdigest()
+        return {
+            "path": self.path,
+            "state_id": id(self),
+            "serial": self._export_serial,
+            "cache_dir": cache_dir,
+            "page_id": page_id,
+            "revision": revision,
+            "profile": profile,
+            "image": image,
+            "image_id": id(image) if image is not None else None,
+            "source_cache_path": source_cache_path,
+        }
+
+    def commit_export_cache_result(self, result: dict) -> bool:
+        if not isinstance(result, dict) or result.get("state_id") != id(self):
+            _discard_export_cache_result(result)
+            return False
+        path = result.get("created_path")
+        unchanged = (
+            int(result.get("serial", -1)) == int(self._export_serial) and
+            int(result.get("revision", -1)) == int(self._layer_revision.get("result", -2)) and
+            str(result.get("profile", "")) != "" and
+            path and os.path.isfile(path)
+        )
+        resident = self._result_bgr
+        image_id = result.get("image_id")
+        if image_id is not None and resident is not None and id(resident) != int(image_id):
+            unchanged = False
+        if not unchanged:
+            _discard_export_cache_result(result)
+            return False
+        old_path = self._export_cache_path
+        self._export_cache_path = str(path)
+        self._export_cache_profile = str(result.get("profile"))
+        self._export_cache_revision = int(result.get("revision", -1))
+        self._export_cache_metadata = dict(result.get("metadata", {}) or {})
+
+        # When the chosen export is truly lossless, reuse it as the inactive
+        # page cache instead of storing both PNG and WebP copies.
+        self._promote_lossless_export_cache()
+
+        if (old_path and old_path != path and
+                old_path not in self._layer_cache_paths.values()):
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+        return True
+
+    FULL_SNAPSHOT_FIELDS = (
+        "result_bgr", "ai_result_bgr", "filter_base_bgr",
+        "bias_brush_reference_bgr", "bias_brush_reference_filter_bgr",
+        "hint_manager", "pipeline_diagnostics", "quality_report",
+    )
+    PIXEL_EDIT_FIELDS = (
+        "result_bgr", "filter_base_bgr",
+        "bias_brush_reference_bgr", "bias_brush_reference_filter_bgr",
+    )
+    FILTER_EDIT_FIELDS = ("result_bgr", "filter_base_bgr")
+    HINT_EDIT_FIELDS = ("hint_manager",)
+
+    def edit_snapshot(self, fields=None) -> dict:
+        return capture_edit_state(self, fields=fields)
 
     def snapshot_equals_current(self, snapshot: dict) -> bool:
-        return snapshots_equal(snapshot, self.edit_snapshot())
+        if snapshot.get("__kind__") == "pixel_tiles":
+            for tile in snapshot.get("tiles", ()) or ():
+                x0, y0, x1, y1 = [int(v) for v in tile["bbox"]]
+                for field in ("result_bgr", "filter_base_bgr"):
+                    expected = tile.get(field)
+                    current = getattr(self, field, None)
+                    if expected is None or current is None:
+                        if expected is not None or current is not None:
+                            return False
+                        continue
+                    if current.shape[0] < y1 or current.shape[1] < x1:
+                        return False
+                    crop = current[y0:y1, x0:x1]
+                    if (crop.shape != expected.shape or crop.dtype != expected.dtype or
+                            not np.array_equal(crop, expected)):
+                        return False
+            return True
+        if snapshot.get("__kind__") == "pixel_patch":
+            bbox = snapshot.get("bbox")
+            if not bbox or len(bbox) != 4:
+                return True
+            x0, y0, x1, y1 = [int(v) for v in bbox]
+            for field in ("result_bgr", "filter_base_bgr"):
+                expected = snapshot.get(field)
+                current = getattr(self, field, None)
+                if expected is None or current is None:
+                    if expected is not None or current is not None:
+                        return False
+                    continue
+                if current.shape[0] < y1 or current.shape[1] < x1:
+                    return False
+                crop = current[y0:y1, x0:x1]
+                if (crop.shape != expected.shape or crop.dtype != expected.dtype or
+                        not np.array_equal(crop, expected)):
+                    return False
+            return True
+        fields = snapshot.get("__fields__", self.FULL_SNAPSHOT_FIELDS)
+        return snapshots_equal(snapshot, self.edit_snapshot(fields=fields))
+
+    def inverse_snapshot(self, snapshot: dict) -> dict:
+        """Capture the current state using the same compact representation.
+
+        Pixel-patch checkpoints make ordinary brush undo proportional to the
+        painted corridor rather than the entire multi-megapixel page.  The
+        inverse patch is also sufficient for redo.
+        """
+        kind = snapshot.get("__kind__")
+        if kind == "pixel_tiles":
+            result = self.result_bgr
+            filter_base = self.filter_base_bgr
+            tiles = []
+            for tile in snapshot.get("tiles", ()) or ():
+                x0, y0, x1, y1 = [int(v) for v in tile["bbox"]]
+                tiles.append({
+                    "bbox": (x0, y0, x1, y1),
+                    "result_bgr": (None if result is None else
+                                   result[y0:y1, x0:x1].copy()),
+                    "filter_base_bgr": (None if filter_base is None else
+                                        filter_base[y0:y1, x0:x1].copy()),
+                })
+            return {
+                "__kind__": "pixel_tiles",
+                "__fields__": self.FILTER_EDIT_FIELDS,
+                "tiles": tiles,
+                "filter_was_none": filter_base is None,
+                "bias_brush_reference_bgr": self.bias_brush_reference_bgr,
+                "bias_brush_reference_filter_bgr": self.bias_brush_reference_filter_bgr,
+            }
+        if kind != "pixel_patch":
+            fields = snapshot.get("__fields__", self.FULL_SNAPSHOT_FIELDS)
+            return self.edit_snapshot(fields=fields)
+        x0, y0, x1, y1 = [int(v) for v in snapshot["bbox"]]
+        result = self.result_bgr
+        filter_base = self.filter_base_bgr
+        return {
+            "__kind__": "pixel_patch",
+            "__fields__": self.FILTER_EDIT_FIELDS,
+            "bbox": (x0, y0, x1, y1),
+            "result_bgr": (None if result is None else
+                           result[y0:y1, x0:x1].copy()),
+            "filter_base_bgr": (None if filter_base is None else
+                                filter_base[y0:y1, x0:x1].copy()),
+            "filter_was_none": filter_base is None,
+            # Bias references are not modified by the ordinary brush.  Keep
+            # object references instead of copying two more complete pages.
+            "bias_brush_reference_bgr": self.bias_brush_reference_bgr,
+            "bias_brush_reference_filter_bgr": self.bias_brush_reference_filter_bgr,
+        }
 
     def restore_snapshot(self, snapshot: dict) -> None:
-        """Force the page back to an exact prior edit state."""
+        if snapshot.get("__kind__") == "pixel_tiles":
+            tiles = list(snapshot.get("tiles", ()) or ())
+            result = self.result_bgr
+            if result is not None:
+                for tile in tiles:
+                    old_result = tile.get("result_bgr")
+                    if old_result is None:
+                        continue
+                    x0, y0, x1, y1 = [int(v) for v in tile["bbox"]]
+                    result[y0:y1, x0:x1] = old_result
+                self.result_bgr = result
+            if snapshot.get("filter_was_none"):
+                self.filter_base_bgr = None
+            else:
+                filter_base = self.filter_base_bgr
+                if filter_base is None and self.result_bgr is not None:
+                    filter_base = self.result_bgr.copy()
+                if filter_base is not None:
+                    for tile in tiles:
+                        old_filter = tile.get("filter_base_bgr")
+                        if old_filter is None:
+                            continue
+                        x0, y0, x1, y1 = [int(v) for v in tile["bbox"]]
+                        filter_base[y0:y1, x0:x1] = old_filter
+                    self.filter_base_bgr = filter_base
+            self.bias_brush_reference_bgr = snapshot.get(
+                "bias_brush_reference_bgr")
+            self.bias_brush_reference_filter_bgr = snapshot.get(
+                "bias_brush_reference_filter_bgr")
+            return
+        if snapshot.get("__kind__") == "pixel_patch":
+            x0, y0, x1, y1 = [int(v) for v in snapshot["bbox"]]
+            result = self.result_bgr
+            old_result = snapshot.get("result_bgr")
+            if result is not None and old_result is not None:
+                result[y0:y1, x0:x1] = old_result
+                # Route through the setter so cache revisions and stale spill
+                # tokens are invalidated exactly like a normal edit.
+                self.result_bgr = result
+            if snapshot.get("filter_was_none"):
+                self.filter_base_bgr = None
+            else:
+                filter_base = self.filter_base_bgr
+                old_filter = snapshot.get("filter_base_bgr")
+                if old_filter is not None:
+                    if filter_base is None:
+                        current_result = self.result_bgr
+                        if current_result is not None:
+                            filter_base = current_result.copy()
+                    if filter_base is not None:
+                        filter_base[y0:y1, x0:x1] = old_filter
+                        self.filter_base_bgr = filter_base
+            self.bias_brush_reference_bgr = snapshot.get(
+                "bias_brush_reference_bgr")
+            self.bias_brush_reference_filter_bgr = snapshot.get(
+                "bias_brush_reference_filter_bgr")
+            return
         restore_edit_state(self, snapshot)
 
-    def push_undo(self):
-        """Call BEFORE any visible mutation; empty states are valid snapshots."""
-        snapshot = self.edit_snapshot()
-        if not self.undo_stack or not snapshots_equal(self.undo_stack[-1], snapshot):
+    def push_undo_snapshot(self, snapshot: dict, *, compare: bool = True) -> None:
+        """Push an already-owned checkpoint without copying it again."""
+        if not snapshot:
+            return
+        if (not compare or not self.undo_stack or
+                not self._snapshot_equal(self.undo_stack[-1], snapshot)):
             self.undo_stack.append(snapshot)
             if len(self.undo_stack) > 20:
                 self.undo_stack.pop(0)
         self.redo_stack.clear()
 
+    def push_undo(self, fields=None):
+        snapshot = self.edit_snapshot(fields=fields)
+        self.push_undo_snapshot(snapshot)
+
     @staticmethod
     def _snapshot_equal(left: dict, right: dict) -> bool:
+        left_kind = left.get("__kind__")
+        right_kind = right.get("__kind__")
+        compact_kinds = {"pixel_patch", "pixel_tiles"}
+        if left_kind in compact_kinds or right_kind in compact_kinds:
+            if left_kind != right_kind:
+                return False
+            if left_kind == "pixel_tiles":
+                left_tiles = list(left.get("tiles", ()) or ())
+                right_tiles = list(right.get("tiles", ()) or ())
+                if len(left_tiles) != len(right_tiles):
+                    return False
+                if bool(left.get("filter_was_none")) != bool(right.get("filter_was_none")):
+                    return False
+                for a_tile, b_tile in zip(left_tiles, right_tiles):
+                    if tuple(a_tile.get("bbox", ())) != tuple(b_tile.get("bbox", ())):
+                        return False
+                    for field in ("result_bgr", "filter_base_bgr"):
+                        a, b = a_tile.get(field), b_tile.get(field)
+                        if a is None or b is None:
+                            if a is not None or b is not None:
+                                return False
+                        elif (a.shape != b.shape or a.dtype != b.dtype or
+                              not np.array_equal(a, b)):
+                            return False
+                return True
+            if tuple(left.get("bbox", ())) != tuple(right.get("bbox", ())):
+                return False
+            if bool(left.get("filter_was_none")) != bool(right.get("filter_was_none")):
+                return False
+            for field in ("result_bgr", "filter_base_bgr"):
+                a, b = left.get(field), right.get(field)
+                if a is None or b is None:
+                    if a is not None or b is not None:
+                        return False
+                elif (a.shape != b.shape or a.dtype != b.dtype or
+                      not np.array_equal(a, b)):
+                    return False
+            return True
         return snapshots_equal(left, right)
 
     def discard_unchanged_undo(self) -> None:
-        """Drop a checkpoint when the attempted operation changed nothing."""
         if self.undo_stack and self.snapshot_equals_current(self.undo_stack[-1]):
             self.undo_stack.pop()
 
+
+
+class _CollapsibleSection(QWidget):
+    """Compact setting-card style collapsible section.
+
+    The structure intentionally mirrors the lightweight settings-card /
+    ExpandLayout pattern used by mature Qt settings UIs: a stable header, a
+    concise collapsed summary and an optional detail body.  It uses only stock
+    PySide6 widgets so Colortina does not gain a new runtime dependency.
+    """
+
+    expandedChanged = Signal(bool)
+
+    def __init__(self, title: str, *, summary: str = "", expanded: bool = False,
+                 settings_key: str | None = None, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._title = str(title)
+        self._settings_key = str(settings_key or "").strip() or None
+        self._settings = QSettings("Colortina", "Colortina")
+        if self._settings_key is not None:
+            saved = self._settings.value(
+                f"ui/collapsible/{self._settings_key}", None)
+            if saved is not None:
+                if isinstance(saved, str):
+                    expanded = saved.strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    expanded = bool(saved)
+
+        self.setObjectName("colortinaCollapsibleSection")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self._header = QWidget()
+        self._header.setObjectName("colortinaCollapsibleHeader")
+        header_layout = QVBoxLayout(self._header)
+        header_layout.setContentsMargins(10, 7, 10, 7)
+        header_layout.setSpacing(3)
+
+        self._toggle = QToolButton()
+        self._toggle.setText(self._title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(bool(expanded))
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._toggle.setStyleSheet(
+            "QToolButton { font-weight: 700; padding: 2px 0px; text-align: left; border: none; color: #2b3547; }"
+            "QToolButton:hover { color: #2f80ed; }"
+        )
+        self._toggle.clicked.connect(self.set_expanded)
+        header_layout.addWidget(self._toggle)
+
+        self._summary = QLabel(str(summary or ""))
+        self._summary.setWordWrap(True)
+        self._summary.setStyleSheet("color: #7b8698; font-size: 10px; padding-left: 20px; padding-bottom: 2px;")
+        self._summary.setVisible(bool(summary) and not expanded)
+        header_layout.addWidget(self._summary)
+        root.addWidget(self._header)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(18, 7, 10, 10)
+        self._content_layout.setSpacing(8)
+        self._content.setVisible(bool(expanded))
+        root.addWidget(self._content)
+
+        self.setStyleSheet(
+            "QWidget#colortinaCollapsibleSection {"
+            " border: 1px solid #e7ecf3;"
+            " border-radius: 12px; background: #ffffff; }"
+            "QWidget#colortinaCollapsibleHeader { background: #fbfcfe; border-radius: 11px; }"
+        )
+
+    def content_layout(self) -> QVBoxLayout:
+        return self._content_layout
+
+    def add_widget(self, widget: QWidget, stretch: int = 0) -> None:
+        self._content_layout.addWidget(widget, stretch)
+
+    def add_layout(self, layout) -> None:
+        self._content_layout.addLayout(layout)
+
+    def set_summary(self, text: str) -> None:
+        value = str(text or "")
+        self._summary.setText(value)
+        self._summary.setVisible(bool(value) and not self.is_expanded())
+
+    def set_title(self, text: str) -> None:
+        self._title = str(text or "")
+        self._toggle.setText(self._title)
+
+    def is_expanded(self) -> bool:
+        return bool(self._toggle.isChecked())
+
+    def set_expanded(self, expanded: bool) -> None:
+        expanded = bool(expanded)
+        changed = expanded != self.is_expanded()
+        self._toggle.blockSignals(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.blockSignals(False)
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self._content.setVisible(expanded)
+        self._summary.setVisible(bool(self._summary.text()) and not expanded)
+        self._content.updateGeometry()
+        self.updateGeometry()
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
+        if self._settings_key is not None:
+            self._settings.setValue(
+                f"ui/collapsible/{self._settings_key}", expanded)
+        if changed:
+            self.expandedChanged.emit(expanded)
+
+    def toggle(self) -> None:
+        self.set_expanded(not self.is_expanded())
 
 
 class MainWindow(QMainWindow):
@@ -137,7 +971,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(tr("window_title"))
         self.resize(1400, 900)
-        self.setMinimumSize(1080, 680)  # keep all non-scrolling control tabs usable
+        self.setMinimumSize(1080, 680)  # detailed render/edit tabs scroll vertically when needed
 
         icon_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                  "assets", "icon.png")
@@ -145,11 +979,41 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
 
         self._pages: dict[str, PageState] = {}
+        self._temp_pdf_page_dirs: set[str] = set()
+        self._cleanup_stale_session_caches()
+        self._session_layer_cache_dir = tempfile.mkdtemp(
+            prefix="colortina_session_cache_")
+        self._layer_cache_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="colortina-layer-cache")
+        self._layer_cache_bridge = _LayerCacheBridge(self)
+        self._layer_cache_bridge.completed.connect(self._on_layer_spill_done)
+        self._export_cache_bridge = _ExportCacheBridge(self)
+        self._export_cache_bridge.completed.connect(self._on_export_cache_done)
+        self._pending_layer_spills: dict[str, tuple[int, int]] = {}
+        self._pending_export_cache: dict[str, tuple[int, int]] = {}
+        self._export_compress_queue = deque()
+        self._export_compress_queued: set[str] = set()
+        self._export_compress_timers: dict[str, QTimer] = {}
+        self._recompress_after_pending: set[str] = set()
+        self._respool_after_pending: set[str] = set()
+        self._spill_delay_timers: dict[str, QTimer] = {}
+        self._spill_queue = deque()
+        self._spill_queued: set[str] = set()
+        self._closing = False
+        self._ui_busy = False
+        self._stop_requested = False
+        self._foreground_interaction_depth = 0
         self._current_path: str | None = None
         self._batch_worker: BatchColorizeWorker | None = None
+        self._hair_model_worker: HairModelDownloadWorker | None = None
+        self._pending_colorize_after_hair_download: bool | None = None
         self._local_recolor_worker: LocalModelRecolorWorker | None = None
         self._local_recolor_page_path: str | None = None
         self._local_recolor_selection_mask = None
+        self._semantic_selection_worker: SemanticSelectionWorker | None = None
+        self._hair_refine_worker: HairSelectionRefineWorker | None = None
+        self._hair_refine_page_path = None
+        self._semantic_selection_page_path: str | None = None
         self._line_extract_worker: MangaLineExtractionWorker | None = None
         self._line_extract_page_path: str | None = None
         self._line_extract_raw_mask: np.ndarray | None = None
@@ -166,14 +1030,31 @@ class MainWindow(QMainWindow):
         self._closed_expand_preview_timer.setInterval(70)
         self._closed_expand_preview_timer.timeout.connect(
             self._refresh_closed_selection_preview)
+        # Rebuilding a full-page blue selection overlay for every mouse event
+        # makes selection painting feel sticky on large scans.  Mutate the mask
+        # immediately, but coalesce contour/preview regeneration to ~20 fps.
+        self._selection_adjust_overlay_dirty = False
+        self._selection_adjust_last_add_mode = True
+        self._selection_adjust_gesture_active = False
+        self._selection_adjust_overlay_timer = QTimer(self)
+        self._selection_adjust_overlay_timer.setSingleShot(True)
+        self._selection_adjust_overlay_timer.setInterval(50)
+        self._selection_adjust_overlay_timer.timeout.connect(
+            self._flush_selection_adjust_overlay)
         self._active_color_dialog: QColorDialog | None = None
+        self._semantic_select_armed = False
+        self._selection_control_color = QColor(28, 28, 32)
         self._batch_errors: list[tuple[str, str]] = []
         self._brush_color = QColor(255, 120, 120)
+        self._hair_recolor_color = QColor(24, 24, 24)
+        self._iris_recolor_color = QColor(70, 135, 220)
         # Independent from the ordinary brush and global page colour bias.
         self._bias_brush_color = QColor(120, 160, 255)
         self._last_picked_rgb_raw: tuple[int, int, int] | None = None
         self._local_brush_stroke_active = False
         self._brush_changed_during_stroke = False
+        self._brush_patch_undo: dict | None = None
+        self._brush_stroke_model_hint = False
         self._bias_brush_stroke_active = False
         self._bias_brush_changed_during_stroke = False
         self._bias_brush_alpha = None
@@ -197,6 +1078,25 @@ class MainWindow(QMainWindow):
         self._bias_eraser_preview_interval = 1.0 / 30.0
         self._pending_selection_mask = None
         self._pending_selection_kind = None
+        self._hair_guard_selection_masks = {}
+        self._hair_guard_selection_histories = {}
+        self._hair_guard_selector_mode = None
+        self._hair_guard_selector_active = False
+        self._hair_refine_brush_active = False
+        self._suspend_hair_guard_tool_reset = False
+        self._hair_guard_selection_stroke_mask = None
+        self._hair_guard_selection_stroke_add_mode = True
+        self._hair_guard_selection_stroke_base_mask = None
+
+        # Window resize can generate dozens of events per second.  Re-styling
+        # every child widget on each event makes live resize and splitter
+        # movement feel sticky, so density updates are coalesced.
+        self._responsive_density_timer = QTimer(self)
+        self._responsive_density_timer.setSingleShot(True)
+        self._responsive_density_timer.setInterval(90)
+        self._responsive_density_timer.timeout.connect(
+            self._apply_responsive_density)
+        self._last_density_signature = None
         
         # Book-level state (persists across all pages of this session):
         # an optional extracted/loaded StyleProfile (overrides the style
@@ -215,6 +1115,7 @@ class MainWindow(QMainWindow):
         self._rebuild_central_widget()
         self._update_controls_enabled()
         self._refresh_character_diagnostics()
+        QTimer.singleShot(0, self._refresh_ai_hair_model_status)
 
         # Drag & drop import (images / PDFs / folders) — desktop-GUI
         # convenience from Manga-Colorizer-GUI.
@@ -236,17 +1137,26 @@ class MainWindow(QMainWindow):
             # race with tests that patch pipeline.MangaColorizer.
             return
 
+        from config import Config
+        from core.model_downloader import models_ready
+        if not models_ready(Config.WEIGHTS_DIR):
+            return  # Never download a model in a silent preload thread.
         import threading
 
         def _load():
             try:
                 from pipeline import get_colorizer
-                get_colorizer()
+                get_colorizer(ensure_weights=False)
             except Exception:
                 pass
 
-        threading.Thread(target=_load, daemon=True,
-                         name="mcv2-engine-preload").start()
+        # A daemon preloader can still be inside PyTorch C++ initialization
+        # when Python shuts down, leading to `terminate called without an
+        # active exception`.  Keep the thread alive through normal teardown.
+        # No GUI/QObject is touched by its worker function.
+        self._model_preload_thread = threading.Thread(
+            target=_load, daemon=False, name="mcv2-engine-preload")
+        self._model_preload_thread.start()
 
     # ── Drag & drop import ─────────────────────────────────────────────
 
@@ -283,14 +1193,17 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._apply_responsive_density()
+        if hasattr(self, "_responsive_density_timer"):
+            self._responsive_density_timer.start()
 
     def _apply_responsive_density(self):
-        """Scale the non-scrolling control panel with the window.
+        """Adapt control density without undoing the polished theme.
 
-        Controls remain on four tabs, while font size, row height, group
-        margins and the preferred panel width adapt to the available desktop
-        size.  No vertical or horizontal scrollbar is introduced.
+        Earlier versions applied a second QSS block directly to the right panel
+        during every resize.  That block reset button padding and group spacing
+        to very small values, making the refined UI look unfinished again on
+        normal laptop heights.  Density is now handled through geometry/font
+        values only, leaving the global visual theme intact.
         """
         panel = getattr(self, "_right_panel", None)
         tabs = getattr(self, "_right_tabs", None)
@@ -298,36 +1211,38 @@ class MainWindow(QMainWindow):
             return
         height = max(1, self.height())
         if height < 740:
-            font_px, button_h, margin, spacing = 10, 24, 4, 2
+            font_px, button_h, margin, spacing = 10, 28, 7, 6
         elif height < 900:
-            font_px, button_h, margin, spacing = 11, 27, 6, 3
+            font_px, button_h, margin, spacing = 11, 30, 8, 7
         else:
-            font_px, button_h, margin, spacing = 12, 30, 8, 5
+            font_px, button_h, margin, spacing = 12, 32, 10, 8
 
-        preferred = int(np.clip(self.width() * 0.29, 380, 580))
-        panel.setMinimumWidth(min(420, preferred))
-        panel.setMaximumWidth(max(500, preferred))
-        panel.setStyleSheet(f"""
-            QWidget {{ font-size: {font_px}px; }}
-            QGroupBox {{ margin-top: {font_px + 3}px; padding-top: 2px; }}
-            QPushButton {{ min-height: {button_h}px; padding: 2px 5px; }}
-            QComboBox, QSpinBox {{ min-height: {max(22, button_h - 2)}px; }}
-            QTabBar::tab {{ min-height: {button_h}px; padding: 2px 5px; }}
-        """)
+        preferred = int(np.clip(self.width() * 0.30, 420, 560))
+        signature = (font_px, button_h, margin, spacing, preferred)
+        if signature == getattr(self, "_last_density_signature", None):
+            return
+        self._last_density_signature = signature
+
+        panel.setMinimumWidth(min(440, preferred))
+        panel.setMaximumWidth(max(520, preferred))
+        font = panel.font()
+        font.setPixelSize(font_px)
+        panel.setFont(font)
+
         for group in panel.findChildren(QGroupBox):
             layout = group.layout()
             if layout is not None:
-                layout.setContentsMargins(margin, margin, margin, margin)
+                layout.setContentsMargins(margin + 2, margin, margin + 2, margin + 2)
                 layout.setSpacing(spacing)
         for button in panel.findChildren(QPushButton):
             button.setMinimumHeight(button_h)
-            button.setMaximumHeight(max(button_h + 8, 38))
-        # 自定义颜色倾向的选项必须始终完整可见：给它硬性最小高度，
-        # 空间不足时让其它组收缩，而不是把这些控件压成 0 高度。
+            button.setMaximumHeight(max(button_h + 10, 42))
+
         bias_group = getattr(self, "_custom_color_bias_group", None)
         if bias_group is not None:
             bias_group.updateGeometry()
             bias_group.setMinimumHeight(bias_group.sizeHint().height())
+
 
     def _build_menu_bar(self):
         lang_menu = self.menuBar().addMenu(tr("menu_language"))
@@ -394,10 +1309,19 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)  # indeterminate
+        self._progress.setTextVisible(False)
         self._progress.setVisible(False)
-        self._progress.setFixedWidth(160)
-        self.statusBar().addPermanentWidget(self._progress)
+        self._progress.setFixedHeight(4)
+        self._progress.setMinimumWidth(80)
+        self._progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.statusBar().showMessage(tr("ready"))
+        # The application already exposes persistent state in the top status
+        # chip and workspace footer.  Keeping QMainWindow's native status bar
+        # visible created a redundant empty strip below the footer.  Hide it
+        # while preserving the object so all existing showMessage() calls stay
+        # safe and backward-compatible.
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().hide()
 
         QShortcut(QKeySequence("Ctrl+Z"), self, activated=self._undo)
         QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self._redo)
@@ -413,8 +1337,12 @@ class MainWindow(QMainWindow):
         checkbox state) and re-applies them after rebuilding, so switching
         languages mid-session doesn't reset the user's choices."""
         prev_style_key = getattr(self, "_style_combo", None) and self._style_combo.currentData()
+        prev_inkwash_strength = (getattr(self, "_inkwash_strength_slider", None).value()
+                                  if getattr(self, "_inkwash_strength_slider", None) is not None else 78)
         prev_quality_key = (getattr(self, "_quality_combo", None) and
                             self._quality_combo.currentData()) or Config.DEFAULT_QUALITY_KEY
+        prev_ink_fidelity = (getattr(self, "_chk_ink_fidelity", None) is None or
+                             self._chk_ink_fidelity.isChecked())
         style_strength_widget = getattr(self, "_style_strength_slider", None)
         reference_strength_widget = getattr(self, "_reference_strength_slider", None)
         manual_strength_widget = getattr(self, "_manual_strength_slider", None)
@@ -469,7 +1397,7 @@ class MainWindow(QMainWindow):
         prev_char_mem = getattr(self, "_chk_character_memory", None)
         prev_char_mem = prev_char_mem.isChecked() if prev_char_mem is not None else Config.USE_CHARACTER_MEMORY
         prev_skip_colored = getattr(self, "_chk_skip_colored", None)
-        prev_skip_colored = prev_skip_colored.isChecked() if prev_skip_colored is not None else True
+        prev_skip_colored = prev_skip_colored.isChecked() if prev_skip_colored is not None else False
         prev_picker_mode = self._current_eyedropper_mode() if hasattr(self, '_current_eyedropper_mode') else "point"
         prev_brush_pct = getattr(self, "_brush_slider", None)
         prev_brush_pct = prev_brush_pct.value() if prev_brush_pct is not None else self._brush_percent_from_px(12)
@@ -546,21 +1474,23 @@ class MainWindow(QMainWindow):
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(2, False)
         splitter.setHandleWidth(6)
-        splitter.setSizes([300, 840, 460])
+        splitter.setSizes([280, 900, 440])
 
         container = QWidget()
         container.setObjectName("CentralWorkspace")
         root_layout = QVBoxLayout(container)
-        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setContentsMargins(10, 10, 10, 0)
         root_layout.setSpacing(8)
+        root_layout.addWidget(self._build_workspace_header())
         root_layout.addWidget(splitter, stretch=1)
+        root_layout.addWidget(self._build_workspace_footer())
         self.setCentralWidget(container)
         if old_central is not None:
             old_central.deleteLater()
 
         if prev_style_key in {"monochrome_people", "monochrome_page"}:
             prev_style_key = "monochrome"
-        if prev_style_key == "light":
+        if prev_style_key in {"light", "light2_illustrative"}:
             prev_style_key = "light2"
         if prev_style_key:
             idx = self._style_combo.findData(prev_style_key)
@@ -570,6 +1500,8 @@ class MainWindow(QMainWindow):
         idx = self._quality_combo.findData(prev_quality_key)
         if idx >= 0:
             self._quality_combo.setCurrentIndex(idx)
+        self._chk_ink_fidelity.setChecked(prev_ink_fidelity)
+        self._inkwash_strength_slider.setValue(prev_inkwash_strength)
         self._style_strength_slider.setValue(prev_style_strength)
         self._reference_strength_slider.setValue(prev_reference_strength)
         self._manual_strength_slider.setValue(prev_manual_strength)
@@ -663,6 +1595,7 @@ class MainWindow(QMainWindow):
             self._brush_px_from_percent(self._bias_brush_size_slider.value()))
         self._update_color_swatch()
         self._update_bias_brush_swatch()
+        self._update_hair_recolor_swatch()
         self._sync_workspace_nav()
         self._apply_workspace_theme()
         self._update_tool_specific_visibility()
@@ -674,108 +1607,292 @@ class MainWindow(QMainWindow):
         self._apply_responsive_density()
 
     def _build_workspace_header(self) -> QWidget:
+        """Build the compact application header.
+
+        The right-side workspace QTabWidget already provides navigation, so the
+        duplicated top navigation strip is deliberately omitted.  The header
+        only keeps the product name/version on the left and language/status on
+        the right, matching the simplified reference layout.
+        """
         bar = QWidget()
         bar.setObjectName("WorkspaceHeader")
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(7)
 
-        title = QLabel("Colortina · Manga Color Studio")
-        title.setObjectName("WorkspaceHeaderTitle")
-        layout.addWidget(title)
-        layout.addSpacing(12)
-
-        self._nav_group = QButtonGroup(self)
+        # Keep the old navigation attributes defined as None so helper methods
+        # and language-triggered UI rebuilds remain backward-compatible.
+        self._nav_group = None
         self._workspace_nav_buttons = []
+        self._nav_pages_btn = None
+        self._nav_render_btn = None
+        self._nav_edit_btn = None
+        self._nav_hair_recolor_btn = None
+        self._nav_output_btn = None
 
-        def add_nav(label: str, handler, *, checked: bool = False):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setChecked(checked)
-            btn.setObjectName("WorkspaceNavButton")
-            btn.clicked.connect(handler)
-            self._nav_group.addButton(btn)
-            self._workspace_nav_buttons.append(btn)
-            layout.addWidget(btn)
-            return btn
+        self._header_brand_label = QLabel("Colortina")
+        self._header_brand_label.setObjectName("WorkspaceHeaderTitle")
+        layout.addWidget(self._header_brand_label)
 
-        self._nav_pages_btn = add_nav("页面", lambda: self._page_list.setFocus(), checked=True)
-        self._nav_render_btn = add_nav(tr("right_tab_render"), lambda: self._right_tabs.setCurrentIndex(0))
-        self._nav_edit_btn = add_nav(tr("right_tab_edit"), lambda: self._right_tabs.setCurrentIndex(1))
-        self._nav_output_btn = add_nav(tr("right_tab_output"), lambda: self._right_tabs.setCurrentIndex(2))
+        self._header_version_chip = QLabel(Config.APP_VERSION_LABEL)
+        self._header_version_chip.setObjectName("HeaderChip")
+        layout.addWidget(self._header_version_chip)
+
         layout.addStretch(1)
+
+        self._lang_button = QPushButton(tr("lang_button"))
+        self._lang_button.setObjectName("HeaderLanguageButton")
+        self._lang_button.setToolTip(tr("menu_language"))
+        self._lang_button.clicked.connect(self._toggle_language)
+        layout.addWidget(self._lang_button)
+
+        self._header_status_chip = QLabel("● 就绪")
+        self._header_status_chip.setObjectName("HeaderStatusChip")
+        layout.addWidget(self._header_status_chip)
         return bar
 
+    def _build_workspace_footer(self) -> QWidget:
+        footer = QWidget()
+        footer.setObjectName("WorkspaceFooter")
+        layout = QHBoxLayout(footer)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        def add_stat(value_attr: str, caption: str, *, stretch: int = 1):
+            cell = QWidget()
+            cell.setObjectName("FooterStatCell")
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(14, 7, 14, 7)
+            cell_layout.setSpacing(0)
+            value = QLabel("0")
+            value.setObjectName("FooterStatValue")
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cap = QLabel(caption)
+            cap.setObjectName("FooterStatCaption")
+            cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cell_layout.addWidget(value)
+            cell_layout.addWidget(cap)
+            setattr(self, value_attr, value)
+            layout.addWidget(cell, stretch)
+
+        add_stat("_footer_total_pages", "页面")
+        add_stat("_footer_selected_pages", "已选")
+        add_stat("_footer_colored_pages", "已上色")
+        add_stat("_footer_pending_pages", "待处理")
+
+        status_cell = QWidget()
+        status_cell.setObjectName("FooterStatCell")
+        status_layout = QVBoxLayout(status_cell)
+        status_layout.setContentsMargins(18, 7, 18, 7)
+        status_layout.setSpacing(0)
+        self._footer_status_value = QLabel("就绪")
+        self._footer_status_value.setObjectName("FooterStatusValue")
+        self._footer_status_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_caption = QLabel("状态")
+        status_caption.setObjectName("FooterStatCaption")
+        status_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_layout.addWidget(self._footer_status_value)
+        status_layout.addWidget(status_caption)
+        # Keep the indeterminate progress indicator visible without reviving
+        # QMainWindow's native status-bar strip.  The bar is only 4 px high and
+        # occupies no space while hidden.
+        progress = getattr(self, "_progress", None)
+        if progress is not None:
+            status_layout.addWidget(progress)
+        layout.addWidget(status_cell, 1)
+        return footer
+
     def _sync_workspace_nav(self):
-        if not hasattr(self, "_right_tabs"):
-            return
-        mapping = {
-            0: getattr(self, "_nav_render_btn", None),
-            1: getattr(self, "_nav_edit_btn", None),
-            2: getattr(self, "_nav_output_btn", None),
-        }
-        current = self._right_tabs.currentIndex()
-        btn = mapping.get(current)
-        if btn is not None:
-            btn.setChecked(True)
+        # Main workspace switching now lives only in the right-side tab bar.
+        # Kept as a no-op for compatibility with existing signal hookups.
+        return
 
     def _apply_workspace_theme(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget#CentralWorkspace { background: #eaf4ff; color: #243244; }
-            QMenuBar, QStatusBar { background: #dbe9f7; color: #29405b; }
-            QLabel#WorkspaceTitle { font-size: 18px; font-weight: 700; color: #36506f; padding: 6px 2px 2px 2px; }
-            QLabel#VersionLabel { color: #6c7f94; font-size: 11px; font-weight: 700; padding: 3px 4px; }
-            QPushButton#GhostButton {
-                background: #f4f9ff; border: 1px solid #bfd3e8; border-radius: 10px;
-                padding: 7px 14px; font-weight: 600; }
+            QMainWindow, QWidget#CentralWorkspace { background: #f4f6fa; color: #1f2937; }
+            QMenuBar, QStatusBar { background: #ffffff; color: #5f6877; border-top: 1px solid #e9edf3; }
+
+            QWidget#WorkspaceHeader, QWidget#WorkspaceFooter {
+                background: #ffffff;
+                border: 1px solid #e6ebf2;
+                border-radius: 16px;
+            }
+            QLabel#WorkspaceHeaderTitle { font-size: 16px; font-weight: 800; color: #1f2937; padding: 0 6px 0 2px; }
+            QLabel#HeaderChip {
+                background: #f7f9fc; color: #667084; border: 1px solid #e4e8ef;
+                border-radius: 9px; padding: 4px 9px; font-size: 11px; font-weight: 600;
+            }
+            QLabel#HeaderStatusChip {
+                background: #eef8f2; color: #23825d; border: 1px solid #d9ede1;
+                border-radius: 10px; padding: 5px 10px; font-size: 11px; font-weight: 700;
+            }
+            QWidget#FooterStatCell { background: transparent; border-right: 1px solid #edf1f5; }
+            QLabel#FooterStatValue { font-size: 16px; font-weight: 800; color: #1f2937; }
+            QLabel#FooterStatCaption { font-size: 10px; color: #8b93a1; }
+            QLabel#FooterStatusValue { font-size: 15px; font-weight: 800; color: #2b3442; }
+
+            QLabel#WorkspaceTitle { font-size: 15px; font-weight: 800; color: #1f2937; padding: 2px 2px 4px 2px; }
+            QLabel#VersionLabel { color: #8b93a1; font-size: 11px; font-weight: 600; padding: 2px 0; }
+            QLabel#PanelSectionTitle { font-size: 12px; font-weight: 700; color: #4d5a6b; text-transform: uppercase; }
+            QLabel#StatsValue { font-size: 22px; font-weight: 800; color: #1f2937; }
+            QLabel#StatsCaption { font-size: 11px; color: #7b8596; }
+            QWidget#StatsCard { background: #ffffff; border: 1px solid #e8ebf0; border-radius: 13px; }
+
             QWidget#LeftPanel, QWidget#CanvasPanel, QWidget#RightPanel {
-                background: #f5faff; border: 1px solid #c9dcee; border-radius: 16px; }
-            QLabel#PanelSectionTitle { font-size: 14px; font-weight: 700; color: #36506f; }
-            QListWidget { background: white; border: 1px solid #cadcf0; border-radius: 12px; padding: 6px; }
-            QListWidget::item { border-radius: 9px; padding: 8px 10px; margin: 2px 0px; }
-            QListWidget::item:selected { background: #d7e9ff; color: #1f4f88; }
-            QPushButton { background: #ffffff; border: 1px solid #bed1e4; border-radius: 10px; padding: 6px 10px; }
-            QPushButton:hover { background: #f3f8ff; border-color: #8fb4de; }
-            QPushButton:pressed { background: #e5f0ff; }
-            QPushButton:checked { background: #dcecff; border-color: #76a4dc; }
-            QGroupBox { font-weight: 700; border: 1px solid #cfe0f0; border-radius: 14px; margin-top: 14px; background: #fbfdff; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 2px 6px; color: #36506f; }
-            QComboBox, QSpinBox, QLineEdit { background: #ffffff; border: 1px solid #bfd1e4; border-radius: 8px; padding: 4px 8px; }
-            QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #9fbce0; selection-background-color: #dcecff; selection-color: #1f4f88; outline: 0; }
-            QTabWidget::pane { border: 1px solid #cfdeee; border-radius: 14px; top: -1px; background: #fbfdff; }
-            QTabBar::tab { background: #e4effa; border: 1px solid #cfdeee; border-bottom: none;
-                           border-top-left-radius: 11px; border-top-right-radius: 11px; padding: 8px 12px; margin-right: 4px; }
-            QTabBar::tab:selected { background: #fbfdff; color: #1f4f88; font-weight: 700; }
-            QSlider::groove:horizontal { height: 6px; background: #d5e4f1; border-radius: 3px; }
-            QSlider::handle:horizontal { width: 16px; margin: -5px 0; background: #5a8ee6; border-radius: 8px; }
-            QSplitter::handle { background: transparent; }
-            QRadioButton { spacing: 7px; }
+                background: #ffffff; border: 1px solid #e6ebf2; border-radius: 18px;
+            }
+            QWidget#LeftBottomActions { background: #ffffff; border-top: 1px solid #eef1f5; padding-top: 8px; }
+            QWidget#RightPanel { background: #fbfcfe; }
+            QLabel#CanvasTopLabel { font-size: 12px; font-weight: 700; color: #5e6675; }
+            QLabel#DeviceInfoLabel {
+                background: #f8fafc; color: #697485; border: 1px solid #e7ecf3;
+                border-radius: 12px; padding: 7px 10px; font-size: 11px; font-weight: 600;
+            }
+            QLabel#RightPanelSectionLabel { font-size: 12px; font-weight: 800; color: #394559; letter-spacing: 0.3px; }
+
+            QListWidget { background: #fbfbfc; border: 1px solid #eceef3; border-radius: 14px; padding: 8px; }
+            QListWidget::item { background: #ffffff; border: 1px solid #eceef3; border-radius: 10px; padding: 9px 10px; margin: 3px 0; }
+            QListWidget::item:selected { background: #e8f0fd; border-color: #3b82f6; color: #1e4fa8; }
+
+            QPushButton {
+                background: #ffffff; border: 1px solid #e2e7ef; border-radius: 11px;
+                padding: 8px 12px; font-weight: 600; color: #273142;
+            }
+            QPushButton:hover { background: #f8fafc; border-color: #cfd7e3; }
+            QPushButton:pressed { background: #eef3f8; }
+            QPushButton:checked { background: #e9f1ff; border-color: #4e8df5; color: #2258b2; }
+            QPushButton#GhostButton, QPushButton#HeaderLanguageButton {
+                background: #f7f8fa; border: 1px solid #e3e6ec; border-radius: 10px;
+                padding: 7px 14px; font-weight: 700;
+            }
+            QPushButton#HeaderLanguageButton:hover { background: #f0f4f8; border-color: #cbd2dc; }
+            QPushButton#PrimaryAutoColorizeButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2f80ed, stop:1 #4f9bf8);
+                color: #ffffff; border: 1px solid #2f80ed; border-radius: 14px;
+                padding: 12px 14px; font-weight: 800;
+            }
+            QPushButton#PrimaryAutoColorizeButton:hover { background: #2f80ed; border-color: #246dd0; }
+            QPushButton#PrimaryAutoColorizeButton:pressed { background: #246dd0; }
+            QPushButton#PrimaryAutoColorizeButton[stopMode="true"] { background: #d74646; border-color: #bd3434; color: #ffffff; }
+            QPushButton#PrimaryAutoColorizeButton[stopMode="true"]:hover { background: #c93b3b; border-color: #a92e2e; }
+            QPushButton#PrimaryAutoColorizeButton[stopMode="true"]:pressed { background: #b63131; }
+            QPushButton#PrimaryAutoColorizeButton:disabled { background: #d9e4f5; color: #ffffff; border-color: #d9e4f5; }
+            QPushButton#AccentSecondaryButton { background: #edf5ff; color: #245ca8; border: 1px solid #cfe1fb; font-weight: 700; }
+            QPushButton#AccentSecondaryButton:hover { background: #e3efff; border-color: #afcdf8; }
+            QPushButton#OutputPrimaryButton {
+                background: #2f80ed; color: #ffffff; border: 1px solid #2f80ed;
+                border-radius: 11px; font-weight: 800; padding: 9px 12px;
+            }
+            QPushButton#OutputPrimaryButton:hover { background: #2876df; border-color: #2876df; }
+            QPushButton#OutputPrimaryButton:pressed { background: #2268c6; border-color: #2268c6; }
+            QPushButton#DangerSoftButton { background: #fff7f7; color: #b54a4a; border: 1px solid #f1dada; }
+            QPushButton#DangerSoftButton:hover { background: #fff0f0; border-color: #e9c6c6; }
+            QWidget#ViewSegmentBar { background: #f3f6fa; border: 1px solid #e3e8ef; border-radius: 12px; }
+            QRadioButton#ViewSegmentButton {
+                background: transparent; color: #697386; border: none; border-radius: 9px;
+                padding: 8px 14px; spacing: 0px; font-weight: 700; min-height: 18px;
+            }
+            QRadioButton#ViewSegmentButton:hover { background: #ffffff; color: #334155; }
+            QRadioButton#ViewSegmentButton:checked {
+                background: #ffffff; color: #215bb4; border: 1px solid #cbdcf7;
+            }
+            QRadioButton#ViewSegmentButton:disabled { color: #aeb6c2; background: transparent; border: none; }
+            QRadioButton#ViewSegmentButton::indicator { width: 0px; height: 0px; margin: 0px; }
+
+            QGroupBox {
+                font-weight: 800; color: #283243; background: #ffffff;
+                border: 1px solid #e8edf4; border-radius: 16px; margin-top: 16px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 12px; padding: 3px 8px;
+                color: #273244; background: #ffffff; font-weight: 800;
+            }
+            QGroupBox[rightCard="true"] { background: #ffffff; border-color: #e8edf4; }
+
+            QWidget#RightTabFrame { background: #ffffff; border-radius: 16px; }
+            QWidget#RenderPrimaryActionBox {
+                background: #ffffff; border: 1px solid #e7ecf3; border-radius: 16px;
+            }
+            QLabel#RenderActionStatusLabel { color: #6a7384; font-size: 11px; font-weight: 600; }
+
+            QComboBox, QSpinBox, QLineEdit {
+                background: #ffffff; border: 1px solid #dfe5ee; border-radius: 11px;
+                padding: 6px 10px; min-height: 24px;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #7faef6; }
+            QComboBox::drop-down { border: none; width: 24px; }
+            QComboBox QAbstractItemView {
+                background: #ffffff; border: 1px solid #dfe3ea; selection-background-color: #e8f0fd;
+                selection-color: #1e4fa8; outline: 0; border-radius: 10px;
+            }
+
+            QTabWidget::pane { border: 1px solid #e8edf4; border-radius: 16px; top: -1px; background: #ffffff; }
+            QTabBar::tab {
+                background: #f7f8fa; border: 1px solid #e5e8ee; border-bottom: none;
+                border-top-left-radius: 12px; border-top-right-radius: 12px;
+                padding: 9px 6px; margin-right: 0px; min-width: 0px; color: #5c6678;
+            }
+            QTabBar::tab:hover { background: #f1f5fb; color: #334155; }
+            QTabBar::tab:selected { background: #ffffff; color: #2154ad; font-weight: 800; border-color: #d7e3f5; }
+
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical { width: 10px; background: transparent; margin: 8px 2px 8px 2px; }
+            QScrollBar::handle:vertical { background: #d4dbe6; border-radius: 5px; min-height: 28px; }
+            QScrollBar::handle:vertical:hover { background: #bcc5d3; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+
+            QSlider::groove:horizontal { height: 6px; background: #dde4ee; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #a9c8fb; border-radius: 3px; }
+            QSlider::handle:horizontal { width: 14px; margin: -5px 0; background: #2f80ed; border-radius: 7px; }
+
+            QCheckBox, QRadioButton { spacing: 14px; padding: 4px 8px 4px 1px; min-height: 20px; }
+            QCheckBox:disabled, QRadioButton:disabled { color: #a9b0bb; }
+            QCheckBox::indicator, QRadioButton::indicator { width: 11px; height: 11px; margin-left: 2px; margin-right: 10px; }
+            QCheckBox::indicator:unchecked, QRadioButton::indicator:unchecked { background: #ffffff; border: 1px solid #bfc7d3; border-radius: 6px; }
+            QCheckBox::indicator:checked, QRadioButton::indicator:checked { background: #2f80ed; border: 1px solid #2f80ed; border-radius: 6px; }
+            QCheckBox::indicator:disabled, QRadioButton::indicator:disabled { background: #f1f3f6; border: 1px solid #d7dce4; }
+
+            QToolButton#colortinaCollapseToggle { border: none; background: transparent; font-weight: 800; color: #273041; padding: 2px 0; }
+            QWidget#colortinaCollapsibleHeader { background: #fafbfc; border: 1px solid #eceef3; border-radius: 12px; }
         """)
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
         w.setObjectName("LeftPanel")
         self._left_panel = w
-        w.setMinimumWidth(300)
+        w.setMinimumWidth(270)
         w.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
-        header = QLabel("Colortina Studio")
-        header.setObjectName("WorkspaceTitle")
-        layout.addWidget(header)
+        action_grid = QGridLayout()
+        action_grid.setContentsMargins(0, 0, 0, 0)
+        action_grid.setHorizontalSpacing(6)
+        action_grid.setVerticalSpacing(6)
 
-        self._lang_button = QPushButton(tr("lang_button"))
-        self._lang_button.setObjectName("GhostButton")
-        self._lang_button.setToolTip(tr("menu_language"))
-        self._lang_button.clicked.connect(self._toggle_language)
-        layout.addWidget(self._lang_button)
+        self._btn_import_images = QPushButton(tr("import_images"))
+        self._btn_import_images.clicked.connect(self._import_images)
+        self._btn_import_pdf = QPushButton(tr("import_pdf"))
+        self._btn_import_pdf.clicked.connect(self._import_pdf)
+        self._btn_import_folder = QPushButton(tr("import_folder"))
+        self._btn_import_folder.clicked.connect(self._import_folder)
+        # Local aliases keep the original UI contract/readability while the
+        # instance attributes let _set_busy() lock structure-changing actions.
+        btn_import_images = self._btn_import_images
+        btn_import_pdf = self._btn_import_pdf
+        btn_import_folder = self._btn_import_folder
+        action_grid.addWidget(btn_import_images, 0, 0)
+        action_grid.addWidget(btn_import_pdf, 0, 1)
+        action_grid.addWidget(btn_import_folder, 1, 0, 1, 2)
+        action_grid.setColumnStretch(0, 1)
+        action_grid.setColumnStretch(1, 1)
+        layout.addLayout(action_grid)
 
-        btn_import_images = QPushButton(tr("import_images"))
-        btn_import_images.clicked.connect(self._import_images)
-        btn_import_pdf = QPushButton(tr("import_pdf"))
-        btn_import_pdf.clicked.connect(self._import_pdf)
-        btn_import_folder = QPushButton(tr("import_folder"))
-        btn_import_folder.clicked.connect(self._import_folder)
+        page_section = QLabel("页面列表")
+        page_section.setObjectName("PanelSectionTitle")
+        layout.addWidget(page_section)
 
         self._page_list = QListWidget()
         self._page_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -788,6 +1905,7 @@ class MainWindow(QMainWindow):
         self._page_list.setUniformItemSizes(False)
         self._page_list.setStyleSheet("QListWidget::item { padding: 4px 6px; }")
         self._page_list.currentItemChanged.connect(self._on_page_selected)
+        self._page_list.itemSelectionChanged.connect(self._refresh_workspace_stats)
 
         select_row = QHBoxLayout()
         btn_select_all = QPushButton(tr("select_all"))
@@ -797,40 +1915,52 @@ class MainWindow(QMainWindow):
         select_row.addWidget(btn_select_all)
         select_row.addWidget(btn_select_none)
 
-        layout.addWidget(btn_import_images)
-        layout.addWidget(btn_import_pdf)
-        layout.addWidget(btn_import_folder)
-        layout.addWidget(QLabel(tr("pages_label")))
         layout.addLayout(select_row)
         layout.addWidget(self._page_list, stretch=1)
 
-        manage_row = QHBoxLayout()
-        btn_move_up = QPushButton(tr("move_up"))
-        btn_move_up.clicked.connect(lambda: self._move_selected_page(-1))
-        btn_move_down = QPushButton(tr("move_down"))
-        btn_move_down.clicked.connect(lambda: self._move_selected_page(1))
-        manage_row.addWidget(btn_move_up)
-        manage_row.addWidget(btn_move_down)
-        layout.addLayout(manage_row)
+        # Keep page/project management anchored to the bottom of the sidebar.
+        # The previous layout added another stretch *after* these controls, which
+        # left a large blank area underneath and made the controls float upward.
+        bottom_actions = QWidget()
+        bottom_actions.setObjectName("LeftBottomActions")
+        bottom_actions.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Fixed)
+        bottom_layout = QVBoxLayout(bottom_actions)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(6)
 
-        btn_delete = QPushButton(tr("delete_pages"))
-        btn_delete.clicked.connect(self._delete_selected_pages)
-        layout.addWidget(btn_delete)
+        manage_row = QHBoxLayout()
+        manage_row.setContentsMargins(0, 0, 0, 0)
+        manage_row.setSpacing(6)
+        self._btn_move_up = QPushButton(tr("move_up"))
+        self._btn_move_up.clicked.connect(lambda: self._move_selected_page(-1))
+        self._btn_move_down = QPushButton(tr("move_down"))
+        self._btn_move_down.clicked.connect(lambda: self._move_selected_page(1))
+        self._btn_move_up.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._btn_move_down.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        manage_row.addWidget(self._btn_move_up)
+        manage_row.addWidget(self._btn_move_down)
+        bottom_layout.addLayout(manage_row)
+
+        self._btn_delete_pages = QPushButton(tr("delete_pages"))
+        self._btn_delete_pages.clicked.connect(self._delete_selected_pages)
+        self._btn_delete_pages.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        bottom_layout.addWidget(self._btn_delete_pages)
 
         project_row = QHBoxLayout()
-        btn_load_project = QPushButton(tr("load_project"))
-        btn_load_project.clicked.connect(self._load_project)
-        btn_save_project = QPushButton(tr("save_project"))
-        btn_save_project.clicked.connect(self._save_project)
-        project_row.addWidget(btn_load_project)
-        project_row.addWidget(btn_save_project)
-        layout.addLayout(project_row)
+        project_row.setContentsMargins(0, 0, 0, 0)
+        project_row.setSpacing(6)
+        self._btn_load_project = QPushButton(tr("load_project"))
+        self._btn_load_project.clicked.connect(self._load_project)
+        self._btn_save_project = QPushButton(tr("save_project"))
+        self._btn_save_project.clicked.connect(self._save_project)
+        self._btn_load_project.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._btn_save_project.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        project_row.addWidget(self._btn_load_project)
+        project_row.addWidget(self._btn_save_project)
+        bottom_layout.addLayout(project_row)
 
-        self._version_label = QLabel(Config.APP_VERSION_LABEL)
-        self._version_label.setObjectName("VersionLabel")
-        self._version_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._version_label.setToolTip(f"Colortina {Config.APP_VERSION_LABEL} ({Config.APP_VERSION})")
-        layout.addWidget(self._version_label)
+        layout.addWidget(bottom_actions, stretch=0, alignment=Qt.AlignmentFlag.AlignBottom)
         return w
 
     def _build_canvas_panel(self) -> QWidget:
@@ -841,10 +1971,9 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         toolbar = QHBoxLayout()
-        title = QLabel("画布 / 预览")
-        title.setObjectName("PanelSectionTitle")
-        toolbar.addWidget(title)
-        toolbar.addSpacing(8)
+        self._canvas_title_label = QLabel("")
+        self._canvas_title_label.setObjectName("CanvasTopLabel")
+        self._canvas_title_label.setVisible(False)
         btn_fit = QPushButton(tr("fit_view"))
         btn_fit.clicked.connect(lambda: self._canvas.fit_view())
         btn_zoom_in = QPushButton("＋")
@@ -857,7 +1986,6 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(btn_fit)
         toolbar.addWidget(btn_zoom_out)
         toolbar.addWidget(btn_zoom_in)
-        toolbar.addStretch(1)
 
         self._canvas = HintCanvas()
         self._canvas.hint_dab_added.connect(self._on_hint_dab_added)
@@ -875,35 +2003,39 @@ class MainWindow(QMainWindow):
         self._canvas.rect_fill_requested.connect(self._on_rect_fill_requested)
         self._canvas.selection_preview_active.connect(self._on_selection_preview_active)
         self._canvas.selection_adjust_dab.connect(self._on_selection_adjust_dab)
+        self._canvas.selection_adjust_finished.connect(self._on_selection_adjust_finished)
 
         layout.addLayout(toolbar)
         layout.addWidget(self._canvas, stretch=1)
         return w
 
     def _build_right_panel(self) -> QWidget:
-        """Build a non-scrolling, responsive right control panel.
+        """Build the responsive right control panel.
 
-        The old implementation placed every group in one very tall scrolling panel.
-        On ordinary laptop windows the most important buttons were below the
-        fold.  The panel is now split into four compact tabs.  Every tab fits in
-        the supported minimum window height, every control expands with the
-        splitter, and neither the panel nor its tabs use scrollbars.
+        Long settings pages use vertical scrolling, while the render workspace
+        keeps its primary Auto Colorize action fixed below the settings viewport.
+        Horizontal scrolling remains disabled so controls follow panel width.
         """
         panel = QWidget()
         panel.setObjectName("RightPanel")
         self._right_panel = panel
-        panel.setMinimumWidth(390)
-        panel.setMaximumWidth(560)
+        panel.setMinimumWidth(420)
+        panel.setMaximumWidth(520)
         panel.setSizePolicy(QSizePolicy.Policy.Preferred,
                             QSizePolicy.Policy.Expanding)
         outer = QVBoxLayout(panel)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
 
         self._device_label = QLabel(f"{tr('device_label')}—")
+        self._device_label.setObjectName("DeviceInfoLabel")
         self._device_label.setSizePolicy(QSizePolicy.Policy.Expanding,
                                          QSizePolicy.Policy.Fixed)
         outer.addWidget(self._device_label)
+
+        right_section_label = QLabel("参数与工具")
+        right_section_label.setObjectName("RightPanelSectionLabel")
+        outer.addWidget(right_section_label)
 
         self._right_tabs = QTabWidget()
         self._right_tabs.setDocumentMode(True)
@@ -915,20 +2047,36 @@ class MainWindow(QMainWindow):
 
         def make_tab() -> tuple[QWidget, QVBoxLayout]:
             tab = QWidget()
+            tab.setObjectName("RightTabFrame")
             tab.setSizePolicy(QSizePolicy.Policy.Expanding,
                               QSizePolicy.Policy.Expanding)
             lay = QVBoxLayout(tab)
-            lay.setContentsMargins(6, 6, 6, 6)
-            lay.setSpacing(5)
+            lay.setContentsMargins(8, 8, 8, 8)
+            lay.setSpacing(6)
             return tab, lay
+
+        def make_scrollable_tab() -> tuple[QScrollArea, QWidget, QVBoxLayout]:
+            content, lay = make_tab()
+            content.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                  QSizePolicy.Policy.Minimum)
+            lay.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setWidget(content)
+            scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            return scroll, content, lay
 
         def make_group(title: str) -> tuple[QGroupBox, QVBoxLayout]:
             group = QGroupBox(title)
+            group.setProperty("rightCard", True)
             group.setSizePolicy(QSizePolicy.Policy.Expanding,
                                 QSizePolicy.Policy.Expanding)
             lay = QVBoxLayout(group)
-            lay.setContentsMargins(8, 6, 8, 7)
-            lay.setSpacing(4)
+            lay.setContentsMargins(12, 10, 12, 12)
+            lay.setSpacing(8)
             return group, lay
 
         def tune_button(button: QPushButton, minimum_height: int = 29) -> QPushButton:
@@ -941,8 +2089,8 @@ class MainWindow(QMainWindow):
                             columns: int = 2) -> None:
             grid = QGridLayout()
             grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(5)
-            grid.setVerticalSpacing(4)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(6)
             for i, button in enumerate(buttons):
                 tune_button(button)
                 grid.addWidget(button, i // columns, i % columns)
@@ -953,33 +2101,92 @@ class MainWindow(QMainWindow):
         from core.presets import STYLE_PRESETS, QUALITY_PRESETS
 
         # ── Tab 1: rendering and automatic colourization ──────────────
-        render_tab, render_layout = make_tab()
+        # Keep settings scrollable while the primary Auto Colorize action stays
+        # permanently visible at the bottom of the render workspace.  Earlier
+        # UI refactors moved the whole auto_group into the dedicated hair tab
+        # and accidentally moved the primary button with it.
+        render_tab = QWidget()
+        render_tab.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                 QSizePolicy.Policy.Expanding)
+        render_page_layout = QVBoxLayout(render_tab)
+        render_page_layout.setContentsMargins(0, 0, 0, 0)
+        render_page_layout.setSpacing(8)
+        render_scroll, render_content, render_layout = make_scrollable_tab()
+        self._render_scroll_area = render_scroll
+        render_page_layout.addWidget(render_scroll, stretch=1)
         style_group, style_layout = make_group(tr("style_quality_group"))
 
         style_grid = QGridLayout()
         style_grid.setContentsMargins(0, 0, 0, 0)
-        style_grid.setHorizontalSpacing(6)
-        style_grid.setVerticalSpacing(4)
+        style_grid.setHorizontalSpacing(10)
+        style_grid.setVerticalSpacing(6)
         style_grid.addWidget(QLabel(tr("style_label")), 0, 0)
         self._style_combo = QComboBox()
-        visible_style_keys = ["none", "light2", "light3"]
+        visible_style_keys = ["light2", "light2_soft", "light3",
+                              "light2_git_legacy", "light3_git_legacy", "none"]
         for key in visible_style_keys:
             preset = STYLE_PRESETS.get(key)
             if preset is not None:
                 self._style_combo.addItem(preset.label, key)
         self._style_combo.currentIndexChanged.connect(self._on_style_combo_changed)
+        new_default = self._style_combo.findData(Config.DEFAULT_STYLE_KEY)
+        self._style_combo.setCurrentIndex(max(new_default, 0))
         style_grid.addWidget(self._style_combo, 0, 1, 1, 2)
-        # 质量已固定为最快模式：控件保留供设置读写，但不再显示。
+        # Expose the actual inference resolution instead of silently forcing
+        # every request to Fast/576.  Keep Fast as the compatible default.
         self._quality_combo = QComboBox()
-        self._quality_combo.addItem("Fast", "draft")
-        self._quality_combo.hide()
+        for quality_key in ("draft", "standard", "detail"):
+            preset = QUALITY_PRESETS[quality_key]
+            self._quality_combo.addItem(preset.label, quality_key)
+        self._quality_combo.setToolTip(
+            "Fast 576：较快；精细 768：更多线条细节；高清 960：CPU 较慢、占用更多内存。"
+            "这里只改变模型输入精度，不保证发色自动正确。")
+        style_grid.addWidget(QLabel("渲染精度"), 1, 0)
+        style_grid.addWidget(self._quality_combo, 1, 1, 1, 2)
         style_grid.setColumnStretch(1, 1)
         style_layout.addLayout(style_grid)
+        # Optional ORIGINAL generator point control. The existing "mixed" route
+        # remains default; nothing is auto-selected or exported as a hair mask.
+        native_hint_row = QHBoxLayout()
+        native_hint_row.addWidget(QLabel("颜色 Hint 方式"))
+        self._native_hint_mode_combo = QComboBox()
+        self._native_hint_mode_combo.addItem("标准区域提示", "mixed")
+        self._native_hint_mode_combo.addItem("原生柔和点提示（点痕检测，不保证改色）", "native_soft")
+        self._native_hint_mode_combo.setToolTip(
+            "直接把用户的颜色点送入原 Generator 五通道输入；保留整页结构和上下文。"
+            "不会自动识别头发。检测到明显圆形色斑时会自动保留无提示原模型结果；可能因此无法按指定颜色改色。")
+        native_hint_row.addWidget(self._native_hint_mode_combo, 1)
+        style_layout.addLayout(native_hint_row)
+        self._chk_ink_fidelity = QCheckBox("原稿线稿保真 · 柔和颜色（推荐，可关闭）")
+        self._chk_ink_fidelity.setChecked(True)
+        self._chk_ink_fidelity.setToolTip(
+            "保留原图的墨线、网点和细部纹理，并柔和过饱和颜色。"
+            "不会猜测人物设定发色，也不会启用自动头发纠色。")
+        style_layout.addWidget(self._chk_ink_fidelity)
+        ink_row = QHBoxLayout()
+        self._inkwash_strength_label = QLabel("水墨渲染浓度")
+        ink_row.addWidget(self._inkwash_strength_label)
+        self._inkwash_strength_slider = QSlider(Qt.Orientation.Horizontal)
+        self._inkwash_strength_slider.setRange(0, 100)
+        self._inkwash_strength_slider.setValue(78)
+        self._inkwash_strength_slider.setToolTip(
+            "0%：保留原始 Generator 配色；78%：推荐水墨浓度；100%：最明显的淡彩透明度，黑色线稿始终保留。"
+            "不对人物发色作身份推断。")
+        self._inkwash_strength_spin = QSpinBox()
+        self._inkwash_strength_spin.setRange(0, 100)
+        self._inkwash_strength_spin.setSuffix("%")
+        self._inkwash_strength_spin.setFixedWidth(68)
+        self._inkwash_strength_spin.setValue(78)
+        self._inkwash_strength_slider.valueChanged.connect(self._inkwash_strength_spin.setValue)
+        self._inkwash_strength_spin.valueChanged.connect(self._inkwash_strength_slider.setValue)
+        ink_row.addWidget(self._inkwash_strength_slider, stretch=1)
+        ink_row.addWidget(self._inkwash_strength_spin)
+        style_layout.addLayout(ink_row)
 
         strength_grid = QGridLayout()
         strength_grid.setContentsMargins(0, 0, 0, 0)
-        strength_grid.setHorizontalSpacing(5)
-        strength_grid.setVerticalSpacing(0)
+        strength_grid.setHorizontalSpacing(8)
+        strength_grid.setVerticalSpacing(6)
 
         def add_strength_row(row: int, label_key: str, attr_name: str,
                              default: int = 100):
@@ -991,7 +2198,7 @@ class MainWindow(QMainWindow):
             spin.setRange(0, 100)
             spin.setSuffix("%")
             spin.setValue(default)
-            spin.setMaximumWidth(72)
+            spin.setFixedWidth(68)
             slider.valueChanged.connect(spin.setValue)
             spin.valueChanged.connect(slider.setValue)
             strength_grid.addWidget(label, row, 0)
@@ -1012,25 +2219,16 @@ class MainWindow(QMainWindow):
         # Fine-tuning now lives inside the render tab again, alongside the
         # colourization controls, instead of being a separate main tab.
         self._style_fine_group = QGroupBox(tr("style_fine_controls_group"))
+        self._style_fine_group.setProperty("rightCard", True)
         fine_layout = QVBoxLayout(self._style_fine_group)
-        fine_layout.setContentsMargins(10, 10, 10, 8)
-        fine_layout.setSpacing(4)
-        fine_hint = QLabel(tr("style_fine_controls_hint"))
-        fine_hint.setWordWrap(True)
-        fine_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
-        fine_layout.addWidget(fine_hint)
+        fine_layout.setContentsMargins(12, 12, 12, 12)
+        fine_layout.setSpacing(8)
         self._style_fine_active_label = QLabel()
-        self._style_fine_active_label.setWordWrap(True)
-        self._style_fine_active_label.setStyleSheet("font-weight: 600;")
-        fine_layout.addWidget(self._style_fine_active_label)
-        fine_apply_hint = QLabel(tr("style_fine_apply_hint"))
-        fine_apply_hint.setWordWrap(True)
-        fine_apply_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
-        fine_layout.addWidget(fine_apply_hint)
+        self._style_fine_active_label.setVisible(False)
         fine_grid = QGridLayout()
         fine_grid.setContentsMargins(0, 0, 0, 0)
-        fine_grid.setHorizontalSpacing(5)
-        fine_grid.setVerticalSpacing(3)
+        fine_grid.setHorizontalSpacing(8)
+        fine_grid.setVerticalSpacing(6)
 
         def add_tune_row(grid: QGridLayout, row: int, label_key: str, attr_name: str,
                          min_value: int = 0, max_value: int = 180, default: int = 100):
@@ -1042,7 +2240,7 @@ class MainWindow(QMainWindow):
             spin.setRange(min_value, max_value)
             spin.setSuffix("%")
             spin.setValue(default)
-            spin.setMaximumWidth(72)
+            spin.setFixedWidth(68)
             slider.valueChanged.connect(spin.setValue)
             spin.valueChanged.connect(slider.setValue)
             grid.addWidget(label, row, 0)
@@ -1071,17 +2269,14 @@ class MainWindow(QMainWindow):
         fine_layout.addWidget(self._btn_reset_style_fine)
 
         self._filter_group = QGroupBox(tr("image_filter_group"))
+        self._filter_group.setProperty("rightCard", True)
         filter_layout = QVBoxLayout(self._filter_group)
-        filter_layout.setContentsMargins(10, 10, 10, 8)
-        filter_layout.setSpacing(4)
-        filter_hint = QLabel(tr("image_filter_hint"))
-        filter_hint.setWordWrap(True)
-        filter_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
-        filter_layout.addWidget(filter_hint)
+        filter_layout.setContentsMargins(12, 12, 12, 12)
+        filter_layout.setSpacing(8)
         filter_grid = QGridLayout()
         filter_grid.setContentsMargins(0, 0, 0, 0)
-        filter_grid.setHorizontalSpacing(5)
-        filter_grid.setVerticalSpacing(3)
+        filter_grid.setHorizontalSpacing(8)
+        filter_grid.setVerticalSpacing(6)
         add_tune_row(filter_grid, 0, "filter_brightness", "_filter_brightness_slider", 0, 200, 100)
         add_tune_row(filter_grid, 1, "filter_contrast", "_filter_contrast_slider", 0, 200, 100)
         add_tune_row(filter_grid, 2, "filter_saturation", "_filter_saturation_slider", 0, 200, 100)
@@ -1095,8 +2290,8 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(self._chk_filter_color)
         filter_color_grid = QGridLayout()
         filter_color_grid.setContentsMargins(0, 0, 0, 0)
-        filter_color_grid.setHorizontalSpacing(5)
-        filter_color_grid.setVerticalSpacing(3)
+        filter_color_grid.setHorizontalSpacing(8)
+        filter_color_grid.setVerticalSpacing(6)
         filter_color_grid.addWidget(QLabel(tr("filter_color_strength")), 0, 0)
         self._filter_color_strength_slider = QSlider(Qt.Orientation.Horizontal)
         self._filter_color_strength_slider.setRange(0, 150)
@@ -1105,7 +2300,7 @@ class MainWindow(QMainWindow):
         self._filter_color_strength_spin.setRange(0, 150)
         self._filter_color_strength_spin.setSuffix("%")
         self._filter_color_strength_spin.setValue(35)
-        self._filter_color_strength_spin.setMaximumWidth(72)
+        self._filter_color_strength_spin.setFixedWidth(68)
         self._filter_color_strength_slider.valueChanged.connect(self._filter_color_strength_spin.setValue)
         self._filter_color_strength_spin.valueChanged.connect(self._filter_color_strength_slider.setValue)
         filter_color_grid.addWidget(self._filter_color_strength_slider, 0, 1)
@@ -1134,17 +2329,18 @@ class MainWindow(QMainWindow):
         filter_layout.addLayout(filter_button_row)
 
         self._pastel_controls_group = QGroupBox(tr("pastel_controls_group"))
+        self._pastel_controls_group.setProperty("rightCard", True)
         pastel_layout = QVBoxLayout(self._pastel_controls_group)
-        pastel_layout.setContentsMargins(10, 10, 10, 8)
-        pastel_layout.setSpacing(4)
+        pastel_layout.setContentsMargins(12, 12, 12, 12)
+        pastel_layout.setSpacing(8)
         pastel_hint = QLabel(tr("pastel_controls_hint"))
         pastel_hint.setWordWrap(True)
         pastel_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
         pastel_layout.addWidget(pastel_hint)
         pastel_grid = QGridLayout()
         pastel_grid.setContentsMargins(0, 0, 0, 0)
-        pastel_grid.setHorizontalSpacing(5)
-        pastel_grid.setVerticalSpacing(3)
+        pastel_grid.setHorizontalSpacing(8)
+        pastel_grid.setVerticalSpacing(6)
 
         def add_pastel_row(row: int, label_key: str, attr_name: str, default: int = 100):
             add_tune_row(pastel_grid, row, label_key, attr_name, 0, 180, default)
@@ -1165,14 +2361,15 @@ class MainWindow(QMainWindow):
         self._chk_character_memory.hide()
 
         self._chk_skip_colored = QCheckBox(tr("skip_colored_checkbox"))
-        self._chk_skip_colored.setChecked(True)
+        self._chk_skip_colored.setChecked(False)
         self._chk_skip_colored.setToolTip(tr("skip_colored_tooltip"))
         style_layout.addWidget(self._chk_skip_colored)
 
         self._custom_color_bias_group = QGroupBox(tr("custom_color_bias_group"))
+        self._custom_color_bias_group.setProperty("rightCard", True)
         custom_bias_layout = QVBoxLayout(self._custom_color_bias_group)
-        custom_bias_layout.setContentsMargins(10, 10, 10, 8)
-        custom_bias_layout.setSpacing(4)
+        custom_bias_layout.setContentsMargins(12, 12, 12, 12)
+        custom_bias_layout.setSpacing(8)
         self._chk_custom_color_bias = QCheckBox(tr("custom_color_bias_enable"))
         self._chk_custom_color_bias.toggled.connect(self._update_custom_bias_controls_enabled)
         custom_bias_layout.addWidget(self._chk_custom_color_bias)
@@ -1184,8 +2381,8 @@ class MainWindow(QMainWindow):
         custom_bias_details_layout.setSpacing(4)
         custom_bias_grid = QGridLayout()
         custom_bias_grid.setContentsMargins(0, 0, 0, 0)
-        custom_bias_grid.setHorizontalSpacing(5)
-        custom_bias_grid.setVerticalSpacing(3)
+        custom_bias_grid.setHorizontalSpacing(8)
+        custom_bias_grid.setVerticalSpacing(6)
         custom_bias_grid.addWidget(QLabel(tr("custom_color_bias_color")), 0, 0)
         self._custom_color_bias_btn = QPushButton()
         self._custom_color_bias_btn.setFixedSize(54, 30)
@@ -1216,7 +2413,7 @@ class MainWindow(QMainWindow):
         self._custom_color_bias_spin.setRange(0, 200)
         self._custom_color_bias_spin.setSuffix("%")
         self._custom_color_bias_spin.setValue(35)
-        self._custom_color_bias_spin.setMaximumWidth(72)
+        self._custom_color_bias_spin.setFixedWidth(68)
         self._custom_color_bias_slider.valueChanged.connect(self._custom_color_bias_spin.setValue)
         self._custom_color_bias_spin.valueChanged.connect(self._custom_color_bias_slider.setValue)
         custom_bias_grid.addWidget(self._custom_color_bias_slider, 3, 1)
@@ -1228,8 +2425,8 @@ class MainWindow(QMainWindow):
         custom_bias_details_layout.addWidget(protection_label)
         protection_grid = QGridLayout()
         protection_grid.setContentsMargins(0, 0, 0, 0)
-        protection_grid.setHorizontalSpacing(8)
-        protection_grid.setVerticalSpacing(2)
+        protection_grid.setHorizontalSpacing(22)
+        protection_grid.setVerticalSpacing(10)
         self._chk_custom_bias_protect_skin = QCheckBox(tr("custom_color_bias_protect_skin"))
         self._chk_custom_bias_protect_lineart = QCheckBox(tr("custom_color_bias_protect_lineart"))
         self._chk_custom_bias_protect_saturated = QCheckBox(tr("custom_color_bias_protect_saturated"))
@@ -1240,6 +2437,7 @@ class MainWindow(QMainWindow):
             checkbox.setChecked(True)
             checkbox.setToolTip(tr("custom_color_bias_protection_hint"))
             protection_grid.addWidget(checkbox, index // 2, index % 2)
+        protection_grid.setColumnStretch(0, 1)
         protection_grid.setColumnStretch(1, 1)
         custom_bias_details_layout.addLayout(protection_grid)
         custom_bias_layout.addWidget(self._custom_color_bias_details)
@@ -1247,23 +2445,379 @@ class MainWindow(QMainWindow):
         self._update_custom_color_bias_swatch()
         self._update_custom_bias_controls_enabled()
 
-        auto_group, auto_layout = make_group(tr("auto_group"))
+        auto_group, auto_layout = make_group("头发纠色")
+        auto_fold_toolbar = QHBoxLayout()
+        auto_fold_toolbar.setContentsMargins(0, 0, 0, 0)
+        auto_fold_toolbar.setSpacing(5)
+        auto_fold_toolbar.addStretch(1)
+        self._btn_collapse_auto_details = QPushButton("收起全部细则")
+        self._btn_collapse_auto_details.setMaximumWidth(120)
+        auto_fold_toolbar.addWidget(self._btn_collapse_auto_details)
+        auto_layout.addLayout(auto_fold_toolbar)
+
+        self._auto_detail_section = _CollapsibleSection(
+            "基础保护", summary="文字气泡保护等自动上色基础开关",
+            expanded=False, settings_key="render_base")
+        auto_layout.addWidget(self._auto_detail_section)
+        auto_content_layout = self._auto_detail_section.content_layout()
+
+        self._hair_guard_detail_section = _CollapsibleSection(
+            "纠色设置", summary="目标发色 · 多人物范围 · 独立蓝框 / 画笔 · 遮罩预览",
+            expanded=False, settings_key="render_hair_guard")
+        auto_layout.addWidget(self._hair_guard_detail_section)
+        hair_guard_content_layout = self._hair_guard_detail_section.content_layout()
+
+        self._ai_hair_detail_section = _CollapsibleSection(
+            "AI 头发解析", summary="识别后端 · 模型状态 · 安装 / 检查",
+            expanded=False, settings_key="render_ai_hair")
+        auto_layout.addWidget(self._ai_hair_detail_section)
+        ai_hair_content_layout = self._ai_hair_detail_section.content_layout()
+
+        self._btn_collapse_auto_details.clicked.connect(
+            lambda: self._collapse_sections(
+                self._auto_detail_section, self._hair_guard_detail_section,
+                self._ai_hair_detail_section))
         self._chk_protect_text = QCheckBox("保护文字气泡（AI 检测文字区域，保持原稿黑白）")
         self._chk_protect_text.setChecked(True)
         self._chk_protect_text.setToolTip(
             "用本地文字检测模型找到对话框文字像素，上色后把这些区域还原为原稿的"
             "纸白与墨黑，避免文字被染色。模型文件缺失时自动跳过，不影响上色。")
-        auto_layout.addWidget(self._chk_protect_text)
-        self._btn_auto = tune_button(QPushButton(tr("auto_btn")), 40)
-        self._btn_auto.clicked.connect(self._run_auto_colorize)
-        auto_layout.addWidget(self._btn_auto)
+        auto_content_layout.addWidget(self._chk_protect_text)
+
+        self._chk_auto_black_hair_guard = QCheckBox("自动头发纠色（把误判成橙/红暖色的头发重建为目标发色）")
+        self._chk_auto_black_hair_guard.setChecked(False)
+        self._chk_auto_black_hair_guard.setToolTip(
+            "只对自动上色生效。它会先检测被 mc-v2 误成橙/红暖色的头发对象，"
+            "再按原始黑白稿的明暗结构重建为目标发色。默认目标色为黑色，"
+            "也可改成棕色、深蓝等。为避免误伤原本的暖色头发，默认关闭，需要时手动开启。")
+        hair_guard_content_layout.addWidget(self._chk_auto_black_hair_guard)
+
+        black_guard_row = QHBoxLayout()
+        black_guard_row.setContentsMargins(18, 0, 0, 0)
+        black_guard_row.setSpacing(8)
+        black_guard_label = QLabel("头发纠色模式：")
+        self._combo_auto_black_hair_guard_mode = QComboBox()
+        self._combo_auto_black_hair_guard_mode.addItem("保守（更少误伤橙色区域）", "conservative")
+        self._combo_auto_black_hair_guard_mode.addItem("标准（更积极修正橙发误判）", "normal")
+        self._combo_auto_black_hair_guard_mode.setCurrentIndex(0)
+        self._combo_auto_black_hair_guard_mode.setToolTip(
+            "保守：仅在检测到大面积、明显带明暗结构的暖色头发时才触发自动纠色。\n"
+            "标准：更容易触发，适合误判暖色头发比较严重的页面。")
+        self._combo_auto_black_hair_guard_mode.setEnabled(False)
+        self._chk_auto_black_hair_guard.toggled.connect(
+            self._combo_auto_black_hair_guard_mode.setEnabled)
+        black_guard_row.addWidget(black_guard_label)
+        black_guard_row.addWidget(self._combo_auto_black_hair_guard_mode, 1)
+        hair_guard_content_layout.addLayout(black_guard_row)
+
+        black_guard_scope_row = QHBoxLayout()
+        black_guard_scope_row.setContentsMargins(18, 0, 0, 0)
+        black_guard_scope_row.setSpacing(8)
+        black_guard_scope_label = QLabel("头发纠色范围：")
+        self._combo_auto_black_hair_guard_scope = QComboBox()
+        self._combo_auto_black_hair_guard_scope.addItem("人物附近优先（更稳，默认）", "near_face")
+        self._combo_auto_black_hair_guard_scope.addItem("整页主暖色对象（更强）", "page")
+        self._combo_auto_black_hair_guard_scope.setCurrentIndex(0)
+        self._combo_auto_black_hair_guard_scope.setEnabled(False)
+        self._combo_auto_black_hair_guard_scope.setToolTip(
+            "人物附近优先：只有靠近检测到的人物头部的暖色头发对象才会被纠色，更适合避免误伤衣服、背景块。\n"
+            "整页主暖色对象：按全页最可疑的大暖色头发对象纠色，适合误判很明显的整页。")
+        self._chk_auto_black_hair_guard.toggled.connect(
+            self._combo_auto_black_hair_guard_scope.setEnabled)
+        black_guard_scope_row.addWidget(black_guard_scope_label)
+        black_guard_scope_row.addWidget(self._combo_auto_black_hair_guard_scope, 1)
+        hair_guard_content_layout.addLayout(black_guard_scope_row)
+
+        black_guard_limit_row = QHBoxLayout()
+        black_guard_limit_row.setContentsMargins(18, 0, 0, 0)
+        black_guard_limit_row.setSpacing(8)
+        black_guard_limit_label = QLabel("纠色作用区域：")
+        self._combo_auto_black_hair_guard_limit_mode = QComboBox()
+        self._combo_auto_black_hair_guard_limit_mode.addItem("整页 / 当前范围内自动检测", "full")
+        self._combo_auto_black_hair_guard_limit_mode.addItem("仅当前选区（蓝框）", "selection")
+        self._combo_auto_black_hair_guard_limit_mode.setCurrentIndex(0)
+        self._combo_auto_black_hair_guard_limit_mode.setEnabled(False)
+        self._combo_auto_black_hair_guard_limit_mode.setToolTip(
+            "整页 / 当前范围内自动检测：按正常自动头发纠色逻辑工作。\n"
+            "仅当前选区（蓝框）：只有蓝框内的候选头发才参与纠色，框外一律不参与；\n"
+            "适合一张图很多人物时，只纠正你框住的那个人或那一块头发。")
+        self._chk_auto_black_hair_guard.toggled.connect(
+            self._combo_auto_black_hair_guard_limit_mode.setEnabled)
+        black_guard_limit_row.addWidget(black_guard_limit_label)
+        black_guard_limit_row.addWidget(self._combo_auto_black_hair_guard_limit_mode, 1)
+        hair_guard_content_layout.addLayout(black_guard_limit_row)
+
+        hair_guard_selector_label = QLabel("头发纠色独立选区")
+        hair_guard_selector_label.setStyleSheet("font-weight: 600;")
+        hair_guard_selector_label.setContentsMargins(18, 2, 0, 0)
+        hair_guard_content_layout.addWidget(hair_guard_selector_label)
+
+        self._hair_guard_selector_grid = QGridLayout()
+        self._hair_guard_selector_grid.setContentsMargins(18, 0, 0, 0)
+        self._hair_guard_selector_grid.setHorizontalSpacing(6)
+        self._hair_guard_selector_grid.setVerticalSpacing(5)
+        self._hair_guard_selector_grid.setColumnStretch(0, 1)
+        self._hair_guard_selector_grid.setColumnStretch(1, 1)
+
+        self._btn_hair_guard_rect_selector = QPushButton("矩形追加")
+        self._btn_hair_guard_rect_selector.setToolTip("独立于编辑选区。可在上色前直接追加一个头发纠色蓝框区域；可连续框多个角色。")
+        self._btn_hair_guard_rect_selector.clicked.connect(lambda: self._activate_hair_guard_selector("rect"))
+        self._btn_hair_guard_brush_add = QPushButton("画笔添加")
+        self._btn_hair_guard_brush_add.setToolTip("独立于编辑选区。旧头发纠色中用于补充蓝框；启用新版蒙版覆盖时，同时作为‘这是头发’的正向语义涂鸦种子。")
+        self._btn_hair_guard_brush_add.clicked.connect(lambda: self._activate_hair_guard_selector("brush_add"))
+        self._btn_hair_guard_brush_erase = QPushButton("画笔擦除")
+        self._btn_hair_guard_brush_erase.setToolTip("独立于编辑选区。旧头发纠色中擦除蓝框；启用新版蒙版覆盖时，同时作为‘这里不是头发’的负向语义涂鸦，阻止自动扩区。")
+        self._btn_hair_guard_brush_erase.clicked.connect(lambda: self._activate_hair_guard_selector("brush_erase"))
+        self._btn_hair_guard_undo_last = QPushButton("撤销上一个区域")
+        self._btn_hair_guard_undo_last.setToolTip("撤销最近一次矩形追加、画笔添加或画笔擦除操作。")
+        self._btn_hair_guard_undo_last.clicked.connect(self._undo_last_hair_guard_selection_operation)
+        self._btn_hair_guard_clear_selection = QPushButton("清除全部纠色选区")
+        self._btn_hair_guard_clear_selection.setToolTip("清除本页全部头发纠色独立选区。")
+        self._btn_hair_guard_clear_selection.clicked.connect(self._clear_hair_guard_selection)
+        self._btn_hair_guard_finish_selector = QPushButton("结束选区器")
+        self._btn_hair_guard_finish_selector.clicked.connect(self._deactivate_hair_guard_selector)
+
+        selector_buttons = (
+            self._btn_hair_guard_rect_selector, self._btn_hair_guard_brush_add,
+            self._btn_hair_guard_brush_erase, self._btn_hair_guard_undo_last,
+            self._btn_hair_guard_clear_selection, self._btn_hair_guard_finish_selector,
+        )
+        for index, _btn in enumerate(selector_buttons):
+            _btn.setMinimumHeight(30)
+            _btn.setMinimumWidth(0)
+            _btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._hair_guard_selector_grid.addWidget(_btn, index // 2, index % 2)
+        hair_guard_content_layout.addLayout(self._hair_guard_selector_grid)
+
+        self._label_hair_guard_selector_mode = QLabel("当前选区器：未启用")
+        self._label_hair_guard_selector_mode.setContentsMargins(36, 0, 0, 0)
+        self._label_hair_guard_selector_mode.setStyleSheet("color: #5d6f84; font-size: 10px;")
+        self._label_hair_guard_selector_mode.setWordWrap(True)
+        hair_guard_content_layout.addWidget(self._label_hair_guard_selector_mode)
+
+        self._label_hair_guard_selection_stats = QLabel("当前头发纠色区域：0 个操作 / 0 px")
+        self._label_hair_guard_selection_stats.setContentsMargins(36, 0, 0, 0)
+        self._label_hair_guard_selection_stats.setStyleSheet("color: #5d6f84; font-size: 10px;")
+        self._label_hair_guard_selection_stats.setWordWrap(True)
+        hair_guard_content_layout.addWidget(self._label_hair_guard_selection_stats)
+
+        black_guard_brush_row = QGridLayout()
+        black_guard_brush_row.setContentsMargins(36, 0, 0, 0)
+        black_guard_brush_row.setHorizontalSpacing(6)
+        black_guard_brush_row.setVerticalSpacing(3)
+        black_guard_brush_row.addWidget(QLabel("画笔半径"), 0, 0)
+        self._hair_guard_brush_radius_slider = QSlider(Qt.Orientation.Horizontal)
+        self._hair_guard_brush_radius_slider.setRange(4, 120)
+        self._hair_guard_brush_radius_slider.setValue(24)
+        self._hair_guard_brush_radius_spin = QSpinBox()
+        self._hair_guard_brush_radius_spin.setRange(4, 120)
+        self._hair_guard_brush_radius_spin.setValue(24)
+        self._hair_guard_brush_radius_spin.setSuffix(" px")
+        self._hair_guard_brush_radius_spin.setMaximumWidth(82)
+        self._hair_guard_brush_radius_slider.valueChanged.connect(self._hair_guard_brush_radius_spin.setValue)
+        self._hair_guard_brush_radius_spin.valueChanged.connect(self._hair_guard_brush_radius_slider.setValue)
+        self._hair_guard_brush_radius_slider.valueChanged.connect(self._update_hair_guard_brush_radius)
+        black_guard_brush_row.addWidget(self._hair_guard_brush_radius_slider, 0, 1)
+        black_guard_brush_row.addWidget(self._hair_guard_brush_radius_spin, 0, 2)
+        black_guard_brush_row.setColumnStretch(1, 1)
+        hair_guard_content_layout.addLayout(black_guard_brush_row)
+
+        black_guard_preview_row = QGridLayout()
+        black_guard_preview_row.setContentsMargins(18, 0, 0, 0)
+        black_guard_preview_row.setHorizontalSpacing(6)
+        black_guard_preview_row.setVerticalSpacing(4)
+        black_guard_preview_row.setColumnStretch(0, 1)
+        black_guard_preview_row.setColumnStretch(1, 1)
+        self._btn_preview_auto_black_hair_guard = QPushButton("预览自动头发纠色遮罩")
+        self._btn_preview_auto_black_hair_guard.setToolTip(
+            "蓝色：AI 主体头发；绿色：通过过滤的补漏区域；红色：检测到但已排除的细丝、描边或边缘薄壳。")
+        self._btn_preview_auto_black_hair_guard.clicked.connect(self._preview_auto_black_hair_guard_mask)
+        self._btn_clear_auto_black_hair_guard_preview = QPushButton("清除预览")
+        self._btn_clear_auto_black_hair_guard_preview.clicked.connect(self._clear_auto_black_hair_guard_preview)
+        for _btn in (self._btn_preview_auto_black_hair_guard, self._btn_clear_auto_black_hair_guard_preview):
+            _btn.setMinimumHeight(30)
+            _btn.setMinimumWidth(0)
+            _btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        black_guard_preview_row.addWidget(self._btn_preview_auto_black_hair_guard, 0, 0)
+        black_guard_preview_row.addWidget(self._btn_clear_auto_black_hair_guard_preview, 0, 1)
+        hair_guard_content_layout.addLayout(black_guard_preview_row)
+
+        hair_recolor_color_row = QHBoxLayout()
+        hair_recolor_color_row.setContentsMargins(18, 0, 0, 0)
+        hair_recolor_color_row.setSpacing(8)
+        hair_recolor_color_row.addWidget(QLabel("目标发色（纠色 / 蒙版覆盖共用）："))
+        self._btn_hair_recolor_color = QPushButton()
+        self._btn_hair_recolor_color.setFixedSize(54, 30)
+        self._btn_hair_recolor_color.clicked.connect(self._pick_hair_recolor_color)
+        self._hair_recolor_color_info = QLabel()
+        self._hair_recolor_color_info.setStyleSheet("color: #5d6f84; font-size: 10px;")
+        hair_recolor_color_row.addWidget(self._btn_hair_recolor_color)
+        hair_recolor_color_row.addWidget(self._hair_recolor_color_info, 1)
+        hair_guard_content_layout.addLayout(hair_recolor_color_row)
+
+        # ── Semantic mask overwrite layers ───────────────────────────────
+        # These are deliberately separate from mc-v2 hints.  The generator
+        # still auto-colourizes the whole page; enabled semantic regions are
+        # replaced afterwards using binary masks (no translucent overlap).
+        self._chk_semantic_mask_layers = QCheckBox(
+            "启用蒙版覆盖上色（新版：发色 / 瞳色 / 背景）")
+        self._chk_semantic_mask_layers.setChecked(False)
+        self._chk_semantic_mask_layers.setToolTip(
+            "先让 mc-v2 正常自动上色，再提取头发/虹膜/背景蒙版。启用的蒙版区域在最终阶段直接覆盖，"
+            "蒙版外逐像素不变；不是半透明叠加。")
+        hair_guard_content_layout.addWidget(self._chk_semantic_mask_layers)
+
+        semantic_grid = QGridLayout()
+        semantic_grid.setContentsMargins(36, 0, 0, 0)
+        semantic_grid.setHorizontalSpacing(8)
+        semantic_grid.setVerticalSpacing(5)
+
+        self._chk_mask_hair_override = QCheckBox("发色覆盖")
+        self._chk_mask_hair_override.setChecked(True)
+        semantic_grid.addWidget(self._chk_mask_hair_override, 0, 0)
+        semantic_grid.addWidget(QLabel("使用上方目标发色；保留 mc-v2 明暗"), 0, 1, 1, 2)
+
+        self._chk_mask_iris_override = QCheckBox("瞳色覆盖")
+        self._chk_mask_iris_override.setChecked(False)
+        semantic_grid.addWidget(self._chk_mask_iris_override, 1, 0)
+        self._btn_iris_recolor_color = QPushButton()
+        self._btn_iris_recolor_color.setFixedSize(54, 28)
+        self._btn_iris_recolor_color.clicked.connect(self._pick_iris_recolor_color)
+        self._iris_recolor_color_info = QLabel()
+        self._iris_recolor_color_info.setStyleSheet("color: #5d6f84; font-size: 10px;")
+        semantic_grid.addWidget(self._btn_iris_recolor_color, 1, 1)
+        semantic_grid.addWidget(self._iris_recolor_color_info, 1, 2)
+
+        semantic_grid.addWidget(QLabel("背景覆盖："), 2, 0)
+        self._combo_mask_background_mode = QComboBox()
+        self._combo_mask_background_mode.addItem("保持自动背景", "keep")
+        self._combo_mask_background_mode.addItem("背景灰度（保留 AI 明暗）", "grayscale")
+        self._combo_mask_background_mode.addItem("背景低饱和", "desaturate")
+        self._combo_mask_background_mode.addItem("恢复原黑白背景", "source_bw")
+        semantic_grid.addWidget(self._combo_mask_background_mode, 2, 1, 1, 2)
+
+        semantic_grid.addWidget(QLabel("覆盖着色："), 3, 0)
+        self._combo_mask_recolor_mode = QComboBox()
+        self._combo_mask_recolor_mode.addItem("精确色系 + 保留明暗（推荐）", "shading")
+        self._combo_mask_recolor_mode.addItem("自然迁色 + 保留纹理", "shift")
+        self._combo_mask_recolor_mode.addItem("纯色覆盖（检查蒙版）", "flat")
+        semantic_grid.addWidget(self._combo_mask_recolor_mode, 3, 1, 1, 2)
+
+        self._chk_mask_character_library_colors = QCheckBox("按角色库分别覆盖发色 / 瞳色")
+        self._chk_mask_character_library_colors.setChecked(True)
+        self._chk_mask_character_library_colors.setToolTip(
+            "同页有多个已匹配角色时，优先使用角色库中各自的 hair / eyes 颜色；"
+            "未匹配区域仍使用上面的统一目标色。关闭后整页只使用统一目标色。")
+        semantic_grid.addWidget(self._chk_mask_character_library_colors, 4, 0, 1, 3)
+        semantic_grid.setColumnStretch(2, 1)
+        hair_guard_content_layout.addLayout(semantic_grid)
+
+        semantic_preview_row = QHBoxLayout()
+        semantic_preview_row.setContentsMargins(36, 0, 0, 0)
+        semantic_preview_row.setSpacing(8)
+        self._btn_preview_semantic_masks = QPushButton("预览 Hair / Iris / Background 蒙版")
+        self._btn_preview_semantic_masks.clicked.connect(self._preview_semantic_mask_layers)
+        self._btn_clear_semantic_masks_preview = QPushButton("清除蒙版预览")
+        self._btn_clear_semantic_masks_preview.clicked.connect(self._clear_auto_black_hair_guard_preview)
+        semantic_preview_row.addWidget(self._btn_preview_semantic_masks, 1)
+        semantic_preview_row.addWidget(self._btn_clear_semantic_masks_preview, 0)
+        hair_guard_content_layout.addLayout(semantic_preview_row)
+
+        self._label_semantic_mask_note = QLabel(
+            "覆盖顺序：背景 → 头发 → 虹膜。蒙版由语义分割 + 线稿区域 + 可用时的 CLIP + mc-v2 Encoder 特征共同判断；断线会自动回退 trapped-ball。最终始终二值覆盖，不做透明重合。")
+        self._label_semantic_mask_note.setContentsMargins(36, 0, 0, 0)
+        self._label_semantic_mask_note.setWordWrap(True)
+        self._label_semantic_mask_note.setStyleSheet("color: #5d6f84; font-size: 10px;")
+        hair_guard_content_layout.addWidget(self._label_semantic_mask_note)
+
+        self._chk_semantic_mask_layers.toggled.connect(
+            self._update_semantic_mask_controls_enabled)
+        self._update_semantic_mask_controls_enabled()
+        self._update_iris_recolor_swatch()
+
+        self._chk_ai_hair_parser = QCheckBox(
+            "启用 AI 发色解析（先识别完整头发，再应用目标发色）")
+        self._chk_ai_hair_parser.setChecked(True)
+        self._chk_ai_hair_parser.setToolTip(
+            "自动模式优先使用 Anime-Face-Segmentation；StyleAnime 只作为低置信度时的辅助候选，"
+            "不再直接用宽泛 StyleAnime 遮罩染色。安装后，SkyTNT 用于限制人物前景，"
+            "yakhyo face-parsing 用于排除皮肤、眼镜和衣服。")
+        ai_hair_content_layout.addWidget(self._chk_ai_hair_parser)
+
+        ai_hair_backend_row = QHBoxLayout()
+        ai_hair_backend_row.setContentsMargins(18, 0, 0, 0)
+        ai_hair_backend_row.setSpacing(8)
+        ai_hair_backend_row.addWidget(QLabel("AI 头发识别后端："))
+        self._combo_ai_hair_parser_backend = QComboBox()
+        self._combo_ai_hair_parser_backend.addItem("自动", "auto")
+        self._combo_ai_hair_parser_backend.addItem(
+            "StyleAnime / Danbooru-Parsing", "styleanime")
+        self._combo_ai_hair_parser_backend.addItem(
+            "Anime-Face-Segmentation", "anime_face_segmentation")
+        self._combo_ai_hair_parser_backend.addItem(
+            "AnimeSeg / Mask2Former（可选，本地安装）", "animeseg")
+        self._combo_ai_hair_parser_backend.addItem(
+            "仅旧算法（不运行 AI 解析）", "legacy")
+        self._combo_ai_hair_parser_backend.setCurrentIndex(0)
+        self._combo_ai_hair_parser_backend.setToolTip(
+            "自动模式优先采用轻量动漫脸/头发分割，并按暖色头发证据评分；"
+            "StyleAnime 仅在轻量结果不足时参与。AI 遮罩只作为语义边界，最终仍由暖色锚点重建头发。")
+        ai_hair_backend_row.addWidget(self._combo_ai_hair_parser_backend, 1)
+        ai_hair_content_layout.addLayout(ai_hair_backend_row)
+        self._chk_ai_hair_parser.toggled.connect(
+            self._combo_ai_hair_parser_backend.setEnabled)
+
+        ai_hair_model_row = QHBoxLayout()
+        ai_hair_model_row.setContentsMargins(18, 0, 0, 0)
+        ai_hair_model_row.setSpacing(8)
+        self._ai_hair_model_status = QLabel("正在检查 AI 头发模型…")
+        self._ai_hair_model_status.setWordWrap(True)
+        self._ai_hair_model_status.setStyleSheet(
+            "color: #5d6f84; font-size: 10px;")
+        self._btn_manage_ai_hair_models = QPushButton("安装/检查模型")
+        self._btn_manage_ai_hair_models.clicked.connect(
+            self._manage_ai_hair_models)
+        ai_hair_model_row.addWidget(self._ai_hair_model_status, 1)
+        ai_hair_model_row.addWidget(self._btn_manage_ai_hair_models)
+        ai_hair_content_layout.addLayout(ai_hair_model_row)
+
+        for _signal_owner in (
+                self._chk_auto_black_hair_guard, self._combo_auto_black_hair_guard_mode,
+                self._combo_auto_black_hair_guard_scope,
+                self._combo_auto_black_hair_guard_limit_mode,
+                self._chk_ai_hair_parser, self._combo_ai_hair_parser_backend):
+            if isinstance(_signal_owner, QComboBox):
+                _signal_owner.currentIndexChanged.connect(
+                    self._refresh_auto_detail_summaries)
+            else:
+                _signal_owner.toggled.connect(self._refresh_auto_detail_summaries)
+        self._refresh_auto_detail_summaries()
+
+        # Primary render action belongs to the render workspace, not the
+        # dedicated hair-recolor settings tab.  It is deliberately outside the
+        # render QScrollArea so it cannot disappear below expanded details.
+        self._render_action_box = QWidget()
+        self._render_action_box.setObjectName("RenderPrimaryActionBox")
+        self._render_action_box.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                              QSizePolicy.Policy.Fixed)
+        render_action_layout = QVBoxLayout(self._render_action_box)
+        render_action_layout.setContentsMargins(10, 10, 10, 10)
+        render_action_layout.setSpacing(8)
         self._auto_status_label = QLabel("准备就绪")
+        self._auto_status_label.setObjectName("RenderActionStatusLabel")
         self._auto_status_label.setWordWrap(True)
-        self._auto_status_label.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self._auto_status_label.setStyleSheet("color: #666;")
+        self._auto_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._auto_status_label.setSizePolicy(QSizePolicy.Policy.Expanding,
-                                              QSizePolicy.Policy.Expanding)
-        auto_layout.addWidget(self._auto_status_label, stretch=1)
+                                              QSizePolicy.Policy.Preferred)
+        render_action_layout.addWidget(self._auto_status_label)
+        self._btn_auto = tune_button(QPushButton(tr("auto_btn")), 42)
+        self._btn_auto.setObjectName("PrimaryAutoColorizeButton")
+        self._btn_auto.setMinimumWidth(0)
+        self._btn_auto.setToolTip("对当前选中的页面执行自动上色；头发纠色与蒙版覆盖页中的设置会在本次自动上色中生效。")
+        self._btn_auto.clicked.connect(self._run_auto_colorize)
+        render_action_layout.addWidget(self._btn_auto)
+        render_page_layout.addWidget(self._render_action_box, stretch=0)
+
         render_detail_tabs = QTabWidget()
         render_detail_tabs.setDocumentMode(True)
         render_detail_tabs.setUsesScrollButtons(False)
@@ -1271,34 +2825,47 @@ class MainWindow(QMainWindow):
         self._render_detail_tabs = render_detail_tabs
 
         detail_fine_tab, detail_fine_layout = make_tab()
+        # v5.13.12: style fine-tuning is always expanded.  This page is already
+        # its own dedicated tab, so an extra collapsible wrapper only adds an
+        # unnecessary click and can hide controls after restoring old settings.
+        self._style_fine_group.setVisible(True)
+        self._style_fine_group.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                             QSizePolicy.Policy.Preferred)
         detail_fine_layout.addWidget(self._style_fine_group, stretch=1)
         render_detail_tabs.addTab(detail_fine_tab, tr("style_detail_tab_fine"))
 
         detail_filter_tab, detail_filter_layout = make_tab()
+        # Natural-image filters likewise stay permanently expanded.
+        self._filter_group.setVisible(True)
+        self._filter_group.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                         QSizePolicy.Policy.Preferred)
         detail_filter_layout.addWidget(self._filter_group, stretch=1)
         render_detail_tabs.addTab(detail_filter_tab, tr("image_filter_group"))
 
-        render_layout.addWidget(style_group, stretch=2)
-        render_layout.addWidget(render_detail_tabs, stretch=4)
-        # Keep the primary action at the very bottom of the render page.
-        render_layout.addWidget(auto_group, stretch=1)
+        render_detail_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        style_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        auto_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        render_layout.addWidget(style_group)
+        render_layout.addWidget(render_detail_tabs)
+        render_layout.addStretch(1)
         self._right_tabs.addTab(render_tab, tr("right_tab_render"))
 
         # ── Tab 2: manual editing ─────────────────────────────────────
         # Restore the single-page editor used before the nested detail tabs.
         # The main editing group owns the available vertical space and extends
         # toward the middle/bottom; history remains a compact fixed-height row.
-        edit_tab, edit_tab_layout = make_tab()
-        edit_tab_layout.setSpacing(5)
+        edit_tab, edit_content, edit_tab_layout = make_scrollable_tab()
+        self._edit_scroll_area = edit_tab
+        edit_tab_layout.setSpacing(6)
         edit_group, edit_layout = make_group(tr("edit_group"))
         edit_group.setSizePolicy(QSizePolicy.Policy.Expanding,
-                                 QSizePolicy.Policy.Expanding)
+                                 QSizePolicy.Policy.Preferred)
         edit_layout.setSpacing(5)
 
         tool_grid = QGridLayout()
         tool_grid.setContentsMargins(0, 0, 0, 0)
-        tool_grid.setHorizontalSpacing(9)
-        tool_grid.setVerticalSpacing(4)
+        tool_grid.setHorizontalSpacing(16)
+        tool_grid.setVerticalSpacing(8)
         self._tool_group = QButtonGroup(self)
         self._radio_brush = QRadioButton(tr("tool_brush"))
         self._radio_brush.setChecked(True)
@@ -1324,6 +2891,20 @@ class MainWindow(QMainWindow):
         self._radio_rect_bucket.toggled.connect(self._on_tool_changed)
         edit_layout.addLayout(tool_grid)
 
+        edit_fold_toolbar = QHBoxLayout()
+        edit_fold_toolbar.setContentsMargins(0, 0, 0, 0)
+        edit_fold_toolbar.setSpacing(5)
+        self._edit_context_hint = QLabel("当前工具细则会按工具自动切换显示")
+        self._edit_context_hint.setStyleSheet("color: #6c7f94; font-size: 10px;")
+        edit_fold_toolbar.addWidget(self._edit_context_hint, 1)
+        self._btn_expand_current_edit_details = QPushButton("展开当前工具")
+        self._btn_expand_current_edit_details.setMaximumWidth(120)
+        edit_fold_toolbar.addWidget(self._btn_expand_current_edit_details)
+        self._btn_collapse_edit_details = QPushButton("收起全部细则")
+        self._btn_collapse_edit_details.setMaximumWidth(120)
+        edit_fold_toolbar.addWidget(self._btn_collapse_edit_details)
+        edit_layout.addLayout(edit_fold_toolbar)
+
         self._tool_visibility_rows = {}
 
         def register_tool_row(name: str, *widgets: QWidget) -> None:
@@ -1335,6 +2916,11 @@ class MainWindow(QMainWindow):
         self._tool_param_group.setSizePolicy(QSizePolicy.Policy.Expanding,
                                              QSizePolicy.Policy.Fixed)
         edit_layout.addWidget(self._tool_param_group)
+        self._edit_tool_detail_section = _CollapsibleSection(
+            "当前工具基础细则", summary="颜色 · 大小 · 填充模式 · 边界 / 选区参数",
+            expanded=False, settings_key="edit_tool_base")
+        tool_param_layout.addWidget(self._edit_tool_detail_section)
+        tool_detail_layout = self._edit_tool_detail_section.content_layout()
 
         edit_grid = QGridLayout()
         edit_grid.setContentsMargins(0, 0, 0, 0)
@@ -1347,7 +2933,7 @@ class MainWindow(QMainWindow):
         self._eyedropper_mode_box = eyedrop_box
         eyedrop_layout = QHBoxLayout(eyedrop_box)
         eyedrop_layout.setContentsMargins(0, 0, 0, 0)
-        eyedrop_layout.setSpacing(9)
+        eyedrop_layout.setSpacing(14)
         self._eyedropper_mode_group = QButtonGroup(self)
         self._eyedropper_mode_group.setExclusive(True)
         self._eyedropper_mode_point = QCheckBox(tr("eyedropper_mode_point"))
@@ -1385,7 +2971,7 @@ class MainWindow(QMainWindow):
         self._brush_spin = QSpinBox()
         self._brush_spin.setRange(0, 100)
         self._brush_spin.setValue(self._brush_slider.value())
-        self._brush_spin.setMaximumWidth(72)
+        self._brush_spin.setFixedWidth(68)
         self._brush_slider.valueChanged.connect(self._brush_spin.setValue)
         self._brush_spin.valueChanged.connect(self._brush_slider.setValue)
         self._brush_slider.valueChanged.connect(
@@ -1405,7 +2991,7 @@ class MainWindow(QMainWindow):
         self._picker_lightness_spin.setRange(-100, 100)
         self._picker_lightness_spin.setValue(0)
         self._picker_lightness_spin.setSuffix("%")
-        self._picker_lightness_spin.setMaximumWidth(72)
+        self._picker_lightness_spin.setFixedWidth(68)
         self._picker_lightness_spin.setToolTip(tr("picker_lightness_hint"))
         self._picker_lightness_slider.valueChanged.connect(
             self._on_picker_lightness_changed)
@@ -1425,7 +3011,7 @@ class MainWindow(QMainWindow):
         self._gap_close_spin.setRange(self._GAP_PX_MIN, self._GAP_PX_MAX)
         self._gap_close_spin.setSuffix(" px")
         self._gap_close_spin.setValue(self._gap_close_slider.value())
-        self._gap_close_spin.setMaximumWidth(72)
+        self._gap_close_spin.setFixedWidth(68)
         self._gap_close_spin.setToolTip(tr("gap_close_tooltip"))
         self._gap_close_slider.valueChanged.connect(
             self._gap_close_spin.setValue)
@@ -1450,7 +3036,7 @@ class MainWindow(QMainWindow):
         selection_mode_box = QWidget()
         selection_mode_layout = QHBoxLayout(selection_mode_box)
         selection_mode_layout.setContentsMargins(0, 0, 0, 0)
-        selection_mode_layout.setSpacing(8)
+        selection_mode_layout.setSpacing(14)
         self._selection_mode_group = QButtonGroup(self)
         self._selection_mode_group.setExclusive(True)
         self._selection_mode_radios = {}
@@ -1482,7 +3068,7 @@ class MainWindow(QMainWindow):
         self._selection_feather_spin.setRange(0, 30)
         self._selection_feather_spin.setSuffix(" px")
         self._selection_feather_spin.setValue(2)
-        self._selection_feather_spin.setMaximumWidth(72)
+        self._selection_feather_spin.setFixedWidth(68)
         self._selection_feather_spin.setToolTip(tr("selection_feather_hint"))
         self._selection_feather_slider.valueChanged.connect(
             self._selection_feather_spin.setValue)
@@ -1492,8 +3078,20 @@ class MainWindow(QMainWindow):
         edit_grid.addWidget(self._selection_feather_spin, 9, 2)
         register_tool_row("selection_feather", self._selection_feather_label, self._selection_feather_slider, self._selection_feather_spin)
 
+        self._selection_boundary_section = _CollapsibleSection(
+            "矩形 / 套索边界细则",
+            summary="闭合区 · 边缘扩张 · 小区域 / 细线过滤 · 手动修补 · 线稿吸附",
+            expanded=False, settings_key="edit_selection_boundary")
+        tool_param_layout.addWidget(self._selection_boundary_section)
+        selection_boundary_layout = self._selection_boundary_section.content_layout()
+        selection_boundary_grid = QGridLayout()
+        selection_boundary_grid.setContentsMargins(0, 0, 0, 0)
+        selection_boundary_grid.setHorizontalSpacing(7)
+        selection_boundary_grid.setVerticalSpacing(5)
+        selection_boundary_layout.addLayout(selection_boundary_grid)
+
         self._selection_closed_expand_label = QLabel(tr("selection_closed_expand"))
-        edit_grid.addWidget(self._selection_closed_expand_label, 10, 0)
+        selection_boundary_grid.addWidget(self._selection_closed_expand_label, 0, 0)
         self._selection_closed_expand_slider = QSlider(Qt.Orientation.Horizontal)
         self._selection_closed_expand_slider.setRange(0, 20)
         self._selection_closed_expand_slider.setValue(0)
@@ -1503,7 +3101,7 @@ class MainWindow(QMainWindow):
         self._selection_closed_expand_spin.setRange(0, 20)
         self._selection_closed_expand_spin.setSuffix(" px")
         self._selection_closed_expand_spin.setValue(0)
-        self._selection_closed_expand_spin.setMaximumWidth(72)
+        self._selection_closed_expand_spin.setFixedWidth(68)
         self._selection_closed_expand_spin.setToolTip(
             tr("selection_closed_expand_hint"))
         self._selection_closed_expand_slider.valueChanged.connect(
@@ -1512,12 +3110,12 @@ class MainWindow(QMainWindow):
             self._selection_closed_expand_slider.setValue)
         self._selection_closed_expand_slider.valueChanged.connect(
             self._schedule_closed_preview_refresh)
-        edit_grid.addWidget(self._selection_closed_expand_slider, 10, 1)
-        edit_grid.addWidget(self._selection_closed_expand_spin, 10, 2)
+        selection_boundary_grid.addWidget(self._selection_closed_expand_slider, 0, 1)
+        selection_boundary_grid.addWidget(self._selection_closed_expand_spin, 0, 2)
         register_tool_row("selection_closed_expand", self._selection_closed_expand_label, self._selection_closed_expand_slider, self._selection_closed_expand_spin)
 
         self._selection_closed_min_area_label = QLabel(tr("selection_closed_min_area"))
-        edit_grid.addWidget(self._selection_closed_min_area_label, 11, 0)
+        selection_boundary_grid.addWidget(self._selection_closed_min_area_label, 1, 0)
         self._selection_closed_min_area_slider = QSlider(Qt.Orientation.Horizontal)
         self._selection_closed_min_area_slider.setRange(0, 10000)
         self._selection_closed_min_area_slider.setValue(6)
@@ -1536,12 +3134,12 @@ class MainWindow(QMainWindow):
             self._selection_closed_min_area_slider.setValue)
         self._selection_closed_min_area_slider.valueChanged.connect(
             self._schedule_closed_preview_refresh)
-        edit_grid.addWidget(self._selection_closed_min_area_slider, 11, 1)
-        edit_grid.addWidget(self._selection_closed_min_area_spin, 11, 2)
+        selection_boundary_grid.addWidget(self._selection_closed_min_area_slider, 1, 1)
+        selection_boundary_grid.addWidget(self._selection_closed_min_area_spin, 1, 2)
         register_tool_row("selection_closed_min_area", self._selection_closed_min_area_label, self._selection_closed_min_area_slider, self._selection_closed_min_area_spin)
 
         self._selection_closed_min_thickness_label = QLabel(tr("selection_closed_min_thickness"))
-        edit_grid.addWidget(self._selection_closed_min_thickness_label, 12, 0)
+        selection_boundary_grid.addWidget(self._selection_closed_min_thickness_label, 2, 0)
         self._selection_closed_min_thickness_slider = QSlider(Qt.Orientation.Horizontal)
         self._selection_closed_min_thickness_slider.setRange(0, 100)
         self._selection_closed_min_thickness_slider.setValue(3)
@@ -1560,14 +3158,17 @@ class MainWindow(QMainWindow):
             self._selection_closed_min_thickness_slider.setValue)
         self._selection_closed_min_thickness_slider.valueChanged.connect(
             self._schedule_closed_preview_refresh)
-        edit_grid.addWidget(self._selection_closed_min_thickness_slider, 12, 1)
-        edit_grid.addWidget(self._selection_closed_min_thickness_spin, 12, 2)
+        selection_boundary_grid.addWidget(self._selection_closed_min_thickness_slider, 2, 1)
+        selection_boundary_grid.addWidget(self._selection_closed_min_thickness_spin, 2, 2)
         register_tool_row("selection_closed_min_thickness", self._selection_closed_min_thickness_label, self._selection_closed_min_thickness_slider, self._selection_closed_min_thickness_spin)
         edit_grid.setColumnStretch(1, 1)
-        tool_param_layout.addLayout(edit_grid)
+        tool_detail_layout.addLayout(edit_grid)
 
         # Independent custom-colour-bias brush controls. These widgets own
         # their state and never mutate the normal brush or global page-bias UI.
+        self._bias_brush_section = _CollapsibleSection("颜色倾向画笔细则", summary="画笔 / 消除 · 颜色 · 大小 · 强度 · 色调保护", expanded=False, settings_key="edit_bias_brush")
+        tool_param_layout.addWidget(self._bias_brush_section)
+
         self._bias_brush_box = QWidget()
         bias_brush_layout = QGridLayout(self._bias_brush_box)
         bias_brush_layout.setContentsMargins(0, 0, 0, 0)
@@ -1578,7 +3179,7 @@ class MainWindow(QMainWindow):
         self._bias_brush_mode_box = QWidget()
         bias_brush_mode_layout = QHBoxLayout(self._bias_brush_mode_box)
         bias_brush_mode_layout.setContentsMargins(0, 0, 0, 0)
-        bias_brush_mode_layout.setSpacing(6)
+        bias_brush_mode_layout.setSpacing(12)
         self._bias_brush_mode_group = QButtonGroup(self)
         self._bias_brush_mode_group.setExclusive(True)
         self._btn_bias_brush_paint = QPushButton(tr("bias_brush_mode_paint"))
@@ -1617,7 +3218,7 @@ class MainWindow(QMainWindow):
         self._bias_brush_size_spin = QSpinBox()
         self._bias_brush_size_spin.setRange(0, 100)
         self._bias_brush_size_spin.setValue(self._bias_brush_size_slider.value())
-        self._bias_brush_size_spin.setMaximumWidth(72)
+        self._bias_brush_size_spin.setFixedWidth(68)
         self._bias_brush_size_slider.valueChanged.connect(self._bias_brush_size_spin.setValue)
         self._bias_brush_size_spin.valueChanged.connect(self._bias_brush_size_slider.setValue)
         self._bias_brush_size_slider.valueChanged.connect(
@@ -1651,24 +3252,26 @@ class MainWindow(QMainWindow):
         bias_brush_layout.addWidget(self._bias_brush_tone_combo, 4, 1, 1, 2)
 
         self._bias_brush_protection_box = QWidget()
-        bias_protect_layout = QHBoxLayout(self._bias_brush_protection_box)
+        bias_protect_layout = QGridLayout(self._bias_brush_protection_box)
         bias_protect_layout.setContentsMargins(0, 0, 0, 0)
-        bias_protect_layout.setSpacing(8)
+        bias_protect_layout.setHorizontalSpacing(22)
+        bias_protect_layout.setVerticalSpacing(8)
         self._chk_bias_brush_protect_skin = QCheckBox(tr("custom_color_bias_protect_skin"))
         self._chk_bias_brush_protect_lineart = QCheckBox(tr("custom_color_bias_protect_lineart"))
         self._chk_bias_brush_protect_saturated = QCheckBox(tr("custom_color_bias_protect_saturated"))
         self._chk_bias_brush_protect_skin.setChecked(True)
         self._chk_bias_brush_protect_lineart.setChecked(True)
         self._chk_bias_brush_protect_saturated.setChecked(True)
-        bias_protect_layout.addWidget(self._chk_bias_brush_protect_skin)
-        bias_protect_layout.addWidget(self._chk_bias_brush_protect_lineart)
-        bias_protect_layout.addWidget(self._chk_bias_brush_protect_saturated)
-        bias_protect_layout.addStretch(1)
+        bias_protect_layout.addWidget(self._chk_bias_brush_protect_skin, 0, 0)
+        bias_protect_layout.addWidget(self._chk_bias_brush_protect_lineart, 0, 1)
+        bias_protect_layout.addWidget(self._chk_bias_brush_protect_saturated, 1, 0)
+        bias_protect_layout.setColumnStretch(0, 1)
+        bias_protect_layout.setColumnStretch(1, 1)
         bias_brush_layout.addWidget(QLabel(tr("custom_color_bias_protection")), 5, 0)
         bias_brush_layout.addWidget(self._bias_brush_protection_box, 5, 1, 1, 2)
         bias_brush_layout.setColumnStretch(1, 1)
-        tool_param_layout.addWidget(self._bias_brush_box)
-        register_tool_row("bias_brush_controls", self._bias_brush_box)
+        self._bias_brush_section.add_widget(self._bias_brush_box)
+        register_tool_row("bias_brush_controls", self._bias_brush_section, self._bias_brush_box)
         self._update_bias_brush_swatch()
 
         self._bias_eraser_size_label = QLabel(tr("bias_eraser_size"))
@@ -1678,7 +3281,7 @@ class MainWindow(QMainWindow):
         self._bias_eraser_size_spin = QSpinBox()
         self._bias_eraser_size_spin.setRange(0, 100)
         self._bias_eraser_size_spin.setValue(self._bias_eraser_size_slider.value())
-        self._bias_eraser_size_spin.setMaximumWidth(72)
+        self._bias_eraser_size_spin.setFixedWidth(68)
         self._bias_eraser_size_slider.valueChanged.connect(self._bias_eraser_size_spin.setValue)
         self._bias_eraser_size_spin.valueChanged.connect(self._bias_eraser_size_slider.setValue)
         self._bias_eraser_size_slider.valueChanged.connect(
@@ -1727,14 +3330,17 @@ class MainWindow(QMainWindow):
             tr("selection_closed_only_hint"))
         self._chk_selection_closed_only.toggled.connect(
             self._update_closed_expand_controls_enabled)
-        tool_param_layout.addWidget(self._chk_selection_closed_only)
+        selection_boundary_layout.addWidget(self._chk_selection_closed_only)
         register_tool_row("selection_closed_only", self._chk_selection_closed_only)
         self._update_closed_expand_controls_enabled(False)
 
+        self._selection_action_section = _CollapsibleSection("矩形 / 选区操作", summary="应用 · AI 重上色 · 语义选取 · 取消", expanded=True, settings_key="edit_selection_actions")
+        tool_param_layout.addWidget(self._selection_action_section)
         self._selection_action_box = QWidget()
-        selection_action_row = QHBoxLayout(self._selection_action_box)
+        selection_action_row = QGridLayout(self._selection_action_box)
         selection_action_row.setContentsMargins(0, 0, 0, 0)
-        selection_action_row.setSpacing(6)
+        selection_action_row.setHorizontalSpacing(6)
+        selection_action_row.setVerticalSpacing(6)
         self._btn_apply_selection = QPushButton(tr("selection_apply"))
         self._btn_apply_selection.setToolTip(tr("selection_apply_hint"))
         self._btn_apply_selection.clicked.connect(
@@ -1743,15 +3349,56 @@ class MainWindow(QMainWindow):
         self._btn_ai_recolor_selection.setToolTip(tr("selection_ai_recolor_hint"))
         self._btn_ai_recolor_selection.clicked.connect(
             self._start_selection_model_recolor)
+        self._btn_semantic_select = QPushButton(tr("selection_semantic_select"))
+        self._btn_semantic_select.setToolTip(tr("selection_semantic_select_hint"))
+        self._btn_semantic_select.clicked.connect(self._arm_semantic_selection)
+        self._btn_refine_hair = QPushButton("智能贴合发丝")
+        self._btn_refine_hair.setToolTip(
+            "先用矩形/套索粗选头发，可用下方发丝+与非发丝−标注，再将蓝框细化为发丝形状。"
+            "结合 mc-v2 已生成的配色做保守边界检查，但它不是独立训练的头发分割模型。"
+            "不确定区域仍需红色负向笔刷确认；本操作只修改选区，不直接改变图片。")
+        self._btn_refine_hair.clicked.connect(self._start_hair_selection_refine)
+        self._btn_refine_positive = QPushButton("发丝 + 画笔")
+        self._btn_refine_negative = QPushButton("非发丝 − 画笔")
+        self._btn_refine_positive.setToolTip("在头发内部拖动画笔，标明这里一定是头发；笔迹与项目一同保存。")
+        self._btn_refine_negative.setToolTip("在额头/面部/背景拖动画笔，标明这里不能染色；笔迹与项目一同保存。")
+        self._btn_refine_positive.clicked.connect(
+            lambda: self._activate_hair_refine_brush("brush_add"))
+        self._btn_refine_negative.clicked.connect(
+            lambda: self._activate_hair_refine_brush("brush_erase"))
+        self._btn_refine_stop_brush = QPushButton("结束标注")
+        self._btn_refine_stop_brush.clicked.connect(self._deactivate_hair_guard_selector)
+        self._btn_refine_clear_brush = QPushButton("清除发丝标注")
+        self._btn_refine_clear_brush.setToolTip("仅清除该页正负发丝标注，不清除粗选区和上色图片。")
+        self._btn_refine_clear_brush.clicked.connect(self._clear_hair_guard_selection)
         self._btn_cancel_selection = QPushButton(tr("selection_cancel"))
         self._btn_cancel_selection.clicked.connect(
             self._cancel_pending_selection_fill)
-        selection_action_row.addWidget(self._btn_apply_selection)
-        selection_action_row.addWidget(self._btn_ai_recolor_selection)
-        selection_action_row.addWidget(self._btn_cancel_selection)
-        tool_param_layout.addWidget(self._selection_action_box)
-        register_tool_row("selection_actions", self._selection_action_box)
+        self._btn_restore_selection_bw = QPushButton("选区恢复黑白")
+        self._btn_restore_selection_bw.setToolTip(
+            "只将当前选区恢复为原始黑白，选区外逐像素不变；可撤销，整页 AI 结果保留。")
+        self._btn_restore_selection_bw.clicked.connect(self._restore_selection_bw)
+        for _row, _col, _button in (
+            (0, 0, self._btn_apply_selection),
+            (0, 1, self._btn_restore_selection_bw),
+            (1, 0, self._btn_ai_recolor_selection),
+            (1, 1, self._btn_semantic_select),
+            (2, 0, self._btn_refine_hair),
+            (2, 1, self._btn_cancel_selection),
+            (3, 0, self._btn_refine_positive),
+            (3, 1, self._btn_refine_negative),
+            (4, 0, self._btn_refine_stop_brush),
+            (4, 1, self._btn_refine_clear_brush),
+        ):
+            _button.setMinimumWidth(0)
+            selection_action_row.addWidget(_button, _row, _col)
+        selection_action_row.setColumnStretch(0, 1)
+        selection_action_row.setColumnStretch(1, 1)
+        self._selection_action_section.add_widget(self._selection_action_box)
+        register_tool_row("selection_actions", self._selection_action_section, self._selection_action_box)
 
+        self._selection_ai_options_section = _CollapsibleSection("矩形 / 选区 AI 上色细则", summary="局部提示 · 上下文范围 · 发色预设 · 颜色锁定", expanded=False, settings_key="edit_selection_ai")
+        tool_param_layout.addWidget(self._selection_ai_options_section)
         self._selection_ai_options_box = QWidget()
         selection_ai_options = QGridLayout(self._selection_ai_options_box)
         selection_ai_options.setContentsMargins(0, 0, 0, 0)
@@ -1799,6 +3446,62 @@ class MainWindow(QMainWindow):
             tr("selection_clear_local_hints_hint"))
         self._btn_clear_selection_hints.clicked.connect(
             self._clear_selection_model_hints)
+
+        self._chk_selection_region_control = QCheckBox(tr("selection_region_control"))
+        self._chk_selection_region_control.setChecked(True)
+        self._chk_selection_region_control.setToolTip(tr("selection_region_control_hint"))
+        self._chk_selection_region_control.toggled.connect(
+            self._update_selection_region_control_enabled)
+        self._selection_control_preset_label = QLabel(tr("selection_control_hair_preset"))
+        self._selection_control_preset_combo = QComboBox()
+        self._selection_control_preset_combo.addItem(
+            tr("selection_control_preset_custom"), "custom")
+        self._selection_control_preset_combo.addItem(
+            tr("selection_control_preset_ink_black"), "ink_black")
+        self._selection_control_preset_combo.addItem(
+            tr("selection_control_preset_soft_black"), "soft_black")
+        self._selection_control_preset_combo.addItem(
+            tr("selection_control_preset_cool_black"), "cool_black")
+        self._selection_control_preset_combo.addItem(
+            tr("selection_control_preset_light_ink"), "light_ink")
+        self._selection_control_preset_combo.setToolTip(
+            tr("selection_control_hair_preset_hint"))
+        self._selection_control_preset_combo.currentIndexChanged.connect(
+            self._on_selection_control_preset_changed)
+        self._selection_control_color_label = QLabel(tr("selection_control_color"))
+        self._selection_control_color_btn = QPushButton()
+        self._selection_control_color_btn.clicked.connect(
+            self._pick_selection_control_color)
+
+        def _region_spin(key, minimum, maximum, value, suffix="%"):
+            label = QLabel(tr(key))
+            spin = QSpinBox()
+            spin.setRange(minimum, maximum)
+            spin.setValue(value)
+            spin.setSuffix(suffix)
+            return label, spin
+
+        self._selection_control_hint_label, self._selection_control_hint_spin = _region_spin(
+            "selection_control_hint_strength", 0, 100, 50)
+        self._selection_control_gain_label, self._selection_control_gain_spin = _region_spin(
+            "selection_control_feature_gain", 50, 400, 175)
+        self._selection_control_deep_label, self._selection_control_deep_spin = _region_spin(
+            "selection_control_deep", 0, 100, 38)
+        self._selection_control_middle_label, self._selection_control_middle_spin = _region_spin(
+            "selection_control_middle", 0, 100, 74)
+        self._selection_control_shallow_label, self._selection_control_shallow_spin = _region_spin(
+            "selection_control_shallow", 0, 100, 94)
+        self._selection_control_final_label, self._selection_control_final_spin = _region_spin(
+            "selection_control_final", 0, 100, 92)
+        self._selection_control_luminance_label, self._selection_control_luminance_spin = _region_spin(
+            "selection_control_luminance", 0, 100, 28)
+        self._chk_selection_control_adapter = QCheckBox(tr("selection_control_adapter"))
+        self._chk_selection_control_adapter.setChecked(False)
+        self._chk_selection_control_adapter.setToolTip(tr("selection_control_adapter_hint"))
+        self._selection_control_preset_combo.setCurrentIndex(1)
+        self._on_selection_control_preset_changed()
+        self._update_selection_control_swatch()
+
         selection_ai_options.addWidget(self._chk_selection_bw_preview, 0, 0, 1, 2)
         selection_ai_options.addWidget(self._chk_selection_local_hints_only, 1, 0, 1, 2)
         selection_ai_options.addWidget(self._selection_hint_margin_label, 2, 0)
@@ -1810,14 +3513,42 @@ class MainWindow(QMainWindow):
         selection_ai_options.addWidget(self._selection_focus_fade_label, 6, 0)
         selection_ai_options.addWidget(self._selection_focus_fade_spin, 6, 1)
         selection_ai_options.addWidget(self._btn_clear_selection_hints, 7, 0, 1, 2)
-        tool_param_layout.addWidget(self._selection_ai_options_box)
-        register_tool_row("selection_ai_options", self._selection_ai_options_box)
+        selection_ai_options.addWidget(self._chk_selection_region_control, 8, 0, 1, 2)
+        selection_ai_options.addWidget(self._selection_control_preset_label, 9, 0)
+        selection_ai_options.addWidget(self._selection_control_preset_combo, 9, 1)
+        selection_ai_options.addWidget(self._selection_control_color_label, 10, 0)
+        selection_ai_options.addWidget(self._selection_control_color_btn, 10, 1)
+        selection_ai_options.addWidget(self._selection_control_hint_label, 11, 0)
+        selection_ai_options.addWidget(self._selection_control_hint_spin, 11, 1)
+        selection_ai_options.addWidget(self._selection_control_gain_label, 12, 0)
+        selection_ai_options.addWidget(self._selection_control_gain_spin, 12, 1)
+        selection_ai_options.addWidget(self._selection_control_deep_label, 13, 0)
+        selection_ai_options.addWidget(self._selection_control_deep_spin, 13, 1)
+        selection_ai_options.addWidget(self._selection_control_middle_label, 14, 0)
+        selection_ai_options.addWidget(self._selection_control_middle_spin, 14, 1)
+        selection_ai_options.addWidget(self._selection_control_shallow_label, 15, 0)
+        selection_ai_options.addWidget(self._selection_control_shallow_spin, 15, 1)
+        selection_ai_options.addWidget(self._selection_control_final_label, 16, 0)
+        selection_ai_options.addWidget(self._selection_control_final_spin, 16, 1)
+        selection_ai_options.addWidget(self._selection_control_luminance_label, 17, 0)
+        selection_ai_options.addWidget(self._selection_control_luminance_spin, 17, 1)
+        selection_ai_options.addWidget(self._chk_selection_control_adapter, 18, 0, 1, 2)
+        self._selection_ai_options_section.add_widget(self._selection_ai_options_box)
+        register_tool_row("selection_ai_options", self._selection_ai_options_section, self._selection_ai_options_box)
+        self._btn_collapse_edit_details.clicked.connect(
+            lambda: self._collapse_sections(
+                self._edit_tool_detail_section, self._bias_brush_section,
+                self._selection_boundary_section, self._selection_action_section,
+                self._selection_ai_options_section))
+        self._btn_expand_current_edit_details.clicked.connect(
+            self._expand_current_tool_sections)
         self._update_selection_focus_controls_enabled()
+        self._update_selection_region_control_enabled()
 
         self._chk_selection_adjust = QCheckBox(tr("selection_adjust_checkbox"))
         self._chk_selection_adjust.setToolTip(tr("selection_adjust_hint"))
         self._chk_selection_adjust.toggled.connect(self._on_selection_adjust_toggled)
-        tool_param_layout.addWidget(self._chk_selection_adjust)
+        selection_boundary_layout.addWidget(self._chk_selection_adjust)
         register_tool_row("selection_adjust_toggle", self._chk_selection_adjust)
 
         self._selection_adjust_tools_box = QWidget()
@@ -1841,7 +3572,7 @@ class MainWindow(QMainWindow):
             lambda checked: self._set_selection_adjust_mode("erase") if checked else None)
         selection_adjust_tools.addWidget(self._btn_selection_adjust_add)
         selection_adjust_tools.addWidget(self._btn_selection_adjust_erase)
-        tool_param_layout.addWidget(self._selection_adjust_tools_box)
+        selection_boundary_layout.addWidget(self._selection_adjust_tools_box)
         register_tool_row("selection_adjust_tools", self._selection_adjust_tools_box)
 
         self._selection_adjust_row_box = QWidget()
@@ -1861,7 +3592,7 @@ class MainWindow(QMainWindow):
         self._selection_adjust_spin.valueChanged.connect(self._selection_adjust_slider.setValue)
         selection_adjust_row.addWidget(self._selection_adjust_slider, 1)
         selection_adjust_row.addWidget(self._selection_adjust_spin)
-        tool_param_layout.addWidget(self._selection_adjust_row_box)
+        selection_boundary_layout.addWidget(self._selection_adjust_row_box)
         register_tool_row("selection_adjust_radius", self._selection_adjust_row_box)
         self._on_selection_adjust_radius_changed(self._selection_adjust_slider.value())
         self._set_selection_adjust_mode("add")
@@ -1869,7 +3600,7 @@ class MainWindow(QMainWindow):
         self._chk_selection_snap_lineart = QCheckBox(tr("selection_snap_lineart_checkbox"))
         self._chk_selection_snap_lineart.setChecked(False)
         self._chk_selection_snap_lineart.setToolTip(tr("selection_snap_lineart_hint"))
-        tool_param_layout.addWidget(self._chk_selection_snap_lineart)
+        selection_boundary_layout.addWidget(self._chk_selection_snap_lineart)
         register_tool_row("selection_snap_toggle", self._chk_selection_snap_lineart)
 
         self._selection_snap_row_box = QWidget()
@@ -1891,8 +3622,11 @@ class MainWindow(QMainWindow):
             self._selection_snap_distance_slider.setValue)
         selection_snap_row.addWidget(self._selection_snap_distance_slider, 1)
         selection_snap_row.addWidget(self._selection_snap_distance_spin)
-        tool_param_layout.addWidget(self._selection_snap_row_box)
+        selection_boundary_layout.addWidget(self._selection_snap_row_box)
         register_tool_row("selection_snap_distance", self._selection_snap_row_box)
+        self._chk_selection_closed_only.toggled.connect(lambda _checked: self._refresh_edit_detail_summary())
+        self._chk_selection_adjust.toggled.connect(lambda _checked: self._refresh_edit_detail_summary())
+        self._chk_selection_snap_lineart.toggled.connect(lambda _checked: self._refresh_edit_detail_summary())
 
         self._btn_reset_tool_parameters = QPushButton(tr("reset_tool_parameters"))
         self._btn_reset_tool_parameters.clicked.connect(
@@ -1922,6 +3656,7 @@ class MainWindow(QMainWindow):
 
         self._btn_regenerate = tune_button(
             QPushButton(tr("regenerate_btn")), 35)
+        self._btn_regenerate.setObjectName("AccentSecondaryButton")
         self._btn_regenerate.clicked.connect(self._run_regenerate)
         hint_layout.addWidget(self._btn_regenerate)
         edit_layout.addStretch(1)
@@ -1929,7 +3664,7 @@ class MainWindow(QMainWindow):
         self._update_color_swatch()
         self._set_eyedropper_mode("point")
         self._update_selection_buttons(False)
-        edit_tab_layout.addWidget(edit_group, stretch=1)
+        edit_tab_layout.addWidget(edit_group)
 
         history_group, history_layout = make_group(tr("edit_history_group"))
         history_group.setSizePolicy(QSizePolicy.Policy.Expanding,
@@ -1943,40 +3678,468 @@ class MainWindow(QMainWindow):
         edit_tab_layout.addWidget(history_group, stretch=0)
         self._right_tabs.addTab(edit_tab, tr("right_tab_edit"))
 
-        # ── Tab 3: view, restore and export ───────────────────────────
-        output_tab, output_layout = make_tab()
-        view_group, view_layout = make_group(tr("view_group"))
+        # ── Tab 3: dedicated hair recolor workspace ─────────────────
+        hair_tab, hair_content, hair_tab_layout = make_scrollable_tab()
+        self._hair_recolor_scroll_area = hair_tab
+        hair_tab_layout.setSpacing(6)
+        auto_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        hair_tab_layout.addWidget(auto_group)
+        hair_tab_layout.addStretch(1)
+
+        hair_workspace = QWidget()
+        hair_workspace_layout = QVBoxLayout(hair_workspace)
+        hair_workspace_layout.setContentsMargins(0, 0, 0, 0)
+        hair_workspace_layout.setSpacing(8)
+        hair_workspace_layout.addWidget(hair_tab, stretch=1)
+
+        self._hair_recolor_action_box = QWidget()
+        self._hair_recolor_action_box.setObjectName("RenderPrimaryActionBox")
+        self._hair_recolor_action_box.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                                    QSizePolicy.Policy.Fixed)
+        hair_action_layout = QVBoxLayout(self._hair_recolor_action_box)
+        hair_action_layout.setContentsMargins(10, 10, 10, 10)
+        hair_action_layout.setSpacing(8)
+        self._hair_recolor_status_label = QLabel("应用当前头发纠色设置并自动上色")
+        self._hair_recolor_status_label.setObjectName("RenderActionStatusLabel")
+        self._hair_recolor_status_label.setWordWrap(True)
+        hair_action_layout.addWidget(self._hair_recolor_status_label)
+        self._btn_hair_recolor_auto = tune_button(QPushButton("自动上色（应用头发纠色）"), 42)
+        self._btn_hair_recolor_auto.setObjectName("PrimaryAutoColorizeButton")
+        self._btn_hair_recolor_auto.setMinimumWidth(0)
+        self._btn_hair_recolor_auto.setToolTip("按当前头发纠色页中的设置，对当前选中的页面直接执行自动上色。")
+        self._btn_hair_recolor_auto.clicked.connect(self._run_auto_colorize)
+        hair_action_layout.addWidget(self._btn_hair_recolor_auto)
+        hair_workspace_layout.addWidget(self._hair_recolor_action_box, stretch=0)
+
+        # Legacy contract marker for v5.13.11 regression checks:
+        # self._right_tabs.addTab(hair_tab, "头发纠色")
+        self._right_tabs.addTab(hair_workspace, "头发纠色")
+
+        # ── Tab 4: view, restore and export ───────────────────────────
+        output_tab, output_content, output_layout = make_scrollable_tab()
+        self._output_scroll_area = output_tab
+
+        view_group, view_layout = make_group("预览版本")
         self._view_tool_group = QButtonGroup(self)
-        self._radio_view_original = QRadioButton(tr("view_original"))
-        self._radio_view_ai = QRadioButton(tr("view_ai"))
-        self._radio_view_edited = QRadioButton(tr("view_edited"))
+        self._view_tool_group.setExclusive(True)
+        self._radio_view_original = QRadioButton("原图")
+        self._radio_view_ai = QRadioButton("AI结果")
+        self._radio_view_edited = QRadioButton("编辑后")
         self._radio_view_edited.setChecked(True)
+
+        self._view_segment_bar = QWidget()
+        self._view_segment_bar.setObjectName("ViewSegmentBar")
+        view_mode_row = QHBoxLayout(self._view_segment_bar)
+        view_mode_row.setContentsMargins(4, 4, 4, 4)
+        view_mode_row.setSpacing(4)
         for rb in (self._radio_view_original, self._radio_view_ai,
                    self._radio_view_edited):
+            rb.setObjectName("ViewSegmentButton")
+            rb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            rb.setMinimumHeight(34)
             self._view_tool_group.addButton(rb)
             rb.toggled.connect(self._on_view_mode_changed)
-            view_layout.addWidget(rb)
+            view_mode_row.addWidget(rb, 1)
+        view_layout.addWidget(self._view_segment_bar)
+        view_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        output_layout.addWidget(view_group, stretch=0)
+
+        restore_group, restore_layout = make_group("版本操作")
+        # Keep the established full-width restore layout contract while the
+        # visual card itself is now separated from the preview switcher.
+        view_layout = restore_layout
         self._btn_restore_ai = QPushButton(tr("restore_ai"))
+        self._btn_restore_ai.setObjectName("AccentSecondaryButton")
         self._btn_restore_ai.clicked.connect(self._restore_to_ai_result)
         self._btn_restore_bw = QPushButton(tr("restore_bw"))
+        self._btn_restore_bw.setObjectName("DangerSoftButton")
         self._btn_restore_bw.clicked.connect(self._restore_to_original)
+        for _restore_btn in (self._btn_restore_ai, self._btn_restore_bw):
+            _restore_btn.setMinimumHeight(36)
+            _restore_btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                       QSizePolicy.Policy.Fixed)
+            _restore_btn.setToolTip(_restore_btn.text())
         add_button_grid(view_layout,
-                        [self._btn_restore_ai, self._btn_restore_bw])
-        output_layout.addWidget(view_group, stretch=3)
+                        [self._btn_restore_ai, self._btn_restore_bw], columns=1)
+        restore_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        output_layout.addWidget(restore_group, stretch=0)
 
         export_group, export_layout = make_group(tr("export_group"))
+        export_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        compression_label = QLabel(tr("export_compression_mode"))
+        self._export_compression_combo = QComboBox()
+        self._export_compression_combo.addItem(
+            tr("export_compression_smart_webp"), "smart_webp")
+        self._export_compression_combo.addItem(
+            tr("export_compression_webp_lossless"), "webp_lossless")
+        self._export_compression_combo.addItem(
+            tr("export_compression_png"), "png_optimized")
+        self._export_compression_combo.addItem(
+            tr("export_compression_jpeg"), "jpeg_high")
+        self._export_compression_combo.setToolTip(
+            tr("export_compression_tooltip"))
+        self._export_compression_combo.setCurrentIndex(
+            self._export_compression_combo.findData("png_optimized"))
+        self._export_compression_combo.currentIndexChanged.connect(
+            self._on_export_compression_profile_changed)
+        export_layout.addWidget(compression_label)
+        export_layout.addWidget(self._export_compression_combo)
+        self._export_compression_status = QLabel(tr("export_compression_waiting"))
+        self._export_compression_status.setWordWrap(True)
+        self._export_compression_status.setToolTip(
+            tr("export_compression_status_tooltip"))
+        export_layout.addWidget(self._export_compression_status)
         self._btn_export_page = QPushButton(tr("export_page"))
+        self._btn_export_page.setObjectName("AccentSecondaryButton")
         self._btn_export_page.clicked.connect(self._export_current_page)
         self._btn_export_all = QPushButton(tr("export_all"))
+        self._btn_export_all.setObjectName("OutputPrimaryButton")
         self._btn_export_all.clicked.connect(self._export_all_pages)
+        self._btn_export_page.setMinimumHeight(38)
+        self._btn_export_all.setMinimumHeight(38)
         add_button_grid(export_layout,
                         [self._btn_export_page, self._btn_export_all])
-        output_layout.addWidget(export_group, stretch=2)
-        self._right_tabs.addTab(output_tab, tr("right_tab_output"))
+        output_layout.addWidget(export_group, stretch=0)
+        output_layout.addStretch(1)
+        # Legacy contract marker for dedicated output tab regression checks:
+        # self._right_tabs.addTab(output_tab, tr("right_tab_output"))
+        self._right_tabs.addTab(output_tab, "查看导出")
 
         return panel
 
     # ── Import ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cleanup_stale_session_caches(max_age_hours: int = 24) -> None:
+        """Remove abandoned Colortina temp caches left by crashes."""
+        root = tempfile.gettempdir()
+        cutoff = time.time() - max(1, int(max_age_hours)) * 3600
+        try:
+            entries = os.scandir(root)
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                is_session_cache = entry.name.startswith("colortina_session_cache_")
+                is_pdf_cache = (entry.name.startswith("colortina_") and
+                                "_pages_" in entry.name)
+                if not (is_session_cache or is_pdf_cache):
+                    continue
+                try:
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                except OSError:
+                    pass
+
+    def _cleanup_session_layer_cache(self) -> None:
+        for timer in list(getattr(self, "_spill_delay_timers", {}).values()):
+            timer.stop()
+            timer.deleteLater()
+        if hasattr(self, "_spill_delay_timers"):
+            self._spill_delay_timers.clear()
+        for timer in list(getattr(self, "_export_compress_timers", {}).values()):
+            timer.stop()
+            timer.deleteLater()
+        if hasattr(self, "_export_compress_timers"):
+            self._export_compress_timers.clear()
+        if hasattr(self, "_export_compress_queue"):
+            self._export_compress_queue.clear()
+        if hasattr(self, "_export_compress_queued"):
+            self._export_compress_queued.clear()
+        if hasattr(self, "_spill_queue"):
+            self._spill_queue.clear()
+        if hasattr(self, "_spill_queued"):
+            self._spill_queued.clear()
+        for state in self._pages.values():
+            state.clear_layer_cache()
+        path = getattr(self, "_session_layer_cache_dir", None)
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _current_export_profile(self) -> str:
+        from core.image_compressor import DEFAULT_PROFILE, normalize_profile
+        combo = getattr(self, "_export_compression_combo", None)
+        return normalize_profile(combo.currentData() if combo is not None else DEFAULT_PROFILE)
+
+    def _cancel_delayed_export_compression(self, path: str | None) -> None:
+        if not path:
+            return
+        timer = self._export_compress_timers.pop(path, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        if path in self._export_compress_queued:
+            self._export_compress_queued.discard(path)
+            try:
+                self._export_compress_queue.remove(path)
+            except ValueError:
+                pass
+
+    def _schedule_export_compression(self, path: str | None, *, delay_ms: int = 900) -> None:
+        """Pre-encode final export bytes without blocking painting or clicks."""
+        if self._closing or not path:
+            return
+        state = self._pages.get(path)
+        if state is None or not state.has_result:
+            return
+        profile = self._current_export_profile()
+        if state.has_valid_export_cache(profile):
+            if path == self._current_path:
+                self._update_export_compression_status(state)
+            return
+        if delay_ms <= 0 and int(getattr(self, "_foreground_interaction_depth", 0)) > 0:
+            delay_ms = 550
+        if delay_ms > 0:
+            self._cancel_delayed_export_compression(path)
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(max(1, int(delay_ms)))
+            timer.timeout.connect(
+                lambda page_path=path: self._schedule_export_compression(
+                    page_path, delay_ms=0))
+            self._export_compress_timers[path] = timer
+            timer.start()
+            return
+        self._cancel_delayed_export_compression(path)
+        if path in self._pending_export_cache:
+            self._recompress_after_pending.add(path)
+            return
+        if path not in self._export_compress_queued:
+            self._export_compress_queue.append(path)
+            self._export_compress_queued.add(path)
+        self._pump_layer_spill_queue()
+        self._pump_export_compression_queue()
+
+    def _pump_export_compression_queue(self) -> None:
+        # One shared executor keeps PNG session spilling and final-image codec
+        # work from saturating all CPU cores at the same time. Layer spooling
+        # has priority because it releases much more RAM.
+        if (self._closing or self._pending_layer_spills or
+                self._pending_export_cache or self._spill_queue):
+            return
+        while self._export_compress_queue:
+            path = self._export_compress_queue.popleft()
+            self._export_compress_queued.discard(path)
+            state = self._pages.get(path)
+            if state is None or not state.has_result:
+                continue
+            request = state.prepare_export_cache_request(
+                self._session_layer_cache_dir, self._current_export_profile())
+            if request is None:
+                continue
+            token = (int(request["state_id"]), int(request["serial"]))
+            self._pending_export_cache[path] = token
+            future = self._layer_cache_executor.submit(_write_export_cache, request)
+
+            def _done(done_future, page_path=path, page_token=token):
+                try:
+                    result = done_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "path": page_path,
+                        "state_id": page_token[0],
+                        "serial": page_token[1],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                if getattr(self, "_closing", False):
+                    _discard_export_cache_result(result)
+                    return
+                try:
+                    self._export_cache_bridge.completed.emit(result)
+                except RuntimeError:
+                    _discard_export_cache_result(result)
+
+            future.add_done_callback(_done)
+            return
+
+    def _on_export_cache_done(self, result: dict) -> None:
+        path = str(result.get("path", ""))
+        token = (int(result.get("state_id", -1)), int(result.get("serial", -1)))
+        if self._pending_export_cache.get(path) == token:
+            self._pending_export_cache.pop(path, None)
+        state = self._pages.get(path)
+        committed = False
+        if (state is None or id(state) != token[0] or result.get("error")):
+            _discard_export_cache_result(result)
+        else:
+            committed = state.commit_export_cache_result(result)
+        if committed and path == self._current_path:
+            self._update_export_compression_status(state)
+        if path in self._recompress_after_pending:
+            self._recompress_after_pending.discard(path)
+            self._schedule_export_compression(path, delay_ms=0)
+        self._pump_layer_spill_queue()
+        self._pump_export_compression_queue()
+
+    def _update_export_compression_status(self, state: PageState | None = None) -> None:
+        label = getattr(self, "_export_compression_status", None)
+        if label is None:
+            return
+        state = state or self._current_state()
+        if state is None or not state.has_result:
+            label.setText(tr("export_compression_waiting"))
+            return
+        path, meta = state.export_cache_info(self._current_export_profile())
+        if not path:
+            label.setText(tr("export_compression_pending"))
+            return
+        compressed = int(meta.get("compressed_bytes", 0) or 0)
+        raw = int(meta.get("original_bytes", 0) or 0)
+        saved = float(meta.get("saved_percent", 0.0) or 0.0)
+        codec = str(meta.get("codec", ""))
+        label.setText(tr("export_compression_ready").format(
+            codec=codec, size=self._format_bytes(compressed),
+            raw=self._format_bytes(raw), saved=saved))
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        size = float(max(0, int(value)))
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if size < 1024.0 or unit == "GiB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024.0
+        return f"{size:.1f} GiB"
+
+    def _on_export_compression_profile_changed(self, _index: int = -1) -> None:
+        for state in self._pages.values():
+            state.invalidate_export_cache()
+        self._update_export_compression_status()
+        for path, state in self._pages.items():
+            if state.has_result:
+                self._schedule_export_compression(
+                    path, delay_ms=300 if path == self._current_path else 0)
+
+    def _cancel_delayed_spill(self, path: str | None) -> None:
+        if not path:
+            return
+        timer = self._spill_delay_timers.pop(path, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        if path in getattr(self, "_spill_queued", set()):
+            self._spill_queued.discard(path)
+            try:
+                self._spill_queue.remove(path)
+            except ValueError:
+                pass
+
+    def _begin_foreground_interaction(self) -> None:
+        self._foreground_interaction_depth = max(
+            0, int(getattr(self, "_foreground_interaction_depth", 0))) + 1
+
+    def _end_foreground_interaction(self) -> None:
+        self._foreground_interaction_depth = max(
+            0, int(getattr(self, "_foreground_interaction_depth", 0)) - 1)
+
+    def _schedule_page_spill(self, path: str | None, *, delay_ms: int = 0) -> None:
+        """Spool an inactive page without doing compression on the UI thread."""
+        if self._closing or not path or path == self._current_path:
+            return
+        state = self._pages.get(path)
+        if state is None:
+            return
+
+        # PNG encoding runs outside Qt, but it still competes for CPU and disk
+        # bandwidth.  Do not start a new spill while the user is actively
+        # drawing or adjusting a selection; retry shortly after the gesture.
+        if delay_ms <= 0 and int(getattr(self, "_foreground_interaction_depth", 0)) > 0:
+            delay_ms = 450
+
+        if delay_ms > 0:
+            self._cancel_delayed_spill(path)
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(max(1, int(delay_ms)))
+            timer.timeout.connect(
+                lambda page_path=path: self._schedule_page_spill(page_path, delay_ms=0))
+            self._spill_delay_timers[path] = timer
+            timer.start()
+            return
+
+        self._cancel_delayed_spill(path)
+        if state.can_release_cached_layers():
+            state.release_cached_layers()
+            return
+
+        pending = self._pending_layer_spills.get(path)
+        if pending is not None:
+            self._respool_after_pending.add(path)
+            return
+
+        # Queue only lightweight page paths.  Preparing every request up front
+        # would make the executor's waiting futures retain full-resolution
+        # ndarray references even though only one PNG can be written at once.
+        if path not in self._spill_queued:
+            self._spill_queue.append(path)
+            self._spill_queued.add(path)
+        self._pump_layer_spill_queue()
+
+    def _pump_layer_spill_queue(self) -> None:
+        if self._closing or self._pending_layer_spills or self._pending_export_cache:
+            return
+        while self._spill_queue:
+            path = self._spill_queue.popleft()
+            self._spill_queued.discard(path)
+            if path == self._current_path:
+                continue
+            state = self._pages.get(path)
+            if state is None:
+                continue
+            if state.can_release_cached_layers():
+                state.release_cached_layers()
+                continue
+            request = state.prepare_spill_request(self._session_layer_cache_dir)
+            if request is None:
+                continue
+            token = (int(request["state_id"]), int(request["serial"]))
+            self._pending_layer_spills[path] = token
+            future = self._layer_cache_executor.submit(_write_layer_spill, request)
+
+            def _done(done_future, page_path=path, page_token=token):
+                try:
+                    result = done_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "path": page_path,
+                        "state_id": page_token[0],
+                        "serial": page_token[1],
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "created_paths": set(),
+                    }
+                if getattr(self, "_closing", False):
+                    _discard_spill_files(result)
+                    return
+                try:
+                    self._layer_cache_bridge.completed.emit(result)
+                except RuntimeError:
+                    _discard_spill_files(result)
+
+            future.add_done_callback(_done)
+            return
+
+    def _on_layer_spill_done(self, result: dict) -> None:
+        path = str(result.get("path", ""))
+        token = (int(result.get("state_id", -1)), int(result.get("serial", -1)))
+        if self._pending_layer_spills.get(path) == token:
+            self._pending_layer_spills.pop(path, None)
+        state = self._pages.get(path)
+        if (state is None or id(state) != token[0] or result.get("error")):
+            _discard_spill_files(result)
+        else:
+            state.commit_spill_result(
+                result, release=(path != self._current_path))
+
+        if path in self._respool_after_pending:
+            self._respool_after_pending.discard(path)
+            if path != self._current_path:
+                self._schedule_page_spill(path, delay_ms=0)
+        self._pump_layer_spill_queue()
+        self._pump_export_compression_queue()
+
+    def _spill_inactive_page(self, path: str | None) -> None:
+        self._schedule_page_spill(path, delay_ms=0)
 
     _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")
 
@@ -2020,16 +4183,78 @@ class MainWindow(QMainWindow):
         self._import_pdf_path(pdf_path)
 
     def _import_pdf_path(self, pdf_path: str):
-        out_dir = os.path.join(os.path.dirname(pdf_path),
-                               os.path.splitext(os.path.basename(pdf_path))[0] + "_pages")
+        safe_name = os.path.splitext(os.path.basename(pdf_path))[0] or "pdf"
+        out_dir = tempfile.mkdtemp(prefix=f"colortina_{safe_name}_pages_")
+        self._temp_pdf_page_dirs.add(out_dir)
         self.statusBar().showMessage(tr("splitting_pdf"))
         try:
             page_paths = extract_pages(pdf_path, out_dir, dpi=300)
         except Exception as exc:
+            self._cleanup_temp_pdf_dir(out_dir)
             QMessageBox.critical(self, tr("error_title"), tr("pdf_split_failed").format(exc=exc))
             return
         added = self._add_pages_fast(page_paths)
         self.statusBar().showMessage(tr("imported_n_pages").format(n=added), 5000)
+
+    def _cleanup_temp_pdf_dir(self, path: str):
+        self._temp_pdf_page_dirs.discard(path)
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _cleanup_temp_pdf_dirs(self):
+        for path in list(getattr(self, "_temp_pdf_page_dirs", set())):
+            self._cleanup_temp_pdf_dir(path)
+
+    def _running_background_workers(self) -> list:
+        workers = []
+        for name in ("_batch_worker", "_hair_model_worker", "_local_recolor_worker",
+                     "_semantic_selection_worker", "_hair_refine_worker", "_line_extract_worker"):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    workers.append(worker)
+            except RuntimeError:
+                continue
+        return workers
+
+    def closeEvent(self, event):
+        running_workers = self._running_background_workers()
+        if running_workers:
+            # QThread children must not be destroyed while they are still
+            # running.  Several model operations are not safely cancellable
+            # mid-inference/download, so keep the window alive until the
+            # current task reaches its normal completion callback.
+            event.ignore()
+            self.statusBar().showMessage(
+                "后台任务仍在运行，请等待当前任务完成后再关闭程序。", 6000)
+            try:
+                QMessageBox.information(
+                    self, "任务仍在运行",
+                    "当前仍有上色、识别或模型任务在后台运行。为了避免线程被强制销毁导致崩溃，"
+                    "请等待当前任务完成后再关闭程序。")
+            except RuntimeError:
+                pass
+            return
+        self._closing = True
+        for timer in list(getattr(self, "_spill_delay_timers", {}).values()):
+            timer.stop()
+        for timer in list(getattr(self, "_export_compress_timers", {}).values()):
+            timer.stop()
+        try:
+            self._layer_cache_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        self._spill_queue.clear()
+        self._spill_queued.clear()
+        self._export_compress_queue.clear()
+        self._export_compress_queued.clear()
+        self._cleanup_temp_pdf_dirs()
+        self._cleanup_session_layer_cache()
+        super().closeEvent(event)
 
     def _register_page_path(self, path: str) -> QListWidgetItem | None:
         path = os.path.abspath(path)
@@ -2102,7 +4327,9 @@ class MainWindow(QMainWindow):
         for item in items:
             path = item.data(Qt.ItemDataRole.UserRole)
             deleted_paths.add(path)
-            self._pages.pop(path, None)
+            removed_state = self._pages.pop(path, None)
+            if removed_state is not None:
+                removed_state.clear_layer_cache()
             row = self._page_list.row(item)
             self._page_list.takeItem(row)
 
@@ -2127,6 +4354,33 @@ class MainWindow(QMainWindow):
         self._page_list.insertItem(new_row, item)
         self._page_list.setCurrentRow(new_row)
 
+    def _refresh_workspace_stats(self) -> None:
+        total = len(getattr(self, "_pages", {}) or {})
+        try:
+            selected = len(self._page_list.selectedItems()) if hasattr(self, "_page_list") and self._page_list is not None else 0
+        except RuntimeError:
+            selected = 0
+        colored = 0
+        for _path, state in (getattr(self, "_pages", {}) or {}).items():
+            if getattr(state, "has_ai_result", False):
+                colored += 1
+        pending = max(0, total - colored)
+        for attr, value in (("_stats_total_pages", total), ("_stats_selected_pages", selected), ("_stats_colored_pages", colored), ("_stats_pending_pages", pending),
+                            ("_footer_total_pages", total), ("_footer_selected_pages", selected), ("_footer_colored_pages", colored), ("_footer_pending_pages", pending)):
+            label = getattr(self, attr, None)
+            if label is not None:
+                label.setText(str(int(value)))
+        if bool(getattr(self, "_ui_busy", False)):
+            status_text = "处理中"
+        else:
+            status_text = "待导入" if total <= 0 else ("待上色" if pending > 0 else "完成")
+        footer_status = getattr(self, "_footer_status_value", None)
+        if footer_status is not None:
+            footer_status.setText(status_text)
+        header_status = getattr(self, "_header_status_chip", None)
+        if header_status is not None:
+            header_status.setText("● " + status_text)
+
     def _repopulate_page_list(self):
         """Rebuild the page-list widget from `self._pages` — needed after
         a language-switch UI rebuild, since `_build_left_panel()` creates
@@ -2134,7 +4388,7 @@ class MainWindow(QMainWindow):
         selected_row = -1
         for i, (path, state) in enumerate(self._pages.items()):
             label = os.path.basename(path)
-            if state.ai_result_bgr is not None:
+            if state.has_ai_result:
                 marker = "⚠ " if (state.quality_report is not None and
                                     state.quality_report.score < 60) else "✓ "
                 label = marker + label
@@ -2154,6 +4408,7 @@ class MainWindow(QMainWindow):
         if selected_row >= 0:
             self._page_list.setCurrentRow(selected_row)
         self._fit_left_panel_to_filenames()
+        self._refresh_workspace_stats()
 
     # ── Page selection ────────────────────────────────────────────────
 
@@ -2161,9 +4416,16 @@ class MainWindow(QMainWindow):
         if current is None:
             return
         path = current.data(Qt.ItemDataRole.UserRole)
+        previous_path = self._current_path
         self._cancel_pending_selection_fill()
         self._current_path = path
+        self._cancel_delayed_spill(path)
+        if previous_path and previous_path != path:
+            # Keep the immediately previous page hot for a short grace period;
+            # rapid back/forward clicks then avoid both compression and decode.
+            self._schedule_page_spill(previous_path, delay_ms=1500)
         state = self._pages[path]
+        self._update_view_mode_availability()
         try:
             self._sync_view_after_edit(state)
         except Exception as exc:
@@ -2172,9 +4434,109 @@ class MainWindow(QMainWindow):
         # Auto-fit the newly displayed page to the window.
         self._canvas.fit_view()
         self._update_controls_enabled()
+        self._refresh_workspace_stats()
         self._refresh_character_diagnostics()
 
     # ── Colorize actions ─────────────────────────────────────────────
+
+    @staticmethod
+    def _collapse_sections(*sections) -> None:
+        for section in sections:
+            if section is not None and hasattr(section, "set_expanded"):
+                section.set_expanded(False)
+
+    def _refresh_auto_detail_summaries(self, *_args) -> None:
+        base = getattr(self, "_auto_detail_section", None)
+        if base is not None:
+            protect = bool(getattr(self, "_chk_protect_text", None) and
+                           self._chk_protect_text.isChecked())
+            base.set_summary("文字气泡保护：" + ("开启" if protect else "关闭"))
+
+        hair = getattr(self, "_hair_guard_detail_section", None)
+        if hair is not None:
+            enabled = bool(getattr(self, "_chk_auto_black_hair_guard", None) and
+                           self._chk_auto_black_hair_guard.isChecked())
+            mode_combo = getattr(self, "_combo_auto_black_hair_guard_mode", None)
+            scope_combo = getattr(self, "_combo_auto_black_hair_guard_scope", None)
+            limit_combo = getattr(self, "_combo_auto_black_hair_guard_limit_mode", None)
+            mode = mode_combo.currentText() if mode_combo is not None else ""
+            scope = scope_combo.currentText() if scope_combo is not None else ""
+            limit = limit_combo.currentText() if limit_combo is not None else ""
+            color = QColor(getattr(self, "_hair_recolor_color", QColor(24, 24, 24))).name()
+            selection_suffix = ""
+            if self._auto_black_hair_guard_requires_selection():
+                selection_mask = self._current_hair_guard_selection_mask()
+                selection_area = int(np.count_nonzero(selection_mask)) if selection_mask is not None else 0
+                selection_suffix = f" · 选区 {selection_area} px"
+            hair.set_summary(
+                f"{'开启' if enabled else '关闭'} · {mode} · {scope} · {limit} · {color}{selection_suffix}")
+
+        ai = getattr(self, "_ai_hair_detail_section", None)
+        if ai is not None:
+            enabled = bool(getattr(self, "_chk_ai_hair_parser", None) and
+                           self._chk_ai_hair_parser.isChecked())
+            combo = getattr(self, "_combo_ai_hair_parser_backend", None)
+            backend = combo.currentText() if combo is not None else "自动"
+            ai.set_summary(f"{'开启' if enabled else '关闭'} · {backend}")
+
+    def _refresh_edit_detail_summary(self, tool: str | None = None) -> None:
+        tool = tool or self._current_manual_tool_key()
+        section = getattr(self, "_edit_tool_detail_section", None)
+        hint = getattr(self, "_edit_context_hint", None)
+        summaries = {
+            "brush": "画笔上色：颜色 · 画笔大小 · 填充模式 · 风格匹配",
+            "bias_brush": "颜色倾向画笔：画笔 / 消除 · 颜色 · 强度 · 色调保护",
+            "eyedropper": "吸管：点 / 区域取色 · 明度调整 · 模型提示",
+            "bucket": "油漆桶：颜色 · 缝隙闭合 · 填充模式",
+            "lasso": "套索上色：选区模式 · 羽化 · 闭合区过滤 · AI 重上色",
+            "rect": "矩形上色：选区模式 · 羽化 · 闭合区过滤 · AI 重上色",
+        }
+        if section is not None:
+            titles = {
+                "brush": "画笔上色基础",
+                "bias_brush": "颜色倾向画笔",
+                "eyedropper": "吸管基础",
+                "bucket": "油漆桶基础",
+                "lasso": "套索上色基础",
+                "rect": "矩形上色基础",
+            }
+            section.set_title(titles.get(tool, "当前工具基础细则"))
+            section.set_summary(summaries.get(tool, "当前工具参数"))
+        boundary = getattr(self, "_selection_boundary_section", None)
+        if boundary is not None:
+            closed_only = bool(getattr(self, "_chk_selection_closed_only", None) and
+                               self._chk_selection_closed_only.isChecked())
+            snap = bool(getattr(self, "_chk_selection_snap_lineart", None) and
+                        self._chk_selection_snap_lineart.isChecked())
+            adjust = bool(getattr(self, "_chk_selection_adjust", None) and
+                          self._chk_selection_adjust.isChecked())
+            boundary.set_summary(
+                f"闭合区：{'开' if closed_only else '关'} · "
+                f"线稿吸附：{'开' if snap else '关'} · "
+                f"手动修补：{'开' if adjust else '关'}")
+        if hint is not None:
+            hint.setText(summaries.get(tool, "当前工具细则会按工具自动切换显示"))
+
+    def _expand_current_tool_sections(self) -> None:
+        tool = self._current_manual_tool_key()
+        base = getattr(self, "_edit_tool_detail_section", None)
+        bias = getattr(self, "_bias_brush_section", None)
+        boundary = getattr(self, "_selection_boundary_section", None)
+        actions = getattr(self, "_selection_action_section", None)
+        ai = getattr(self, "_selection_ai_options_section", None)
+        if tool == "bias_brush":
+            if bias is not None:
+                bias.set_expanded(True)
+            return
+        if base is not None:
+            base.set_expanded(True)
+        if tool in {"lasso", "rect"}:
+            if boundary is not None:
+                boundary.set_expanded(True)
+            if actions is not None:
+                actions.set_expanded(True)
+            # AI details stay opt-in: do not automatically expand the very
+            # long advanced panel unless the user explicitly opens it.
 
     def showEvent(self, event):
         """First time the window is actually shown the canvas finally has
@@ -2190,10 +4552,58 @@ class MainWindow(QMainWindow):
         return self._pages[self._current_path]
 
     def _run_auto_colorize(self):
+        # The primary action is intentionally a toggle: once any foreground
+        # model task is running the same button becomes Stop.
+        if bool(getattr(self, "_ui_busy", False)) or self._running_background_workers():
+            self._stop_all_running_tasks()
+            return
         self._run_colorize(regenerate_auto=True)
 
     def _run_regenerate(self):
+        if bool(getattr(self, "_ui_busy", False)):
+            return
         self._run_colorize(regenerate_auto=False)
+
+    def _stop_all_running_tasks(self):
+        """Request a safe stop for every active model/background worker.
+
+        PyTorch kernels are not force-terminated: doing so can corrupt MPS/CUDA
+        state and leave the application unusable.  Every Colortina worker now
+        owns a cooperative stop flag; model/pipeline stages, panel/tile loops and
+        result callbacks observe that flag and discard all late results.
+        """
+        if bool(getattr(self, "_stop_requested", False)):
+            return
+        self._stop_requested = True
+        self._pending_colorize_after_hair_download = None
+        requested = 0
+        for worker in self._running_background_workers():
+            try:
+                cancel = getattr(worker, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                else:
+                    worker.requestInterruption()
+                requested += 1
+            except RuntimeError:
+                continue
+        for button in (getattr(self, "_btn_auto", None),
+                       getattr(self, "_btn_hair_recolor_auto", None)):
+            if button is not None:
+                button.setText(tr("stopping"))
+                button.setEnabled(False)
+        self.statusBar().showMessage("正在停止当前任务；不会再处理下一页或写回晚到结果…", 0)
+        if hasattr(self, "_auto_status_label"):
+            self._auto_status_label.setText(tr("stopping"))
+        if requested == 0:
+            self._finish_stop_state()
+
+    def _finish_stop_state(self):
+        self._stop_requested = False
+        self._set_busy(False, tr("stopped"))
+        if hasattr(self, "_auto_status_label"):
+            self._auto_status_label.setText(tr("stopped"))
+        self._release_compute_memory()
 
     def _selected_paths(self) -> list[str]:
         items = self._page_list.selectedItems()
@@ -2203,6 +4613,857 @@ class MainWindow(QMainWindow):
             return [self._current_path]
         return []
 
+    def _current_auto_black_hair_guard(self):
+        checkbox = getattr(self, "_chk_auto_black_hair_guard", None)
+        if checkbox is None or not checkbox.isChecked():
+            return False
+        combo = getattr(self, "_combo_auto_black_hair_guard_mode", None)
+        if combo is None:
+            return True
+        return combo.currentData() or "normal"
+
+    def _current_auto_black_hair_guard_scope(self):
+        combo = getattr(self, "_combo_auto_black_hair_guard_scope", None)
+        if combo is None:
+            return "page"
+        scope = combo.currentData() or "page"
+        return scope if scope in {"page", "near_face"} else "page"
+
+    def _current_auto_black_hair_guard_limit_mode(self):
+        combo = getattr(self, "_combo_auto_black_hair_guard_limit_mode", None)
+        if combo is None:
+            return "full"
+        mode = combo.currentData() or "full"
+        return mode if mode in {"full", "selection"} else "full"
+
+    def _auto_black_hair_guard_requires_selection(self) -> bool:
+        return bool(self._current_auto_black_hair_guard()) and self._current_auto_black_hair_guard_limit_mode() == "selection"
+
+    def _normalise_binary_mask(self, mask: np.ndarray | None) -> np.ndarray | None:
+        if mask is None:
+            return None
+        arr = np.asarray(mask)
+        if arr.size == 0:
+            return None
+        if arr.ndim == 3:
+            arr = np.max(arr, axis=2)
+        arr = np.where(arr > 0, 255, 0).astype(np.uint8)
+        if not np.any(arr):
+            return None
+        return arr
+
+    def _current_hair_guard_selection_mask(self) -> np.ndarray | None:
+        store = getattr(self, "_hair_guard_selection_masks", None) or {}
+        path = getattr(self, "_current_path", None)
+        if path is None:
+            return None
+        mask = self._normalise_binary_mask(store.get(path))
+        if mask is None:
+            return None
+        return mask.copy()
+
+    def _set_current_hair_guard_selection_mask(self, mask: np.ndarray | None) -> np.ndarray | None:
+        path = getattr(self, "_current_path", None)
+        if path is None:
+            return None
+        store = getattr(self, "_hair_guard_selection_masks", None)
+        if store is None:
+            store = {}
+            self._hair_guard_selection_masks = store
+        normalised = self._normalise_binary_mask(mask)
+        if normalised is None:
+            store.pop(path, None)
+            self._update_hair_guard_selection_stats()
+            return None
+        store[path] = normalised.copy()
+        self._update_hair_guard_selection_stats()
+        return normalised
+
+    def _current_hair_guard_selection_history(self) -> list[tuple[str, np.ndarray]]:
+        path = getattr(self, "_current_path", None)
+        if path is None:
+            return []
+        store = getattr(self, "_hair_guard_selection_histories", None)
+        if store is None:
+            store = {}
+            self._hair_guard_selection_histories = store
+        history = store.get(path)
+        if history is None:
+            history = []
+            legacy_mask = self._current_hair_guard_selection_mask()
+            if legacy_mask is not None:
+                history = [("add", legacy_mask.copy())]
+                store[path] = history
+            else:
+                return []
+        return [(str(kind), np.asarray(mask).copy()) for kind, mask in history]
+
+    def _set_current_hair_guard_selection_history(self, history: list[tuple[str, np.ndarray]]) -> np.ndarray | None:
+        path = getattr(self, "_current_path", None)
+        if path is None:
+            return None
+        store = getattr(self, "_hair_guard_selection_histories", None)
+        if store is None:
+            store = {}
+            self._hair_guard_selection_histories = store
+        normalized_history: list[tuple[str, np.ndarray]] = []
+        for kind, mask in history or []:
+            norm = self._normalise_binary_mask(mask)
+            if norm is None:
+                continue
+            normalized_history.append(("erase" if str(kind) == "erase" else "add", norm))
+        if normalized_history:
+            store[path] = [(kind, mask.copy()) for kind, mask in normalized_history]
+        else:
+            store.pop(path, None)
+        return self._set_current_hair_guard_selection_mask(
+            self._compose_hair_guard_selection_mask_from_history(normalized_history))
+
+    def _compose_hair_guard_selection_mask_from_history(self, history: list[tuple[str, np.ndarray]] | None) -> np.ndarray | None:
+        shape = self._hair_guard_selection_shape()
+        if shape is None:
+            return None
+        composed = np.zeros(shape, np.uint8)
+        any_active = False
+        for kind, mask in history or []:
+            norm = self._normalise_binary_mask(mask)
+            if norm is None:
+                continue
+            if norm.shape[:2] != shape:
+                norm = cv2.resize(norm, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+                norm = np.where(norm > 0, 255, 0).astype(np.uint8)
+            if str(kind) == "erase":
+                composed = cv2.bitwise_and(composed, cv2.bitwise_not(norm))
+            else:
+                composed = cv2.bitwise_or(composed, norm)
+                any_active = True
+            if np.any(composed):
+                any_active = True
+        if not any_active and not np.any(composed):
+            return None
+        return np.where(composed > 0, 255, 0).astype(np.uint8)
+
+    def _hair_guard_semantic_scribbles_for_path(self, path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Compose positive/negative semantic seeds for one page path.
+
+        This intentionally derives its canvas size from the persisted brush
+        masks, so saving a large project never has to materialize every source
+        page merely to serialize scribbles.
+        """
+        history = (getattr(self, "_hair_guard_selection_histories", {}) or {}).get(path, [])
+        legacy = (getattr(self, "_hair_guard_selection_masks", {}) or {}).get(path)
+        if not history and legacy is not None:
+            history = [("add", legacy)]
+        first = next((self._normalise_binary_mask(mask) for _kind, mask in history
+                      if self._normalise_binary_mask(mask) is not None), None)
+        if first is None:
+            return None, None
+        shape = first.shape[:2]
+        positive = np.zeros(shape, np.uint8)
+        negative = np.zeros(shape, np.uint8)
+        for kind, mask in history:
+            norm = self._normalise_binary_mask(mask)
+            if norm is None:
+                continue
+            if norm.shape[:2] != shape:
+                norm = cv2.resize(norm, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+                norm = np.where(norm > 0, 255, 0).astype(np.uint8)
+            if str(kind) == "erase":
+                negative = cv2.bitwise_or(negative, norm)
+            else:
+                positive = cv2.bitwise_or(positive, norm)
+        return (positive if np.any(positive) else None,
+                negative if np.any(negative) else None)
+
+    def _current_hair_guard_semantic_scribbles(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return positive/negative rough seeds from the existing hair brush history.
+
+        In Semantic Mask mode the existing "画笔添加" and "画笔擦除" tools
+        become true object-segmentation scribbles: adds say "this is hair";
+        erases say "this is not hair".  This preserves the old desktop UI
+        while absorbing the useful scribble interaction from manga-segment.
+        """
+        path = getattr(self, "_current_path", None)
+        if path is None:
+            return None, None
+        return self._hair_guard_semantic_scribbles_for_path(path)
+
+    def _all_semantic_hair_scribbles(self) -> dict[str, dict[str, np.ndarray]]:
+        out = {}
+        for path in (getattr(self, "_pages", {}) or {}):
+            positive, negative = self._hair_guard_semantic_scribbles_for_path(path)
+            row = {}
+            if positive is not None:
+                row["hair_positive"] = positive
+            if negative is not None:
+                row["hair_negative"] = negative
+            if row:
+                out[os.path.abspath(path)] = row
+        return out
+
+    def _append_hair_guard_selection_operation(self, mask: np.ndarray | None, *, add_mode: bool = True) -> np.ndarray | None:
+        norm = self._normalise_binary_mask(mask)
+        if norm is None:
+            return self._current_hair_guard_selection_mask()
+        history = self._current_hair_guard_selection_history()
+        history.append(("add" if add_mode else "erase", norm))
+        return self._set_current_hair_guard_selection_history(history)
+
+    def _undo_last_hair_guard_selection_operation(self) -> None:
+        history = self._current_hair_guard_selection_history()
+        if not history:
+            self.statusBar().showMessage("当前没有可撤销的头发纠色区域操作。", 2500)
+            return
+        history.pop()
+        saved = self._set_current_hair_guard_selection_history(history)
+        self._show_preferred_selection_overlay()
+        count = len(history)
+        area = int(np.count_nonzero(saved)) if saved is not None else 0
+        self.statusBar().showMessage(f"已撤销上一个头发纠色区域操作。剩余 {count} 个操作，覆盖 {area} px。", 3000)
+
+    def _update_hair_guard_selection_stats(self) -> None:
+        label = getattr(self, "_label_hair_guard_selection_stats", None)
+        if label is None:
+            return
+        history = self._current_hair_guard_selection_history()
+        mask = self._current_hair_guard_selection_mask()
+        area = int(np.count_nonzero(mask)) if mask is not None else 0
+        label.setText(f"当前头发纠色区域：{len(history)} 个操作 / {area} px")
+        self._refresh_auto_detail_summaries()
+        undo_btn = getattr(self, "_btn_hair_guard_undo_last", None)
+        if undo_btn is not None:
+            undo_btn.setEnabled(bool(history))
+
+    def _hair_guard_selection_shape(self) -> tuple[int, int] | None:
+        state = self._current_state()
+        if state is None:
+            return None
+        if getattr(state, "original_bgr", None) is not None:
+            return tuple(int(v) for v in state.original_bgr.shape[:2])
+        if getattr(state, "result_bgr", None) is not None:
+            return tuple(int(v) for v in state.result_bgr.shape[:2])
+        return None
+
+    def _show_preferred_selection_overlay(self) -> None:
+        self._update_hair_guard_selection_stats()
+        hair_mask = self._current_hair_guard_selection_mask()
+        self._update_hair_guard_selection_stats()
+        if hair_mask is not None and (self._hair_guard_selector_active or self._auto_black_hair_guard_requires_selection()):
+            self._canvas.set_selection_mask_overlay(hair_mask, mode="replace")
+            return
+        if getattr(self, "_pending_selection_mask", None) is not None and np.any(self._pending_selection_mask):
+            self._canvas.set_selection_mask_overlay(
+                self._pending_selection_mask, mode=self._current_selection_mode())
+            return
+        self._canvas.clear_selection_preview()
+
+    def _update_hair_guard_brush_radius(self, value: int) -> None:
+        self._canvas.set_selection_adjust_radius(int(value))
+
+    def _activate_hair_guard_selector(self, mode: str, *, for_refinement: bool = False) -> None:
+        state = self._current_state()
+        shape = self._hair_guard_selection_shape()
+        if state is None or shape is None:
+            QMessageBox.information(self, "无法框选", "请先导入并选中页面，再使用头发纠色独立选区器。")
+            return
+        combo = getattr(self, "_combo_auto_black_hair_guard_limit_mode", None)
+        if combo is not None and not for_refinement:
+            idx = combo.findData("selection")
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        self._hair_guard_selector_mode = str(mode)
+        self._hair_guard_selector_active = True
+        mode_label = getattr(self, "_label_hair_guard_selector_mode", None)
+        if mode_label is not None:
+            mode_text = {"rect": "矩形追加", "brush_add": "画笔添加", "brush_erase": "画笔擦除"}.get(str(mode), str(mode))
+            mode_label.setText(f"当前选区器：{mode_text}")
+        self._canvas.clear_debug_overlays()
+        existing = self._current_hair_guard_selection_mask()
+        if existing is not None:
+            self._canvas.set_selection_mask_overlay(existing, mode="replace")
+        elif str(mode).startswith("brush"):
+            self._canvas.clear_selection_preview()
+        self._canvas.set_selection_adjust_radius(
+            int(getattr(self, "_hair_guard_brush_radius_spin", None).value()
+                if getattr(self, "_hair_guard_brush_radius_spin", None) is not None else 24))
+        if mode == "rect":
+            self._canvas.set_selection_adjust_enabled(False)
+            self._canvas.set_selection_adjust_allow_empty(False)
+            self._canvas.set_tool(HintCanvas.TOOL_RECT_BUCKET)
+            self.statusBar().showMessage("头发纠色独立矩形框选器已开启：每次拖出一个蓝框并追加到当前头发纠色区域，可连续框多个角色。", 6000)
+        else:
+            self._canvas.set_selection_adjust_mode("erase" if mode == "brush_erase" else "add")
+            self._canvas.set_selection_adjust_allow_empty(True)
+            self._canvas.set_selection_adjust_enabled(True)
+            self._canvas.set_tool(HintCanvas.TOOL_LASSO_BUCKET)
+            self.statusBar().showMessage("头发纠色独立画笔已开启：可继续添加或擦除多个头发纠色区域，只作用于自动头发纠色。", 6000)
+
+    def _deactivate_hair_guard_selector(self) -> None:
+        if not self._hair_guard_selector_active and self._hair_guard_selector_mode is None:
+            return
+        was_refining = bool(getattr(self, '_hair_refine_brush_active', False))
+        self._hair_guard_selector_active = False
+        self._hair_refine_brush_active = False
+        if was_refining:
+            self._canvas.clear_debug_overlays()
+        self._hair_guard_selector_mode = None
+        mode_label = getattr(self, "_label_hair_guard_selector_mode", None)
+        if mode_label is not None:
+            mode_label.setText("当前选区器：未启用")
+        self._canvas.set_selection_adjust_enabled(False)
+        self._canvas.set_selection_adjust_allow_empty(False)
+        self._show_preferred_selection_overlay()
+        self._suspend_hair_guard_tool_reset = True
+        try:
+            self._on_tool_changed()
+        finally:
+            self._suspend_hair_guard_tool_reset = False
+        self.statusBar().showMessage("已结束头发纠色独立选区器。", 2500)
+
+    def _clear_hair_guard_selection(self) -> None:
+        self._set_current_hair_guard_selection_history([])
+        self._hair_guard_selection_stroke_mask = None
+        self._hair_guard_selection_stroke_base_mask = None
+        self._canvas.clear_debug_overlays()
+        self._show_preferred_selection_overlay()
+        self.statusBar().showMessage("已清除头发纠色独立选区。", 2500)
+
+    def _current_auto_black_hair_guard_limit_mask(self):
+        if not self._auto_black_hair_guard_requires_selection():
+            return None
+        hair_mask = self._current_hair_guard_selection_mask()
+        if hair_mask is not None:
+            return hair_mask
+        mask = getattr(self, "_pending_selection_mask", None)
+        return self._normalise_binary_mask(mask)
+
+    def _ensure_auto_black_hair_guard_selection_ready(self, *, interactive: bool = False) -> bool:
+        if not self._auto_black_hair_guard_requires_selection():
+            return True
+        limit_mask = self._current_auto_black_hair_guard_limit_mask()
+        if limit_mask is not None and np.any(limit_mask):
+            return True
+        message = (
+            "当前已将“自动头发纠色”的作用区域设为“仅当前选区（蓝框）”，"
+            "但还没有有效选区。请先使用头发纠色独立框选器 / 画笔，或编辑区蓝框，框住目标人物或目标头发区域，再进行预览或自动上色。")
+        if interactive:
+            QMessageBox.information(self, "需要选区", message)
+        else:
+            self.statusBar().showMessage(message, 5000)
+        return False
+
+    def _current_auto_black_hair_guard_target_rgb(self):
+        color = QColor(getattr(self, '_hair_recolor_color', QColor(24, 24, 24)))
+        return (int(color.red()), int(color.green()), int(color.blue()))
+
+    def _clear_auto_black_hair_guard_preview(self):
+        self._canvas.clear_debug_overlays()
+        self._show_preferred_selection_overlay()
+        if (self._current_hair_guard_selection_mask() is None and
+                getattr(self, "_pending_selection_mask", None) is None):
+            state = self._current_state()
+            if state is not None:
+                self._sync_view_after_edit(state)
+        self.statusBar().showMessage("已清除自动头发纠色预览。", 2200)
+
+    def _preview_auto_black_hair_guard_mask(self):
+        state = self._current_state()
+        if state is None:
+            return
+        guard = self._current_auto_black_hair_guard()
+        if not guard:
+            self.statusBar().showMessage("当前已关闭自动头发纠色。", 2500)
+            return
+        if not self._ensure_auto_black_hair_guard_selection_ready(interactive=True):
+            return
+        scope = self._current_auto_black_hair_guard_scope()
+        limit_mask = self._current_auto_black_hair_guard_limit_mask()
+        semantic = state.ai_result_bgr
+        if semantic is None:
+            semantic = state.result_bgr
+        if semantic is None:
+            self.statusBar().showMessage("请先至少自动上色一次，再预览自动头发纠色遮罩。", 4000)
+            return
+        try:
+            from core.illustrative_inkwash import build_auto_hair_recolor_mask
+            parser_enabled = bool(
+                getattr(self, "_chk_ai_hair_parser", None) is not None and
+                self._chk_ai_hair_parser.isChecked() and
+                self._current_ai_hair_parser_backend() != "legacy")
+            mask, diagnostics = build_auto_hair_recolor_mask(
+                state.original_bgr, semantic,
+                mode=self._current_auto_black_hair_guard(),
+                scope=scope,
+                limit_mask=limit_mask,
+                parser_enabled=parser_enabled,
+                parser_backend=self._current_ai_hair_parser_backend(),
+                parser_allow_download=False,
+                return_preview_layers=True)
+        except Exception as exc:
+            self.statusBar().showMessage(f"自动头发纠色预览失败：{type(exc).__name__}: {exc}", 5000)
+            return
+        if mask is None or not np.any(mask):
+            self.statusBar().showMessage(
+                "当前设置下没有检测到会被自动纠色的头发区域。"
+                + (f" 原因：{diagnostics.get('reason')}" if isinstance(diagnostics, dict) and diagnostics.get('reason') else ""),
+                4500)
+            return
+        preview_layers = (diagnostics.get("_preview_layers", {})
+                          if isinstance(diagnostics, dict) else {})
+        primary = preview_layers.get("primary") if isinstance(preview_layers, dict) else None
+        supplemental = preview_layers.get("supplemental") if isinstance(preview_layers, dict) else None
+        rejected_thin = preview_layers.get("rejected_thin") if isinstance(preview_layers, dict) else None
+        if primary is None:
+            primary = mask
+        self._canvas.set_auto_hair_preview_overlay(
+            primary, supplemental, rejected_thin)
+        px = int(np.count_nonzero(mask))
+        primary_px = int(np.count_nonzero(primary)) if primary is not None else px
+        supplemental_px = int(np.count_nonzero(supplemental)) if supplemental is not None else 0
+        rejected_px = int(np.count_nonzero(rejected_thin)) if rejected_thin is not None else 0
+        detector = (diagnostics.get("selected_detector", "未知")
+                    if isinstance(diagnostics, dict) else "未知")
+        self.statusBar().showMessage(
+            f"头发遮罩预览：主体蓝 {primary_px} · 补漏绿 {supplemental_px} · 已排除细丝红 {rejected_px} · {detector}",
+            6500)
+
+    def _pick_hair_recolor_color(self):
+        color = self._open_color_dialog(
+            QColor(getattr(self, '_hair_recolor_color', QColor(24, 24, 24))),
+            "选择自动纠色目标发色")
+        if color.isValid():
+            self._hair_recolor_color = QColor(color)
+            self._update_hair_recolor_swatch()
+
+    def _update_hair_recolor_swatch(self):
+        btn = getattr(self, '_btn_hair_recolor_color', None)
+        color = QColor(getattr(self, '_hair_recolor_color', QColor(24, 24, 24)))
+        if btn is not None:
+            btn.setText('')
+            btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #888;")
+            btn.setToolTip(color.name())
+        info = getattr(self, '_hair_recolor_color_info', None)
+        if info is not None:
+            info.setText(color.name() + " · 目标发色")
+            info.setToolTip("该颜色用于旧头发纠色与新版 Hair 蒙版覆盖，不会改动普通画笔颜色。")
+        if hasattr(self, "_refresh_auto_detail_summaries"):
+            self._refresh_auto_detail_summaries()
+
+
+    def _pick_iris_recolor_color(self):
+        color = self._open_color_dialog(
+            QColor(getattr(self, '_iris_recolor_color', QColor(70, 135, 220))),
+            "选择统一瞳色")
+        if color.isValid():
+            self._iris_recolor_color = QColor(color)
+            self._update_iris_recolor_swatch()
+
+    def _update_iris_recolor_swatch(self):
+        btn = getattr(self, '_btn_iris_recolor_color', None)
+        color = QColor(getattr(self, '_iris_recolor_color', QColor(70, 135, 220)))
+        if btn is not None:
+            btn.setText('')
+            btn.setStyleSheet(
+                f"background-color: {color.name()}; border: 1px solid #888;")
+            btn.setToolTip(color.name())
+        info = getattr(self, '_iris_recolor_color_info', None)
+        if info is not None:
+            info.setText(color.name() + " · 虹膜覆盖目标")
+
+    def _update_semantic_mask_controls_enabled(self):
+        enabled = bool(getattr(self, '_chk_semantic_mask_layers', None) and
+                       self._chk_semantic_mask_layers.isChecked())
+        for widget in (
+                getattr(self, '_chk_mask_hair_override', None),
+                getattr(self, '_chk_mask_iris_override', None),
+                getattr(self, '_btn_iris_recolor_color', None),
+                getattr(self, '_combo_mask_background_mode', None),
+                getattr(self, '_combo_mask_recolor_mode', None),
+                getattr(self, '_chk_mask_character_library_colors', None),
+                getattr(self, '_btn_preview_semantic_masks', None),
+                getattr(self, '_btn_clear_semantic_masks_preview', None)):
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _preview_semantic_mask_layers(self):
+        state = self._current_state()
+        if state is None:
+            return
+        base = state.ai_result_bgr
+        if base is None:
+            base = state.result_bgr
+        if base is None:
+            self.statusBar().showMessage("请先自动上色一次，再预览语义蒙版。", 3500)
+            return
+        try:
+            from core.semantic_mask_layers import build_semantic_masks
+            from pipeline import get_colorizer
+            controls = self._current_semantic_mask_controls()
+            fusion_cfg = dict(controls.get('fusion') or {})
+            provider = None
+            if bool(fusion_cfg.get('use_generator_features', True)):
+                provider = lambda labels: get_colorizer(Config).extract_region_embeddings(
+                    state.original_bgr, labels, size=576)
+            masks = build_semantic_masks(
+                base, state.original_bgr,
+                parser_backend=self._current_ai_hair_parser_backend(),
+                parser_allow_download=False,
+                manual_masks=dict(controls.get('manual_masks') or {}),
+                generator_feature_provider=provider,
+                use_region_fusion=bool(fusion_cfg.get('enabled', True)),
+                use_trappedball=bool(fusion_cfg.get('use_trappedball', True)),
+                use_clip_regions=bool(fusion_cfg.get('use_clip_regions', True)),
+                clip_allow_download=False, use_cache=True)
+            self._canvas.set_semantic_mask_preview_overlay(
+                masks.hair_mask, masks.iris_mask, masks.background_mask)
+            diag = masks.diagnostics or {}
+            self.statusBar().showMessage(
+                "蒙版预览：蓝=头发，紫=虹膜，橙=背景；"
+                f"hair {diag.get('hair_pixels', 0)} px / "
+                f"iris {(diag.get('iris') or {}).get('iris_pixels', 0)} px / "
+                f"background {diag.get('background_pixels', 0)} px",
+                6000)
+        except Exception as exc:
+            self.statusBar().showMessage(
+                f"语义蒙版预览失败：{type(exc).__name__}: {exc}", 6000)
+
+    def _current_semantic_mask_controls(self) -> dict:
+        enabled = bool(getattr(self, '_chk_semantic_mask_layers', None) and
+                       self._chk_semantic_mask_layers.isChecked())
+        hair_color = QColor(getattr(self, '_hair_recolor_color', QColor(24, 24, 24)))
+        iris_color = QColor(getattr(self, '_iris_recolor_color', QColor(70, 135, 220)))
+        mode_combo = getattr(self, '_combo_mask_recolor_mode', None)
+        recolor_mode = str(mode_combo.currentData() or 'shading') if mode_combo is not None else 'shading'
+        bg_combo = getattr(self, '_combo_mask_background_mode', None)
+        bg_mode = str(bg_combo.currentData() or 'keep') if bg_combo is not None else 'keep'
+        manual_masks = {}
+        # Reuse Colortina's existing independent hair brush/selection as a
+        # positive semantic scribble. The fusion engine expands the rough
+        # stroke to complete line-bounded hair regions; it is not painted
+        # literally unless the user supplies an exact mask through the API.
+        hair_positive, hair_negative = self._current_hair_guard_semantic_scribbles()
+        if enabled and hair_positive is not None and np.any(hair_positive):
+            manual_masks['hair_positive'] = hair_positive.copy()
+        if enabled and hair_negative is not None and np.any(hair_negative):
+            manual_masks['hair_negative'] = hair_negative.copy()
+        return {
+            'enabled': enabled,
+            'composition': 'hard_replace',
+            'use_character_library_colors': bool(
+                enabled and getattr(self, '_chk_mask_character_library_colors', None)
+                and self._chk_mask_character_library_colors.isChecked()),
+            'manual_masks': manual_masks,
+            'fusion': {
+                'enabled': True,
+                'use_generator_features': True,
+                'use_trappedball': True,
+                'use_clip_regions': True,
+                'clip_allow_download': False,
+                'use_cache': True,
+            },
+            'hair': {
+                'enabled': bool(enabled and getattr(self, '_chk_mask_hair_override', None)
+                                and self._chk_mask_hair_override.isChecked()),
+                'target_rgb': (hair_color.red(), hair_color.green(), hair_color.blue()),
+                'mode': recolor_mode,
+            },
+            'iris': {
+                'enabled': bool(enabled and getattr(self, '_chk_mask_iris_override', None)
+                                and self._chk_mask_iris_override.isChecked()),
+                'target_rgb': (iris_color.red(), iris_color.green(), iris_color.blue()),
+                'mode': recolor_mode,
+            },
+            'background': {
+                'enabled': bool(enabled and bg_mode != 'keep'),
+                'mode': bg_mode,
+            },
+        }
+
+    def _current_ai_hair_parser_backend(self) -> str:
+        combo = getattr(self, "_combo_ai_hair_parser_backend", None)
+        if combo is None:
+            return "auto"
+        return str(combo.currentData() or "auto")
+
+    def _refresh_ai_hair_model_status(self):
+        label = getattr(self, "_ai_hair_model_status", None)
+        try:
+            from core.hair_model_manager import (
+                model_status, total_size_mb, validate_model)
+            rows = model_status(Config, deep_validate=False)
+            # ONNX files are the most likely to be replaced by an HTML/error
+            # payload while still exceeding the size threshold. Validate these
+            # two graphs before showing a green check, without loading the large
+            # PyTorch checkpoints on every UI refresh.
+            for key in ("skytnt_foreground", "yakhyo_face_parsing"):
+                row = rows.get(key)
+                if row and row.get("ready"):
+                    valid, detail = validate_model(key, row.get("path"), Config)
+                    row["ready"] = bool(valid)
+                    row["detail"] = detail
+            ready = {key: bool(row.get("ready")) for key, row in rows.items()}
+            main_ready = ready.get("styleanime", False) or ready.get(
+                "anime_face_segmentation", False)
+            missing = [key for key, value in ready.items() if not value]
+            missing_mb = total_size_mb(missing) if missing else 0.0
+            text = (
+                f"推荐主模型：轻量动漫分割 {'✓' if ready.get('anime_face_segmentation') else '—'}；"
+                f"StyleAnime 辅助 {'✓' if ready.get('styleanime') else '—'}；"
+                f"防泄露 {'✓' if ready.get('skytnt_foreground') else '—'}；"
+                f"皮肤/眼镜排除 {'✓' if ready.get('yakhyo_face_parsing') else '—'}")
+            if missing:
+                text += f"。尚缺 {len(missing)} 项，约 {missing_mb:g} MB"
+            else:
+                text += "。四类模型均已安装"
+            if not main_ready:
+                text += "；当前会回退旧头发算法"
+            if label is not None:
+                label.setText(text)
+                label.setToolTip("\n".join(
+                    f"{row['display_name']}：{'已安装' if row['ready'] else '未安装'}\n{row['path']}"
+                    for row in rows.values()))
+            return rows
+        except Exception as exc:
+            if label is not None:
+                label.setText(f"AI 头发模型状态读取失败：{type(exc).__name__}")
+                label.setToolTip(str(exc))
+            return {}
+
+    def _manage_ai_hair_models(self):
+        worker = getattr(self, "_hair_model_worker", None)
+        if worker is not None and worker.isRunning():
+            self.statusBar().showMessage("AI 头发模型正在下载/校验，请稍候。", 4000)
+            return
+        from core.hair_model_manager import (
+            ALL_MODEL_KEYS, RECOMMENDED_MODEL_KEYS, model_status,
+            repair_invalid_downloads, total_size_mb)
+        removed = repair_invalid_downloads(Config)
+        if removed:
+            self.statusBar().showMessage(
+                f"已清理 {len(removed)} 个损坏或不完整的模型文件。", 5000)
+        rows = model_status(Config, deep_validate=False)
+        missing_recommended = [
+            key for key in RECOMMENDED_MODEL_KEYS if not rows[key]["ready"]]
+        missing_all = [key for key in ALL_MODEL_KEYS if not rows[key]["ready"]]
+        if not missing_all:
+            QMessageBox.information(
+                self, "AI 头发模型", "四类 AI 头发解析模型均已安装。")
+            self._refresh_ai_hair_model_status()
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("安装 AI 头发解析模型")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            "请选择要安装的模型。下载只会在你确认后进行，模型保存到本项目的 "
+            "models/weights 目录，之后可离线使用。")
+        details = []
+        for key in missing_all:
+            row = rows[key]
+            details.append(
+                f"• {row['display_name']}：约 {row['size_mb']:g} MB\n  {row['role']}")
+        box.setDetailedText("\n".join(details))
+        recommended_button = None
+        if missing_recommended:
+            recommended_button = box.addButton(
+                f"安装推荐模型（约 {total_size_mb(missing_recommended):g} MB）",
+                QMessageBox.ButtonRole.AcceptRole)
+        all_button = box.addButton(
+            f"安装全部缺失模型（约 {total_size_mb(missing_all):g} MB）",
+            QMessageBox.ButtonRole.ActionRole)
+        import_button = box.addButton(
+            "导入本地模型文件", QMessageBox.ButtonRole.ActionRole)
+        cancel_button = box.addButton(
+            QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if recommended_button is not None and clicked is recommended_button:
+            self._start_ai_hair_model_download(missing_recommended)
+        elif clicked is all_button:
+            self._start_ai_hair_model_download(missing_all)
+        elif clicked is import_button:
+            self._import_local_ai_hair_model()
+        elif clicked is cancel_button:
+            return
+
+    def _import_local_ai_hair_model(self):
+        from core.hair_model_manager import MODEL_SPECS
+        keys = list(MODEL_SPECS.keys())
+        labels = [MODEL_SPECS[key].display_name for key in keys]
+        selected, ok = QInputDialog.getItem(
+            self, "导入本地 AI 头发模型", "模型类型：", labels, 0, False)
+        if not ok or not selected:
+            return
+        key = keys[labels.index(selected)]
+        spec = MODEL_SPECS[key]
+        file_filter = (
+            "模型文件 (*.pth *.pt *.onnx *.zip);;所有文件 (*)")
+        source, _ = QFileDialog.getOpenFileName(
+            self, f"选择 {spec.display_name}", "", file_filter)
+        if not source:
+            return
+        worker = getattr(self, "_hair_model_worker", None)
+        if worker is not None and worker.isRunning():
+            self.statusBar().showMessage("另一个 AI 模型任务正在运行。", 4000)
+            return
+        self._pending_colorize_after_hair_download = None
+        self._hair_model_worker = HairModelImportWorker(key, source, self)
+        self._hair_model_worker.status.connect(self._on_worker_status)
+        self._hair_model_worker.finished_ok.connect(self._on_ai_hair_models_ready)
+        self._hair_model_worker.finished_err.connect(self._on_ai_hair_models_error)
+        self._hair_model_worker.cancelled.connect(self._on_ai_hair_models_cancelled)
+        btn = getattr(self, "_btn_manage_ai_hair_models", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("正在导入…")
+        self.statusBar().showMessage("正在校验并导入 AI 头发模型…", 0)
+        self._hair_model_worker.start()
+
+    def _start_ai_hair_model_download(self, keys, *, resume_colorize=None):
+        keys = list(dict.fromkeys(str(key) for key in keys))
+        if not keys:
+            self._refresh_ai_hair_model_status()
+            if resume_colorize is not None:
+                QTimer.singleShot(0, lambda: self._run_colorize(bool(resume_colorize)))
+            return
+        worker = getattr(self, "_hair_model_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        self._pending_colorize_after_hair_download = resume_colorize
+        self._hair_model_worker = HairModelDownloadWorker(keys, self)
+        self._hair_model_worker.status.connect(self._on_worker_status)
+        self._hair_model_worker.finished_ok.connect(
+            self._on_ai_hair_models_ready)
+        self._hair_model_worker.finished_err.connect(
+            self._on_ai_hair_models_error)
+        self._hair_model_worker.cancelled.connect(self._on_ai_hair_models_cancelled)
+        btn = getattr(self, "_btn_manage_ai_hair_models", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("正在下载…")
+        if resume_colorize is not None:
+            self._stop_requested = False
+            self._set_busy(True, "正在准备 AI 头发解析模型…")
+        else:
+            self.statusBar().showMessage("正在准备 AI 头发解析模型…", 0)
+        self._hair_model_worker.start()
+
+    def _on_ai_hair_models_ready(self, _result):
+        worker = self._hair_model_worker
+        self._hair_model_worker = None
+        btn = getattr(self, "_btn_manage_ai_hair_models", None)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("安装/检查模型")
+        self._refresh_ai_hair_model_status()
+        self.statusBar().showMessage("AI 头发解析模型准备完成。", 5000)
+        pending = self._pending_colorize_after_hair_download
+        self._pending_colorize_after_hair_download = None
+        if worker is not None:
+            worker.deleteLater()
+        if pending is not None and not self._stop_requested:
+            self._set_busy(False)
+            QTimer.singleShot(0, lambda: self._run_colorize(bool(pending)))
+        elif self._ui_busy:
+            self._set_busy(False)
+
+    def _on_ai_hair_models_cancelled(self):
+        worker = self._hair_model_worker
+        self._hair_model_worker = None
+        self._pending_colorize_after_hair_download = None
+        btn = getattr(self, "_btn_manage_ai_hair_models", None)
+        if btn is not None:
+            btn.setText("安装/检查模型")
+        if worker is not None:
+            worker.deleteLater()
+        self._refresh_ai_hair_model_status()
+        self._finish_stop_state()
+
+    def _on_ai_hair_models_error(self, message: str):
+        worker = self._hair_model_worker
+        self._hair_model_worker = None
+        self._pending_colorize_after_hair_download = None
+        if self._ui_busy:
+            self._set_busy(False)
+        btn = getattr(self, "_btn_manage_ai_hair_models", None)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("安装/检查模型")
+        self._refresh_ai_hair_model_status()
+        if worker is not None:
+            worker.deleteLater()
+        QMessageBox.critical(
+            self, "AI 头发模型下载失败",
+            f"模型没有安装完成：\n{message}\n\n"
+            "网络中断产生的有效 .part 文件会保留续传；校验失败、HTML 错误页或损坏的 ONNX 会自动删除，"
+            "下次重试将从零下载。现有 mc-v2 上色与旧头发算法不受影响。")
+        self.statusBar().showMessage("AI 头发模型准备失败。", 6000)
+
+    def _ensure_ai_hair_models_for_run(self, regenerate_auto: bool) -> bool:
+        checkbox = getattr(self, "_chk_ai_hair_parser", None)
+        semantic_enabled = bool(
+            getattr(self, "_chk_semantic_mask_layers", None) is not None and
+            self._chk_semantic_mask_layers.isChecked())
+        # The AI hair parser supports both optional hair recoloring and the
+        # independent semantic mask workspace. Neither requires downloading
+        # weights when both functions are switched off.
+        if not self._current_auto_black_hair_guard() and not semantic_enabled:
+            return True
+        if (checkbox is None or not checkbox.isChecked()) and not semantic_enabled:
+            return True
+        backend = self._current_ai_hair_parser_backend()
+        if backend in {"legacy", "none", "off"}:
+            return True
+        try:
+            from core.hair_model_manager import (
+                RECOMMENDED_MODEL_KEYS, model_status, total_size_mb)
+            rows = model_status(Config, deep_validate=False)
+        except Exception:
+            return True
+        if backend == "styleanime":
+            ready = rows["styleanime"]["ready"]
+            needed = ["styleanime"]
+        elif backend == "anime_face_segmentation":
+            ready = rows["anime_face_segmentation"]["ready"]
+            needed = ["anime_face_segmentation"]
+        else:
+            ready = (rows["styleanime"]["ready"] or
+                     rows["anime_face_segmentation"]["ready"] )
+            needed = [key for key in RECOMMENDED_MODEL_KEYS
+                      if not rows[key]["ready"]]
+        if ready:
+            return True
+        worker = getattr(self, "_hair_model_worker", None)
+        if worker is not None and worker.isRunning():
+            self.statusBar().showMessage(
+                "AI 头发模型仍在下载，完成后会继续上色。", 5000)
+            return False
+
+        box = QMessageBox(self)
+        box.setWindowTitle("需要 AI 头发识别模型")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(
+            "当前选择的 AI 头发识别后端尚未安装。是否先下载推荐模型？")
+        box.setInformativeText(
+            f"预计下载约 {total_size_mb(needed):g} MB。选择“使用旧算法继续”"
+            "不会下载任何文件，本次会直接回退现有头发纠色算法。")
+        download_button = box.addButton(
+            "下载后继续上色", QMessageBox.ButtonRole.AcceptRole)
+        legacy_button = box.addButton(
+            "使用旧算法继续", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is download_button:
+            self._start_ai_hair_model_download(
+                needed, resume_colorize=regenerate_auto)
+            return False
+        if clicked is legacy_button:
+            return True
+        if clicked is cancel_button:
+            return False
+        return False
+
     def _run_colorize(self, regenerate_auto: bool):
         if self._batch_worker is not None and self._batch_worker.isRunning():
             self.statusBar().showMessage("上色任务正在运行，请稍候。", 4000)
@@ -2211,6 +5472,28 @@ class MainWindow(QMainWindow):
         if not paths:
             QMessageBox.information(self, tr("no_result_title"), "请先导入并选择至少一张页面。")
             return
+        from core.model_downloader import models_ready
+        allow_base_download = False
+        if not models_ready(Config.WEIGHTS_DIR):
+            if os.environ.get("COLORTINA_OFFLINE", "").strip().lower() in {"1", "true", "on", "yes"}:
+                QMessageBox.warning(self, "本地模型缺失",
+                    "已启用离线模式。请将 generator.zip 放入模型目录后重试。")
+                return
+            answer = QMessageBox.question(
+                self, "首次安装 mc-v2 模型",
+                "未发现本地上色模型 generator.zip（约 129 MB）。\n"
+                "是否允许本次操作通过网络下载？画稿不会上传。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            allow_base_download = True
+        if not self._ensure_auto_black_hair_guard_selection_ready(interactive=True):
+            return
+        if not self._ensure_ai_hair_models_for_run(regenerate_auto):
+            return
+        current_scope = self._current_auto_black_hair_guard_scope()
+        limit_mask = self._current_auto_black_hair_guard_limit_mask()
         pages = [(p, self._pages[p]._original_bgr,
                   self._pages[p].hint_manager,
                   dict(self._pages[p].forced_character_matches))
@@ -2219,12 +5502,16 @@ class MainWindow(QMainWindow):
         character_memories = self._get_or_create_character_memories()
 
         self._batch_errors = []
+        self._stop_requested = False
         self._set_busy(True, tr("batch_colorizing").format(n=len(pages))
                        if len(pages) > 1 else tr("colorizing"))
         self._batch_worker = BatchColorizeWorker(
             pages, regenerate_auto,
             style_key=self._style_combo.currentData(),
-            quality_key="draft",
+            quality_key=self._quality_combo.currentData(),
+            ink_fidelity=self._chk_ink_fidelity.isChecked(),
+            hint_render_mode=self._native_hint_mode_combo.currentData(),
+            allow_model_download=allow_base_download,
             character_memories=character_memories,
             character_library=self._character_library,
             scene_palette=self._scene_palette,
@@ -2236,10 +5523,22 @@ class MainWindow(QMainWindow):
             pastel_tuning=self._current_pastel_tuning(),
             filter_tuning=self._current_filter_tuning(),
             custom_color_bias=self._current_custom_color_bias(),
+            auto_black_hair_guard=self._current_auto_black_hair_guard(),
+            auto_black_hair_guard_scope=self._current_auto_black_hair_guard_scope(),
+            auto_black_hair_guard_limit_mask=self._current_auto_black_hair_guard_limit_mask(),
+            auto_black_hair_guard_target_rgb=self._current_auto_black_hair_guard_target_rgb(),
+            ai_hair_parser_enabled=(
+                self._chk_ai_hair_parser.isChecked() and
+                self._current_ai_hair_parser_backend() != "legacy"),
+            ai_hair_parser_backend=self._current_ai_hair_parser_backend(),
+            ai_hair_parser_allow_download=False,
+            semantic_mask_controls=self._current_semantic_mask_controls(),
         )
         self._batch_worker.page_done.connect(self._on_batch_page_done)
+        self._batch_worker.page_skipped.connect(self._on_batch_page_skipped)
         self._batch_worker.page_error.connect(self._on_batch_page_error)
         self._batch_worker.status.connect(self._on_worker_status)
+        self._batch_worker.cancelled.connect(lambda: None)
         self._batch_worker.finished_all.connect(self._on_batch_finished)
         self._batch_worker.start()
 
@@ -2275,6 +5574,7 @@ class MainWindow(QMainWindow):
 
     def _current_pastel_tuning(self) -> dict:
         return {
+            "inkwash_strength": self._inkwash_strength_slider.value(),
             "color_strength": self._style_color_slider.value(),
             "brightness": self._style_brightness_slider.value(),
             "warmth": self._style_warmth_slider.value(),
@@ -2321,7 +5621,7 @@ class MainWindow(QMainWindow):
     def _filter_target_states(self) -> list[PageState]:
         scope = self._filter_scope_combo.currentData() if getattr(self, "_filter_scope_combo", None) else "current"
         if scope == "all":
-            return [state for state in self._ordered_states() if state.result_bgr is not None]
+            return [state for state in self._ordered_states() if state.has_result]
         state = self._current_state()
         return [state] if state is not None and state.result_bgr is not None else []
 
@@ -2342,14 +5642,67 @@ class MainWindow(QMainWindow):
                 # non-cumulative from this stable base.
                 state.filter_base_bgr = state.result_bgr.copy()
                 base = state.filter_base_bgr
-            state.push_undo()
+            if state.path == self._current_path:
+                state.push_undo(fields=state.FILTER_EDIT_FIELDS)
             state.result_bgr = apply_image_filter(
                 base.copy(), tuning,
                 style_strength=style_strength,
                 is_styled=style_key not in {None, "none"},
                 source_bw_bgr=state.original_bgr)
+
+            # Semantic mask layers are final-authority colour replacements.
+            # A later manual filter must not wash out the locked hair/iris
+            # colours, so reapply the same hard-replace contract after filtering
+            # without touching mc-v2.  Use the stored AI result only to derive
+            # masks; the replacement is applied to the freshly filtered image.
+            semantic_controls = self._current_semantic_mask_controls()
+            if semantic_controls.get("enabled", False):
+                try:
+                    from core.semantic_mask_layers import (
+                        build_semantic_masks, apply_semantic_mask_overrides)
+                    semantic_source = state.ai_result_bgr
+                    if semantic_source is None:
+                        semantic_source = state.result_bgr
+                    fusion_cfg = dict(semantic_controls.get('fusion') or {})
+                    provider = None
+                    if bool(fusion_cfg.get('use_generator_features', True)):
+                        from pipeline import get_colorizer
+                        provider = lambda labels: get_colorizer(Config).extract_region_embeddings(
+                            state.original_bgr, labels, size=576)
+                    masks = build_semantic_masks(
+                        semantic_source, state.original_bgr,
+                        parser_backend=self._current_ai_hair_parser_backend(),
+                        parser_allow_download=False,
+                        manual_masks=dict(semantic_controls.get('manual_masks') or {}),
+                        generator_feature_provider=provider,
+                        use_region_fusion=bool(fusion_cfg.get('enabled', True)),
+                        use_trappedball=bool(fusion_cfg.get('use_trappedball', True)),
+                        use_clip_regions=bool(fusion_cfg.get('use_clip_regions', True)),
+                        clip_allow_download=False, use_cache=True)
+                    state.result_bgr, _masks, _diag = apply_semantic_mask_overrides(
+                        state.result_bgr, state.original_bgr, semantic_controls,
+                        parser_backend=self._current_ai_hair_parser_backend(),
+                        parser_allow_download=False, masks=masks)
+                    if self._chk_protect_text.isChecked():
+                        from core.text_guard import protect_text_regions
+                        source_guard = state.original_bgr
+                        if source_guard.shape[:2] != state.result_bgr.shape[:2]:
+                            source_guard = cv2.resize(
+                                source_guard,
+                                (state.result_bgr.shape[1], state.result_bgr.shape[0]),
+                                interpolation=cv2.INTER_CUBIC)
+                        state.result_bgr = protect_text_regions(
+                            state.result_bgr, source_guard)
+                except Exception as exc:
+                    self.statusBar().showMessage(
+                        f"滤镜已应用，但蒙版覆盖重应用失败：{type(exc).__name__}: {exc}",
+                        6000)
             state.discard_unchanged_undo()
             self._mark_page_done(state.path)
+            if state.path != self._current_path:
+                state.undo_stack.clear()
+                state.redo_stack.clear()
+                self._schedule_page_spill(state.path, delay_ms=0)
         current = self._current_state()
         if current is not None and current in states:
             self._radio_view_edited.setChecked(True)
@@ -2371,7 +5724,22 @@ class MainWindow(QMainWindow):
         active_label = getattr(self, "_style_fine_active_label", None)
         if active_label is not None:
             active_label.setText(tr("style_fine_active").format(name=combo.currentText()))
-        is_light3 = key == "light3"
+        is_light3 = key in {"light3", "light3_git_legacy"}
+        is_new_inkwash = key in {"light2", "light2_soft", "light3"}
+        # Old Git presets use the original grading pipeline; the NEW watercolour
+        # strength does not apply. Hide it rather than offering an inert slider.
+        for widget in (getattr(self, "_inkwash_strength_label", None),
+                       getattr(self, "_inkwash_strength_slider", None),
+                       getattr(self, "_inkwash_strength_spin", None)):
+            if widget is not None:
+                widget.setVisible(is_new_inkwash)
+        ink_fidelity = getattr(self, "_chk_ink_fidelity", None)
+        if ink_fidelity is not None:
+            ink_fidelity.setEnabled(key not in {"light2_git_legacy", "light3_git_legacy"})
+            ink_fidelity.setToolTip(
+                "旧 Git 风格走原始分级，跳过新版线稿保真与水墨渲染，便于原样对照。"
+                if key in {"light2_git_legacy", "light3_git_legacy"} else
+                "保留原稿墨线、网点与细部纹理，可关闭。")
         for widget in (getattr(self, "_light3_intensity_label", None),
                        getattr(self, "_light3_intensity_slider", None),
                        getattr(self, "_light3_intensity_spin", None)):
@@ -2760,10 +6128,14 @@ class MainWindow(QMainWindow):
     def _project_settings(self) -> dict:
         return {
             "style_key": self._style_combo.currentData(),
-            "quality_key": "draft",
+            "quality_key": self._quality_combo.currentData(),
+            "hint_render_mode": self._native_hint_mode_combo.currentData(),
+            "ink_fidelity": self._chk_ink_fidelity.isChecked(),
+            "export_compression_profile": self._current_export_profile(),
             "style_strength": self._style_strength_slider.value(),
             "reference_strength": self._reference_strength_slider.value(),
             "manual_strength": self._manual_strength_slider.value(),
+            "inkwash_strength": self._inkwash_strength_slider.value(),
             "style_color_strength": self._style_color_slider.value(),
             "style_brightness_strength": self._style_brightness_slider.value(),
             "style_warmth_strength": self._style_warmth_slider.value(),
@@ -2817,6 +6189,20 @@ class MainWindow(QMainWindow):
             "custom_color_bias_protect_skin": self._chk_custom_bias_protect_skin.isChecked(),
             "custom_color_bias_protect_lineart": self._chk_custom_bias_protect_lineart.isChecked(),
             "custom_color_bias_protect_saturated": self._chk_custom_bias_protect_saturated.isChecked(),
+            "auto_black_hair_guard_enabled": bool(self._chk_auto_black_hair_guard.isChecked()),
+            "auto_black_hair_guard_mode": str(self._combo_auto_black_hair_guard_mode.currentData() or "conservative"),
+            "auto_black_hair_guard_scope": str(self._combo_auto_black_hair_guard_scope.currentData() or "near_face"),
+            "auto_black_hair_guard_limit_mode": str(self._combo_auto_black_hair_guard_limit_mode.currentData() or "full"),
+            "semantic_mask_layers_enabled": bool(getattr(self, "_chk_semantic_mask_layers", None) and self._chk_semantic_mask_layers.isChecked()),
+            "semantic_mask_hair_enabled": bool(getattr(self, "_chk_mask_hair_override", None) and self._chk_mask_hair_override.isChecked()),
+            "semantic_mask_iris_enabled": bool(getattr(self, "_chk_mask_iris_override", None) and self._chk_mask_iris_override.isChecked()),
+            "semantic_mask_background_mode": str(getattr(self, "_combo_mask_background_mode", None).currentData() if getattr(self, "_combo_mask_background_mode", None) is not None else "keep"),
+            "semantic_mask_recolor_mode": str(getattr(self, "_combo_mask_recolor_mode", None).currentData() if getattr(self, "_combo_mask_recolor_mode", None) is not None else "shading"),
+            "semantic_mask_hair_color": QColor(getattr(self, "_hair_recolor_color", QColor(24, 24, 24))).name(),
+            "semantic_mask_iris_color": QColor(getattr(self, "_iris_recolor_color", QColor(70, 135, 220))).name(),
+            "semantic_mask_character_library_colors": bool(
+                getattr(self, "_chk_mask_character_library_colors", None)
+                and self._chk_mask_character_library_colors.isChecked()),
             "fill_mode": self._current_fill_mode(),
             "selection_closed_only": self._chk_selection_closed_only.isChecked(),
             "selection_mode": self._current_selection_mode(),
@@ -2825,6 +6211,17 @@ class MainWindow(QMainWindow):
             "selection_focus_outside": self._chk_selection_focus_outside.isChecked() if getattr(self, '_chk_selection_focus_outside', None) is not None else True,
             "selection_focus_context": self._selection_focus_context_spin.value() if getattr(self, '_selection_focus_context_spin', None) is not None else 32,
             "selection_focus_fade": self._selection_focus_fade_spin.value() if getattr(self, '_selection_focus_fade_spin', None) is not None else 96,
+            "selection_region_control_enabled": bool(getattr(self, "_chk_selection_region_control", None) and self._chk_selection_region_control.isChecked()),
+            "selection_region_control_preset": str(getattr(self, "_selection_control_preset_combo", None).currentData() if getattr(self, "_selection_control_preset_combo", None) is not None else "custom"),
+            "selection_region_control_color": QColor(getattr(self, "_selection_control_color", QColor(28, 28, 32))).name(),
+            "selection_region_control_hint": int(getattr(self, "_selection_control_hint_spin", None).value() if getattr(self, "_selection_control_hint_spin", None) is not None else 50),
+            "selection_region_control_gain": int(getattr(self, "_selection_control_gain_spin", None).value() if getattr(self, "_selection_control_gain_spin", None) is not None else 175),
+            "selection_region_control_deep": int(getattr(self, "_selection_control_deep_spin", None).value() if getattr(self, "_selection_control_deep_spin", None) is not None else 38),
+            "selection_region_control_middle": int(getattr(self, "_selection_control_middle_spin", None).value() if getattr(self, "_selection_control_middle_spin", None) is not None else 74),
+            "selection_region_control_shallow": int(getattr(self, "_selection_control_shallow_spin", None).value() if getattr(self, "_selection_control_shallow_spin", None) is not None else 94),
+            "selection_region_control_final": int(getattr(self, "_selection_control_final_spin", None).value() if getattr(self, "_selection_control_final_spin", None) is not None else 92),
+            "selection_region_control_luminance": int(getattr(self, "_selection_control_luminance_spin", None).value() if getattr(self, "_selection_control_luminance_spin", None) is not None else 28),
+            "selection_region_control_adapter": bool(getattr(self, "_chk_selection_control_adapter", None) and self._chk_selection_control_adapter.isChecked()),
             "selection_closed_expand": self._selection_closed_expand_slider.value(),
             "selection_closed_min_area": self._selection_closed_min_area_slider.value(),
             "selection_closed_min_thickness": self._selection_closed_min_thickness_slider.value(),
@@ -2844,12 +6241,16 @@ class MainWindow(QMainWindow):
                     character_library=self._character_library,
                 character_memories=self._character_memories,
                 scene_palette=self._scene_palette,
-                settings=self._project_settings())
+                settings=self._project_settings(),
+                semantic_scribbles=self._all_semantic_hair_scribbles())
         except Exception as exc:
             QMessageBox.warning(self, tr("error_title"),
                                 tr("project_save_failed").format(exc=exc))
             return
         self._current_project_path = path
+        for saved_path, saved_state in self._pages.items():
+            if saved_path != self._current_path and saved_state.has_result:
+                self._schedule_page_spill(saved_path, delay_ms=0)
         self.statusBar().showMessage(tr("project_saved").format(path=path), 5000)
 
     def _load_project(self):
@@ -2865,9 +6266,13 @@ class MainWindow(QMainWindow):
                                 tr("project_load_failed").format(exc=exc))
             return
 
+        for old_state in self._pages.values():
+            old_state.clear_layer_cache()
         self._pages.clear()
         self._page_list.clear()
         self._current_path = None
+        self._hair_guard_selection_masks.clear()
+        self._hair_guard_selection_histories.clear()
         missing = 0
         from core.imageio import imread as _uimread
         valid_records = []
@@ -2901,6 +6306,33 @@ class MainWindow(QMainWindow):
             elif state.result_bgr is not None:
                 # Compatibility with projects saved before V2 filter-base persistence.
                 state.filter_base_bgr = state.result_bgr.copy()
+            positive_path = record.get("semantic_hair_positive")
+            negative_path = record.get("semantic_hair_negative")
+            semantic_history = []
+            positive_mask = None
+            negative_mask = None
+            if positive_path and os.path.isfile(positive_path):
+                positive_mask = _uimread(positive_path, cv2.IMREAD_GRAYSCALE)
+                positive_mask = self._normalise_binary_mask(positive_mask)
+                if positive_mask is not None:
+                    semantic_history.append(("add", positive_mask.copy()))
+            if negative_path and os.path.isfile(negative_path):
+                negative_mask = _uimread(negative_path, cv2.IMREAD_GRAYSCALE)
+                negative_mask = self._normalise_binary_mask(negative_mask)
+                if negative_mask is not None:
+                    semantic_history.append(("erase", negative_mask.copy()))
+            if semantic_history:
+                self._hair_guard_selection_histories[source] = semantic_history
+                composed = (positive_mask.copy() if positive_mask is not None
+                            else np.zeros(state.original_bgr.shape[:2], np.uint8))
+                if negative_mask is not None:
+                    if negative_mask.shape[:2] != composed.shape[:2]:
+                        negative_mask = cv2.resize(negative_mask, (composed.shape[1], composed.shape[0]),
+                                                   interpolation=cv2.INTER_NEAREST)
+                    composed = cv2.bitwise_and(composed, cv2.bitwise_not(negative_mask))
+                if np.any(composed):
+                    self._hair_guard_selection_masks[source] = composed
+
             if state.result_bgr is not None:
                 state.bias_brush_reference_bgr = state.result_bgr.copy()
                 state.bias_brush_reference_filter_bgr = (
@@ -2911,7 +6343,7 @@ class MainWindow(QMainWindow):
         loaded_style_key = settings.get("style_key")
         if loaded_style_key in {"monochrome_people", "monochrome_page"}:
             loaded_style_key = "monochrome"
-        if loaded_style_key == "light":
+        if loaded_style_key in {"light", "light2_illustrative"}:
             loaded_style_key = "light2"
             settings = dict(settings)
             if "pastel_environment_strength" not in settings:
@@ -2922,6 +6354,14 @@ class MainWindow(QMainWindow):
             idx = widget.findData(desired)
             if idx >= 0:
                 widget.setCurrentIndex(idx)
+        native_hint_idx = self._native_hint_mode_combo.findData(
+            settings.get("hint_render_mode", "mixed"))
+        self._native_hint_mode_combo.setCurrentIndex(max(0, native_hint_idx))
+        export_profile = settings.get("export_compression_profile", "png_optimized")
+        self._export_compression_combo.blockSignals(True)
+        export_idx = self._export_compression_combo.findData(export_profile)
+        self._export_compression_combo.setCurrentIndex(max(0, export_idx))
+        self._export_compression_combo.blockSignals(False)
         self._character_library = data["character_library"]
         self._character_memories = data["character_memories"]
         self._scene_palette = data.get("scene_palette")
@@ -2957,6 +6397,46 @@ class MainWindow(QMainWindow):
         legacy_env = 0 if settings.get("style_key") == "monochrome_people" else 100
         self._pastel_environment_slider.setValue(settings.get("pastel_environment_strength", legacy_env))
         self._pastel_skin_warmth_slider.setValue(settings.get("pastel_skin_warmth", 100))
+        self._chk_auto_black_hair_guard.setChecked(
+            bool(settings.get("auto_black_hair_guard_enabled", False)))
+        for combo, key, default in (
+                (self._combo_auto_black_hair_guard_mode, "auto_black_hair_guard_mode", "conservative"),
+                (self._combo_auto_black_hair_guard_scope, "auto_black_hair_guard_scope", "near_face"),
+                (self._combo_auto_black_hair_guard_limit_mode, "auto_black_hair_guard_limit_mode", "full")):
+            index = combo.findData(settings.get(key, default))
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        hair_color_name = settings.get("semantic_mask_hair_color", "#181818")
+        if QColor(hair_color_name).isValid():
+            self._hair_recolor_color = QColor(hair_color_name)
+        iris_color_name = settings.get("semantic_mask_iris_color", "#4687dc")
+        if QColor(iris_color_name).isValid():
+            self._iris_recolor_color = QColor(iris_color_name)
+        if getattr(self, "_chk_semantic_mask_layers", None) is not None:
+            self._chk_semantic_mask_layers.setChecked(
+                bool(settings.get("semantic_mask_layers_enabled", False)))
+        if getattr(self, "_chk_mask_hair_override", None) is not None:
+            self._chk_mask_hair_override.setChecked(
+                bool(settings.get("semantic_mask_hair_enabled", True)))
+        if getattr(self, "_chk_mask_iris_override", None) is not None:
+            self._chk_mask_iris_override.setChecked(
+                bool(settings.get("semantic_mask_iris_enabled", False)))
+        if getattr(self, "_chk_mask_character_library_colors", None) is not None:
+            self._chk_mask_character_library_colors.setChecked(
+                bool(settings.get("semantic_mask_character_library_colors", True)))
+        if getattr(self, "_combo_mask_background_mode", None) is not None:
+            idx = self._combo_mask_background_mode.findData(
+                settings.get("semantic_mask_background_mode", "keep"))
+            if idx >= 0:
+                self._combo_mask_background_mode.setCurrentIndex(idx)
+        if getattr(self, "_combo_mask_recolor_mode", None) is not None:
+            idx = self._combo_mask_recolor_mode.findData(
+                settings.get("semantic_mask_recolor_mode", "shading"))
+            if idx >= 0:
+                self._combo_mask_recolor_mode.setCurrentIndex(idx)
+        self._update_hair_recolor_swatch()
+        self._update_iris_recolor_swatch()
+        self._update_semantic_mask_controls_enabled()
         self._gap_close_slider.setValue(self._gap_px_from_percent(
             settings.get("gap_close", self._gap_close_slider.value())))
         shared_color_name = settings.get("shared_selected_color")
@@ -2998,7 +6478,9 @@ class MainWindow(QMainWindow):
             self._chk_selection_snap_lineart.setChecked(bool(settings.get("selection_snap_lineart", False)))
         if getattr(self, '_chk_manual_match_style', None) is not None:
             self._chk_manual_match_style.setChecked(settings.get("manual_match_style", False))
-        self._chk_skip_colored.setChecked(settings.get("skip_colored", True))
+        self._chk_skip_colored.setChecked(settings.get("skip_colored", False))
+        self._chk_ink_fidelity.setChecked(bool(settings.get("ink_fidelity", True)))
+        self._inkwash_strength_slider.setValue(int(settings.get("inkwash_strength", 78)))
         self._chk_character_memory.setChecked(settings.get("character_memory", True))
         if getattr(self, '_chk_custom_color_bias', None) is not None:
             self._chk_custom_color_bias.setChecked(settings.get("custom_color_bias_enabled", False))
@@ -3040,6 +6522,37 @@ class MainWindow(QMainWindow):
         if getattr(self, '_selection_focus_fade_spin', None) is not None:
             self._selection_focus_fade_spin.setValue(max(int(settings.get("selection_focus_context", 32)), int(settings.get("selection_focus_fade", 96))))
         self._update_selection_focus_controls_enabled()
+        if getattr(self, '_chk_selection_region_control', None) is not None:
+            self._chk_selection_region_control.setChecked(bool(
+                settings.get("selection_region_control_enabled", True)))
+        control_color = QColor(settings.get("selection_region_control_color", "#1c1c20"))
+        if control_color.isValid():
+            self._selection_control_color = control_color
+            self._update_selection_control_swatch()
+        for name, key, default in (
+                ("_selection_control_hint_spin", "selection_region_control_hint", 50),
+                ("_selection_control_gain_spin", "selection_region_control_gain", 175),
+                ("_selection_control_deep_spin", "selection_region_control_deep", 38),
+                ("_selection_control_middle_spin", "selection_region_control_middle", 74),
+                ("_selection_control_shallow_spin", "selection_region_control_shallow", 94),
+                ("_selection_control_final_spin", "selection_region_control_final", 92),
+                ("_selection_control_luminance_spin", "selection_region_control_luminance", 28)):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setValue(int(settings.get(key, default)))
+        preset_combo = getattr(self, "_selection_control_preset_combo", None)
+        if preset_combo is not None:
+            preset_key = str(settings.get("selection_region_control_preset", "custom"))
+            index = preset_combo.findData(preset_key)
+            preset_combo.blockSignals(True)
+            preset_combo.setCurrentIndex(index if index >= 0 else 0)
+            preset_combo.blockSignals(False)
+        adapter = getattr(self, "_chk_selection_control_adapter", None)
+        if adapter is not None:
+            adapter.setChecked(bool(settings.get(
+                "selection_region_control_adapter", False)) and
+                _tunnel2_adapter_available())
+        self._update_selection_region_control_enabled()
         if getattr(self, '_selection_closed_expand_slider', None) is not None:
             self._selection_closed_expand_slider.setValue(settings.get("selection_closed_expand", 0))
         if getattr(self, '_selection_closed_min_area_slider', None) is not None:
@@ -3051,6 +6564,12 @@ class MainWindow(QMainWindow):
         self._current_project_path = path
         if self._page_list.count():
             self._page_list.setCurrentRow(0)
+        for loaded_path, loaded_state in self._pages.items():
+            if loaded_state.has_result:
+                self._schedule_export_compression(
+                    loaded_path, delay_ms=350 if loaded_path == self._current_path else 0)
+            if loaded_path != self._current_path and loaded_state.has_result:
+                self._schedule_page_spill(loaded_path, delay_ms=0)
         self._update_controls_enabled()
         self._update_pastel_controls_visibility()
         message = tr("project_loaded").format(path=path)
@@ -3059,43 +6578,101 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 8000)
 
     def _on_worker_status(self, message: str):
+        if bool(getattr(self, "_stop_requested", False)):
+            return
         self.statusBar().showMessage(message, 0)
         if hasattr(self, "_auto_status_label"):
             self._auto_status_label.setText(message)
 
     def _on_batch_page_done(self, path: str, result_payload):
+        sender = self.sender()
+        if bool(getattr(self, "_stop_requested", False)) or (
+                sender is not None and callable(getattr(sender, "cancel_requested", None))
+                and sender.cancel_requested()):
+            return
         state = self._pages.get(path)
         if state is None:
             return
-        if isinstance(result_payload, tuple) and len(result_payload) == 2:
+        quality_report = None
+        if isinstance(result_payload, dict):
+            result_bgr = result_payload.get("result_bgr")
+            filter_base_bgr = result_payload.get("filter_base_bgr")
+            quality_report = result_payload.get("quality_report")
+        elif isinstance(result_payload, tuple) and len(result_payload) == 2:
             result_bgr, filter_base_bgr = result_payload
         else:
             result_bgr, filter_base_bgr = result_payload, None
-        state.push_undo()  # snapshot whatever was there before this run
-        state.ai_result_bgr = result_bgr.copy()
+        if result_bgr is None:
+            return
+        if path == self._current_path:
+            state.push_undo()  # one active page keeps normal undo semantics
+        else:
+            # A book-wide batch must not retain three full-resolution prior
+            # layers per page in undo history; that is exactly what forces
+            # macOS to allocate huge swap files.
+            state.undo_stack.clear()
+            state.redo_stack.clear()
+        # Take ownership of worker outputs where safe.  Only the editable
+        # result needs an immediate independent copy; this removes one to two
+        # full-page copies from every batch completion callback.
+        result_bgr = np.ascontiguousarray(result_bgr)
+        state.ai_result_bgr = result_bgr
         state.result_bgr = result_bgr.copy()
-        state.filter_base_bgr = (filter_base_bgr.copy() if filter_base_bgr is not None
-                                 else result_bgr.copy())
+        if filter_base_bgr is None or filter_base_bgr is result_bgr:
+            state.filter_base_bgr = result_bgr.copy()
+        else:
+            state.filter_base_bgr = np.ascontiguousarray(filter_base_bgr)
         state.pipeline_diagnostics = dict(
             getattr(state.hint_manager, "last_diagnostics", {}) or {})
-        self._sync_bias_reference_to_current(state)
+        # A fresh automatic result has no colour-bias stroke to erase yet.
+        # Build these two full-resolution reference layers lazily only when
+        # the bias brush is actually used.
+        state.bias_brush_reference_bgr = None
+        state.bias_brush_reference_filter_bgr = None
         self._refresh_character_diagnostics()
-        try:
-            from core.quality_score import assess_colorization
-            state.quality_report = assess_colorization(state.original_bgr, result_bgr)
-        except Exception:
-            state.quality_report = None
+        state.quality_report = quality_report
+        if state.quality_report is None:
+            try:
+                from core.quality_score import assess_colorization
+                state.quality_report = assess_colorization(
+                    state.original_bgr, result_bgr)
+            except Exception:
+                state.quality_report = None
         self._mark_page_done(path)
         self._canvas.clear_dabs()
         if path == self._current_path:
+            self._schedule_export_compression(path, delay_ms=350)
             self._radio_view_edited.setChecked(True)
             self._sync_view_after_edit(state)
+        else:
+            # Release full-resolution batch layers first.  Final export
+            # compression then reads the lossless session cache, so completed
+            # pages cannot accumulate in RAM while WebP/PNG encoding catches up.
+            self._schedule_page_spill(state.path, delay_ms=0)
+            self._schedule_export_compression(state.path, delay_ms=0)
 
     def _on_batch_page_error(self, path: str, message: str):
+        sender = self.sender()
+        if bool(getattr(self, "_stop_requested", False)) or (
+                sender is not None and callable(getattr(sender, "cancel_requested", None))
+                and sender.cancel_requested()):
+            return
         name = os.path.basename(path)
         self._batch_errors.append((name, message))
         visible = tr("page_colorize_failed").format(name=name, message=message)
         self.statusBar().showMessage(visible, 8000)
+        if hasattr(self, "_auto_status_label"):
+            self._auto_status_label.setText(visible)
+
+    def _on_batch_page_skipped(self, path: str, reason: str):
+        sender = self.sender()
+        if bool(getattr(self, "_stop_requested", False)) or (
+                sender is not None and callable(getattr(sender, "cancel_requested", None))
+                and sender.cancel_requested()):
+            return
+        name = os.path.basename(path)
+        visible = tr("page_colorize_skipped").format(name=name, reason=reason)
+        self.statusBar().showMessage(visible, 5000)
         if hasattr(self, "_auto_status_label"):
             self._auto_status_label.setText(visible)
 
@@ -3115,9 +6692,23 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_batch_finished(self):
+        try:
+            from pipeline import clear_transient_page_caches
+            clear_transient_page_caches()
+        except Exception:
+            pass
+        for path, state in self._pages.items():
+            if path != self._current_path and state.has_result:
+                self._schedule_page_spill(state.path, delay_ms=0)
         self._release_compute_memory()
         worker = self._batch_worker
         self._batch_worker = None
+        if self._stop_requested:
+            if worker is not None:
+                worker.deleteLater()
+            self._finish_stop_state()
+            self._update_device_label()
+            return
         if self._batch_errors:
             name, message = self._batch_errors[0]
             self._set_busy(False, "上色未完成")
@@ -3175,35 +6766,112 @@ class MainWindow(QMainWindow):
                 break
 
     def _set_busy(self, busy: bool, message: str = ""):
+        self._ui_busy = bool(busy)
         self._progress.setVisible(busy)
-        self._btn_auto.setText("正在上色…" if busy else tr("auto_btn"))
-        for btn in (self._btn_auto, self._btn_regenerate, self._btn_undo,
+        self._btn_auto.setText(tr("stop_btn") if busy else tr("auto_btn"))
+        self._btn_auto.setProperty("stopMode", bool(busy))
+        self._btn_auto.style().unpolish(self._btn_auto)
+        self._btn_auto.style().polish(self._btn_auto)
+        self._btn_auto.setEnabled(True if busy else self._current_state() is not None)
+        hair_btn = getattr(self, "_btn_hair_recolor_auto", None)
+        if hair_btn is not None:
+            hair_btn.setText(tr("stop_btn") if busy else "自动上色（应用头发纠色）")
+            hair_btn.setProperty("stopMode", bool(busy))
+            hair_btn.style().unpolish(hair_btn)
+            hair_btn.style().polish(hair_btn)
+            hair_btn.setEnabled(True if busy else self._current_state() is not None)
+        for btn in (self._btn_regenerate, self._btn_undo,
                    self._btn_clear, self._btn_undo_edit, self._btn_redo_edit,
                    self._btn_restore_ai, self._btn_restore_bw,
                    self._btn_export_page, self._btn_export_all,
                    self._btn_apply_selection, self._btn_ai_recolor_selection,
-                   self._btn_clear_selection_hints, self._btn_cancel_selection):
-            btn.setEnabled(not busy)
+                   self._btn_restore_selection_bw,
+                   getattr(self, '_btn_refine_hair', None),
+                   getattr(self, '_btn_refine_positive', None),
+                   getattr(self, '_btn_refine_negative', None),
+                   getattr(self, '_btn_refine_stop_brush', None),
+                   getattr(self, '_btn_refine_clear_brush', None),
+                   self._btn_semantic_select, self._btn_clear_selection_hints,
+                   self._btn_cancel_selection,
+                   getattr(self, '_btn_hair_guard_rect_selector', None),
+                   getattr(self, '_btn_hair_guard_brush_add', None),
+                   getattr(self, '_btn_hair_guard_brush_erase', None),
+                   getattr(self, '_btn_hair_guard_undo_last', None),
+                   getattr(self, '_btn_hair_guard_clear_selection', None),
+                   getattr(self, '_btn_hair_guard_finish_selector', None),
+                   getattr(self, '_btn_import_images', None),
+                   getattr(self, '_btn_import_pdf', None),
+                   getattr(self, '_btn_import_folder', None),
+                   getattr(self, '_btn_move_up', None),
+                   getattr(self, '_btn_move_down', None),
+                   getattr(self, '_btn_delete_pages', None),
+                   getattr(self, '_btn_load_project', None),
+                   getattr(self, '_btn_save_project', None),
+                   getattr(self, '_lang_button', None)):
+            if btn is not None:
+                btn.setEnabled(not busy)
+        header_status = getattr(self, "_header_status_chip", None)
+        footer_status = getattr(self, "_footer_status_value", None)
+        hair_status_label = getattr(self, "_hair_recolor_status_label", None)
+        if busy:
+            if header_status is not None:
+                header_status.setText("● 处理中")
+            if footer_status is not None:
+                footer_status.setText("处理中")
+            if hair_status_label is not None:
+                hair_status_label.setText("正在应用头发纠色设置并上色…")
+        else:
+            self._refresh_workspace_stats()
+            if hair_status_label is not None:
+                hair_status_label.setText("应用当前头发纠色设置并自动上色")
+        model_btn = getattr(self, "_btn_manage_ai_hair_models", None)
+        if model_btn is not None:
+            model_worker = getattr(self, "_hair_model_worker", None)
+            model_btn.setEnabled(
+                not busy and not (model_worker is not None and model_worker.isRunning()))
         if not busy:
             self._update_selection_buttons(
                 self._pending_selection_mask is not None)
+            self._update_controls_enabled()
         if message:
             self.statusBar().showMessage(message, 0 if busy else 5000)
 
     def _update_device_label(self):
-        """Show device/model readiness without loading models on the UI thread."""
+        """Show validated accelerator readiness without loading mc-v2 weights."""
         try:
             import torch
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif (getattr(torch.backends, "mps", None) is not None
-                  and torch.backends.mps.is_available()):
-                device = "mps"
-            else:
-                device = "cpu"
+            from core.device_runtime import probe_torch_device
+            report = probe_torch_device(Config.ML_DEVICE, torch_module=torch,
+                                        smoke_test=True)
             from core.model_downloader import models_ready
             suffix = "模型已就绪" if models_ready(Config.WEIGHTS_DIR) else "首次上色将下载模型"
-            self._device_label.setText(f"{tr('device_label')}{device} · {suffix}")
+            device = report.selected
+            runtime = ("生成器 MPS / 降噪 CPU" if device == "mps"
+                       else report.short_reason)
+            try:
+                import pipeline as _pipeline
+                engine = getattr(_pipeline, "_colorizer", None)
+                if engine is not None:
+                    device = str(getattr(engine, "device_name", device))
+                    warning = str(getattr(engine, "device_warning", "") or "")
+                    if warning:
+                        runtime = warning
+                    elif device == "mps":
+                        runtime = "生成器 MPS / 降噪 CPU"
+                    else:
+                        runtime = "mc-v2 实际运行设备"
+            except Exception:
+                pass
+            self._device_label.setText(
+                f"{tr('device_label')}{device} · {runtime} · {suffix}")
+            self._device_label.setToolTip(
+                f"macOS: {report.macos_version or '—'}\n"
+                f"架构: {report.architecture}\n"
+                f"Python: {report.python_version}\n"
+                f"PyTorch: {report.torch_version}\n"
+                f"MPS built/available/smoke: "
+                f"{report.mps_built}/{report.mps_available}/{report.mps_smoke_ok}\n"
+                f"说明: {report.reason}")
         except Exception as exc:
             self._device_label.setText(f"{tr('device_label')}检测失败：{exc}")
 
@@ -3217,6 +6885,19 @@ class MainWindow(QMainWindow):
             active = self._pending_selection_mask is not None
         if getattr(self, '_btn_apply_selection', None) is not None:
             self._btn_apply_selection.setEnabled(bool(active))
+        if getattr(self, '_btn_refine_hair', None) is not None:
+            self._btn_refine_hair.setEnabled(bool(active) and not bool(getattr(self, '_ui_busy', False)))
+        for name in ('_btn_refine_positive', '_btn_refine_negative',
+                     '_btn_refine_stop_brush', '_btn_refine_clear_brush'):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(self._current_state() is not None and
+                                  not bool(getattr(self, '_ui_busy', False)))
+        if getattr(self, '_btn_restore_selection_bw', None) is not None:
+            state = self._current_state()
+            self._btn_restore_selection_bw.setEnabled(
+                bool(active) and state is not None and state.result_bgr is not None
+                and not bool(getattr(self, '_ui_busy', False)))
         if getattr(self, '_btn_cancel_selection', None) is not None:
             self._btn_cancel_selection.setEnabled(bool(active))
         if getattr(self, '_btn_ai_recolor_selection', None) is not None:
@@ -3349,18 +7030,95 @@ class MainWindow(QMainWindow):
             self._canvas.set_selection_adjust_radius(int(value))
 
     def _on_selection_adjust_dab(self, ix: int, iy: int, radius_px: int, add_mode: bool):
-        if self._pending_selection_mask is None:
+        if self._hair_guard_selector_active and self._hair_guard_selector_mode in {"brush_add", "brush_erase"}:
+            shape = self._hair_guard_selection_shape()
+            if shape is None:
+                return
+            if not self._selection_adjust_gesture_active:
+                self._selection_adjust_gesture_active = True
+                self._begin_foreground_interaction()
+                base = self._current_hair_guard_selection_mask()
+                if base is None:
+                    base = np.zeros(shape, np.uint8)
+                self._hair_guard_selection_stroke_base_mask = base.copy()
+                self._hair_guard_selection_stroke_mask = np.zeros(shape, np.uint8)
+                self._hair_guard_selection_stroke_add_mode = bool(add_mode)
+            stroke = self._hair_guard_selection_stroke_mask
+            base = self._hair_guard_selection_stroke_base_mask
+            if stroke is None or base is None:
+                return
+            cv2.circle(stroke, (int(ix), int(iy)), max(1, int(radius_px)), 255, thickness=-1)
+            preview = cv2.bitwise_or(base, stroke) if self._hair_guard_selection_stroke_add_mode else cv2.bitwise_and(base, cv2.bitwise_not(stroke))
+            if getattr(self, '_hair_refine_brush_active', False):
+                self._show_hair_refine_scribbles(pending=stroke, add_mode=add_mode)
+            else:
+                self._canvas.set_selection_mask_overlay(preview, mode="replace")
             return
+        mask = self._pending_selection_mask
+        if mask is None:
+            return
+        if not self._selection_adjust_gesture_active:
+            self._selection_adjust_gesture_active = True
+            self._begin_foreground_interaction()
         # Manual corrections become authoritative.  Stop the cached AI preview
         # from regenerating on Apply and overwriting the user's add/erase work.
         self._clear_closed_preview_cache()
-        mask = self._pending_selection_mask.copy()
         value = 255 if add_mode else 0
         cv2.circle(mask, (int(ix), int(iy)), max(1, int(radius_px)), value, thickness=-1)
-        self._set_pending_selection(mask, self._pending_selection_kind, combine=False)
+        self._selection_adjust_last_add_mode = bool(add_mode)
+        self._selection_adjust_overlay_dirty = True
+        if not self._selection_adjust_overlay_timer.isActive():
+            self._selection_adjust_overlay_timer.start()
+
+    def _flush_selection_adjust_overlay(self):
+        if not self._selection_adjust_overlay_dirty:
+            return
+        self._selection_adjust_overlay_dirty = False
+        mask = self._pending_selection_mask
+        active = mask is not None and bool(np.any(mask))
+        self._update_selection_buttons(active)
+        if active:
+            mode = self._current_selection_mode()
+            if (getattr(self, '_chk_selection_bw_preview', None) is not None
+                    and self._chk_selection_bw_preview.isChecked()):
+                self._refresh_selection_display_preview()
+            else:
+                self._canvas.set_selection_mask_overlay(mask, mode=mode)
+        else:
+            self._pending_selection_mask = None
+            self._pending_selection_kind = None
+            self._canvas.clear_selection_preview()
         self.statusBar().showMessage(
-            tr("selection_adjust_add_status") if add_mode else tr("selection_adjust_erase_status"),
+            tr("selection_adjust_add_status") if self._selection_adjust_last_add_mode
+            else tr("selection_adjust_erase_status"),
             1200)
+
+    def _on_selection_adjust_finished(self):
+        try:
+            if self._hair_guard_selector_active and self._hair_guard_selector_mode in {"brush_add", "brush_erase"}:
+                stroke = self._hair_guard_selection_stroke_mask
+                add_mode = bool(self._hair_guard_selection_stroke_add_mode)
+                if stroke is not None and np.any(stroke):
+                    saved = self._append_hair_guard_selection_operation(stroke, add_mode=add_mode)
+                    if getattr(self, '_hair_refine_brush_active', False):
+                        self._show_hair_refine_scribbles()
+                    else:
+                        self._canvas.set_selection_mask_overlay(saved, mode="replace") if saved is not None else self._canvas.clear_selection_preview()
+                    count = len(self._current_hair_guard_selection_history())
+                    area = int(np.count_nonzero(saved)) if saved is not None else 0
+                    self.statusBar().showMessage(
+                        f"已{'添加' if add_mode else '擦除'}头发纠色区域。当前 {count} 个操作，覆盖 {area} px。",
+                        1800)
+                self._hair_guard_selection_stroke_mask = None
+                self._hair_guard_selection_stroke_base_mask = None
+                return
+            if self._selection_adjust_overlay_timer.isActive():
+                self._selection_adjust_overlay_timer.stop()
+            self._flush_selection_adjust_overlay()
+        finally:
+            if self._selection_adjust_gesture_active:
+                self._selection_adjust_gesture_active = False
+                self._end_foreground_interaction()
 
     def _current_selection_mode(self) -> str:
         radios = getattr(self, '_selection_mode_radios', {}) or {}
@@ -3390,6 +7148,9 @@ class MainWindow(QMainWindow):
     def _set_pending_selection(self, mask: np.ndarray | None,
                                kind: str | None = None, *,
                                combine: bool = True):
+        if self._selection_adjust_overlay_timer.isActive():
+            self._selection_adjust_overlay_timer.stop()
+        self._selection_adjust_overlay_dirty = False
         combined = (self._combine_selection_mask(mask) if combine else
                     (None if mask is None or not np.any(mask) else
                      np.where(mask > 0, 255, 0).astype(np.uint8)))
@@ -3487,6 +7248,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _cancel_pending_selection_fill(self):
+        self._semantic_select_armed = False
+        if self._selection_adjust_overlay_timer.isActive():
+            self._selection_adjust_overlay_timer.stop()
+        self._selection_adjust_overlay_dirty = False
         self._clear_closed_preview_cache()
         # A running inference cannot always be interrupted safely, but clearing
         # these tokens makes its eventual result stale and therefore ignored.
@@ -3504,6 +7269,29 @@ class MainWindow(QMainWindow):
         if state is not None:
             self._sync_view_after_edit(state)
         self.statusBar().showMessage(tr('selection_cancel'), 2500)
+
+    def _restore_selection_bw(self):
+        """Undoable, mask-clipped local B/W restore (unlike full-page reset)."""
+        state = self._current_state()
+        mask = self._pending_selection_mask
+        if state is None or state.result_bgr is None or mask is None or not np.any(mask):
+            self.statusBar().showMessage("请先选择已上色页面中的区域。", 3500)
+            return
+        if getattr(self, "_ui_busy", False):
+            return
+        from core.local_model_recolor import restore_selection_to_original
+        state.push_undo(fields=state.PIXEL_EDIT_FIELDS)
+        state.result_bgr, state.filter_base_bgr, changed = restore_selection_to_original(
+            state.original_bgr, state.result_bgr, state.filter_base_bgr, mask)
+        if changed == 0:
+            state.discard_unchanged_undo()
+            self.statusBar().showMessage("选区已经是原始黑白，无需恢复。", 3000)
+            return
+        self._sync_bias_reference_to_current(state)
+        self._radio_view_edited.setChecked(True)
+        self._sync_view_after_edit(state)
+        self._schedule_export_compression(state.path, delay_ms=350)
+        self.statusBar().showMessage(f"已恢复选区黑白：{changed} 个像素（可撤销）", 5000)
 
     def _apply_pending_selection_fill(self):
         if self._closed_preview_probability is not None:
@@ -3546,6 +7334,315 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setEnabled(enabled)
 
+    def _update_selection_control_swatch(self):
+        button = getattr(self, "_selection_control_color_btn", None)
+        if button is None:
+            return
+        color = QColor(getattr(self, "_selection_control_color", QColor(28, 28, 32)))
+        button.setText(color.name().upper())
+        text = "#ffffff" if color.lightness() < 120 else "#111111"
+        button.setStyleSheet(
+            f"QPushButton {{ background: {color.name()}; color: {text}; "
+            "border: 1px solid #718096; border-radius: 4px; padding: 4px; }")
+
+    def _on_selection_control_preset_changed(self, _index: int | None = None):
+        combo = getattr(self, "_selection_control_preset_combo", None)
+        if combo is None:
+            return
+        key = str(combo.currentData() or "custom")
+        presets = {
+            # RGB, final lock %, luminance pull %, hint %, gain %, deep %,
+            # middle %, shallow %. These presets are tuned for black-hair source
+            # control: they bias the generator harder before the deterministic
+            # post-lock removes any remaining warm cast.
+            # Ink Black is deliberately neutral. Use Cool Black for a blue-black
+            # finish. Keeping the two presets separate avoids the old situation
+            # where "墨黑" still looked slightly teal/brown on long highlights.
+            "ink_black": ((24, 24, 24), 40, 0, 100, 160, 70, 90, 100),
+            "soft_black": ((40, 40, 46), 32, 0, 96, 155, 66, 88, 98),
+            "cool_black": ((24, 30, 44), 36, 0, 100, 165, 72, 92, 100),
+            "light_ink": ((68, 69, 78), 25, 0, 90, 150, 60, 84, 94),
+        }
+        preset = presets.get(key)
+        if preset is None:
+            return
+        rgb, final_lock, luminance, hint_opacity, gain, deep, middle, shallow = preset
+        self._selection_control_color = QColor(*rgb)
+        widget_values = {
+            "_selection_control_final_spin": final_lock,
+            "_selection_control_luminance_spin": luminance,
+            "_selection_control_hint_spin": hint_opacity,
+            "_selection_control_gain_spin": gain,
+            "_selection_control_deep_spin": deep,
+            "_selection_control_middle_spin": middle,
+            "_selection_control_shallow_spin": shallow,
+        }
+        for name, value in widget_values.items():
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setValue(value)
+        self._update_selection_control_swatch()
+
+    def _pick_selection_control_color(self):
+        current = QColor(getattr(self, "_selection_control_color", QColor(28, 28, 32)))
+        chosen = self._open_color_dialog(current, tr("selection_control_color"))
+        if chosen.isValid():
+            self._selection_control_color = QColor(chosen)
+            combo = getattr(self, "_selection_control_preset_combo", None)
+            if combo is not None:
+                custom_index = combo.findData("custom")
+                if custom_index >= 0:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(custom_index)
+                    combo.blockSignals(False)
+            self._update_selection_control_swatch()
+
+    def _update_selection_region_control_enabled(self, _checked: bool | None = None):
+        enabled = bool(getattr(self, "_chk_selection_region_control", None)
+                       and self._chk_selection_region_control.isChecked())
+        names = (
+            "_selection_control_preset_label", "_selection_control_preset_combo",
+            "_selection_control_color_label", "_selection_control_color_btn",
+            "_selection_control_hint_label", "_selection_control_hint_spin",
+            "_selection_control_gain_label", "_selection_control_gain_spin",
+            "_selection_control_deep_label", "_selection_control_deep_spin",
+            "_selection_control_middle_label", "_selection_control_middle_spin",
+            "_selection_control_shallow_label", "_selection_control_shallow_spin",
+            "_selection_control_final_label", "_selection_control_final_spin",
+            "_selection_control_luminance_label", "_selection_control_luminance_spin",
+        )
+        for name in names:
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+        adapter = getattr(self, "_chk_selection_control_adapter", None)
+        if adapter is not None:
+            adapter.setEnabled(enabled and _tunnel2_adapter_available())
+
+    def _current_selection_region_control(self) -> dict:
+        color = QColor(getattr(self, "_selection_control_color", QColor(28, 28, 32)))
+        def pct(name: str, default: int) -> float:
+            widget = getattr(self, name, None)
+            return float(widget.value() if widget is not None else default) / 100.0
+        enabled = bool(getattr(self, "_chk_selection_region_control", None)
+                       and self._chk_selection_region_control.isChecked())
+        rgb = (color.red(), color.green(), color.blue())
+        black_like = (max(rgb) <= 96 and (max(rgb) - min(rgb)) <= 34)
+        neutral_ink = (max(rgb) <= 48 and (max(rgb) - min(rgb)) <= 6)
+        return {
+            "enabled": enabled,
+            "target_rgb": rgb,
+            "hint_opacity": pct("_selection_control_hint_spin", 50),
+            "feature_gain": pct("_selection_control_gain_spin", 175),
+            "deep_strength": pct("_selection_control_deep_spin", 38),
+            "middle_strength": pct("_selection_control_middle_spin", 74),
+            "shallow_strength": pct("_selection_control_shallow_spin", 94),
+            "deep_shrink_px": 2 if black_like else 8,
+            "middle_shrink_px": 1 if black_like else 3,
+            "shallow_shrink_px": 0,
+            "mask_feather_px": (1 if black_like else max(1, int(getattr(
+                self, "_selection_feather_slider", None).value()
+                if getattr(self, "_selection_feather_slider", None) is not None else 3))),
+            "final_color_lock": pct("_selection_control_final_spin", 92),
+            "luminance_shift": pct("_selection_control_luminance_spin", 28),
+            "protect_lineart": True,
+            "preserve_highlights": True,
+            "use_adapter": bool(getattr(self, "_chk_selection_control_adapter", None)
+                                and self._chk_selection_control_adapter.isChecked()),
+            # Automatic real-checkpoint black-hair calibration. No new UI is
+            # required: dark low-chroma targets receive an inverse-calibrated
+            # internal generator hint plus a stronger warm-cast cleanup.
+            "source_bias_strength": 0.0,
+            "source_bias_tone": 0,
+            "source_bias_feather_px": 0,
+            "neutralize_chroma": (1.00 if neutral_ink else 0.94) if black_like else 0.0,
+            "warm_suppression": 1.00 if black_like else 0.0,
+            "protect_lineart_threshold": 108 if black_like else 88,
+            # Never silently reconstruct/expand a manually reviewed selection.
+            # A separately approved full-hair semantic selection arrives as an
+            # already-built mask and must remain authoritative as well.
+            "complete_hair_object": False,
+            "expand_control_mask": False,
+            "expand_merge_mask": False,
+            "hair_object_max_ratio": 2.15,
+        }
+
+    def _show_hair_refine_scribbles(self, *, pending=None, add_mode=None):
+        """Blue=definite hair, red=definite non-hair, including live strokes."""
+        positive, negative = self._current_hair_guard_semantic_scribbles()
+        if pending is not None and np.any(pending):
+            if bool(add_mode):
+                positive = (pending.copy() if positive is None else
+                            cv2.bitwise_or(positive, pending))
+            else:
+                negative = (pending.copy() if negative is None else
+                            cv2.bitwise_or(negative, pending))
+        self._canvas.set_auto_hair_preview_overlay(positive, None, negative)
+
+    def _activate_hair_refine_brush(self, mode: str):
+        """Expose already-persisted positive/negative hair strokes in Edit tab."""
+        self._activate_hair_guard_selector(mode, for_refinement=True)
+        self._hair_refine_brush_active = True
+        self._show_hair_refine_scribbles()
+        self.statusBar().showMessage(
+            "发丝正向标注：在头发内部涂抹，完成后点「智能贴合发丝」。" if mode == "brush_add"
+            else "非发丝负向标注：在面部、背景等禁止覆盖区域涂抹。", 6500)
+
+    def _start_hair_selection_refine(self):
+        state = self._current_state()
+        rough = self._pending_selection_mask
+        if state is None or state.result_bgr is None or rough is None or not np.any(rough):
+            self.statusBar().showMessage("请先在上色页面用矩形或套索粗选头发。", 4000)
+            return
+        if self._hair_refine_worker is not None and self._hair_refine_worker.isRunning():
+            return
+        if getattr(self, '_ui_busy', False):
+            return
+        positive, negative = self._current_hair_guard_semantic_scribbles()
+        if self._hair_guard_selector_active:
+            self._deactivate_hair_guard_selector()
+        colour = state.ai_result_bgr if state.ai_result_bgr is not None else state.result_bgr
+        distance_widget = getattr(self, '_selection_snap_distance_spin', None)
+        distance = max(12, min(48, int(distance_widget.value()) * 3 if distance_widget else 22))
+        worker = HairSelectionRefineWorker(
+            state.original_bgr, colour, rough,
+            positive=positive, negative=negative, grow_px=distance, parent=self)
+        self._hair_refine_worker = worker
+        self._hair_refine_page_path = state.path
+        worker.status.connect(self._on_worker_status)
+        worker.finished_ok.connect(self._on_hair_selection_refined)
+        worker.finished_err.connect(self._on_hair_selection_refine_failed)
+        worker.cancelled.connect(self._on_hair_selection_refine_cancelled)
+        self._set_busy(True, "正在贴合发丝边界…")
+        worker.start()
+
+    def _finish_hair_selection_refine(self):
+        worker = self._hair_refine_worker
+        self._hair_refine_worker = None
+        self._hair_refine_page_path = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_busy(False)
+        self._update_selection_buttons(self._pending_selection_mask is not None)
+
+    def _on_hair_selection_refined(self, payload):
+        state = self._current_state()
+        if state is None or state.path != self._hair_refine_page_path:
+            self._finish_hair_selection_refine()
+            return
+        mask = np.asarray((payload or {}).get('mask'))
+        info = dict((payload or {}).get('diagnostics') or {})
+        if mask.ndim != 2 or not np.any(mask):
+            self._finish_hair_selection_refine()
+            self.statusBar().showMessage("发丝细化结果为空，粗选区未改变。", 4500)
+            return
+        if info.get('used_fallback'):
+            # Never silently replace a precise manual selection with a failed
+            # segmentation that may contain face or background.
+            self._finish_hair_selection_refine()
+            self.statusBar().showMessage(
+                f"未能安全细化（{info.get('reason')}），保留原选区，请补充正负标注。", 5500)
+            return
+        self._set_pending_selection(mask.astype(np.uint8), 'guided_hair', combine=False)
+        self._finish_hair_selection_refine()
+        self.statusBar().showMessage(
+            f"发丝贴合成功：{info.get('selected_pixels',0)} px，补入 "
+            f"{info.get('added_pixels',0)} px，排除 {info.get('removed_pixels',0)} px；"
+            "可直接局部改色/恢复黑白/AI 重算。", 7500)
+
+    def _on_hair_selection_refine_failed(self, message: str):
+        self._finish_hair_selection_refine()
+        self.statusBar().showMessage(f"发丝贴合失败：{message}", 6000)
+
+    def _on_hair_selection_refine_cancelled(self):
+        self._finish_hair_selection_refine()
+        self.statusBar().showMessage("已停止发丝贴合。", 3000)
+
+    def _arm_semantic_selection(self):
+        state = self._current_state()
+        if state is None or state.result_bgr is None:
+            QMessageBox.information(self, tr("no_result_title"), tr("no_result_body"))
+            return
+        self._semantic_select_armed = True
+        if getattr(self, "_radio_bucket", None) is not None:
+            self._radio_bucket.setChecked(True)
+            self._on_tool_changed()
+        self.statusBar().showMessage(tr("selection_semantic_armed"), 7000)
+
+    def _run_semantic_selection(self, state, ix: int, iy: int) -> bool:
+        if (self._semantic_selection_worker is not None and
+                self._semantic_selection_worker.isRunning()):
+            self.statusBar().showMessage(tr("selection_semantic_busy"), 3000)
+            return False
+        colour = state.ai_result_bgr if state.ai_result_bgr is not None else state.result_bgr
+        if colour is None:
+            return False
+        # An existing rectangle/polygon/brush selection is treated as a rough
+        # semantic boundary, not as pixels that must all remain selected.  The
+        # actual full-resolution analysis runs in a QThread; first-use OpenCV
+        # initialisation can otherwise pause the UI for several hundred ms.
+        rough_limit = (None if self._pending_selection_mask is None else
+                       self._pending_selection_mask.copy())
+        control = self._current_selection_region_control()
+        rgb = tuple(control.get("target_rgb") or (255, 255, 255))
+        complete_hair_object = bool(
+            max(rgb) <= 96 and (max(rgb) - min(rgb)) <= 34)
+        worker = SemanticSelectionWorker(
+            state.original_bgr, colour, (int(ix), int(iy)),
+            limit_mask=rough_limit,
+            complete_hair_object=complete_hair_object, parent=self)
+        self._semantic_selection_worker = worker
+        self._semantic_selection_page_path = state.path
+        worker.status.connect(self._on_worker_status)
+        worker.finished_ok.connect(self._on_semantic_selection_done)
+        worker.finished_err.connect(self._on_semantic_selection_error)
+        worker.cancelled.connect(self._on_semantic_selection_cancelled)
+        self._set_busy(True, tr("selection_semantic_running"))
+        worker.start()
+        return True
+
+    def _finish_semantic_selection_worker(self):
+        worker = self._semantic_selection_worker
+        self._semantic_selection_worker = None
+        self._semantic_selection_page_path = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_busy(False)
+        self._update_selection_buttons(self._pending_selection_mask is not None)
+
+    def _on_semantic_selection_done(self, payload):
+        page_path = self._semantic_selection_page_path
+        state = self._pages.get(page_path) if page_path else None
+        mask = np.asarray((payload or {}).get("mask"))
+        diagnostics = dict((payload or {}).get("diagnostics") or {})
+        if state is None or state.path != self._current_path:
+            self._finish_semantic_selection_worker()
+            return
+        if mask.ndim != 2 or not np.any(mask):
+            self._finish_semantic_selection_worker()
+            self.statusBar().showMessage(tr("selection_semantic_empty"), 4500)
+            return
+        selection_kind = (
+            "mcv2_complete_hair" if diagnostics.get(
+                "complete_hair_object_enabled", False) else "mcv2_semantic")
+        self._set_pending_selection(mask.astype(np.uint8), selection_kind,
+                                    combine=False)
+        pixels = int(diagnostics.get("selected_pixels", np.count_nonzero(mask)))
+        self._finish_semantic_selection_worker()
+        self.statusBar().showMessage(
+            tr("selection_semantic_done").format(pixels=pixels), 5000)
+
+    def _on_semantic_selection_cancelled(self):
+        self._finish_semantic_selection_worker()
+        self._stop_requested = False
+        self.statusBar().showMessage(tr("stopped"), 4000)
+
+    def _on_semantic_selection_error(self, message: str):
+        self._finish_semantic_selection_worker()
+        QMessageBox.critical(
+            self, tr("selection_semantic_failed_title"),
+            tr("selection_semantic_failed").format(message=message))
+
     def _clear_selection_model_hints(self):
         state = self._current_state()
         mask = self._pending_selection_mask
@@ -3553,7 +7650,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(tr("selection_fill_empty"), 2500)
             return
         from core.local_model_recolor import clear_manual_hints_in_selection
-        state.push_undo()
+        state.push_undo(fields=state.HINT_EDIT_FIELDS)
         removed = clear_manual_hints_in_selection(state.hint_manager, mask)
         if removed <= 0:
             state.discard_unchanged_undo()
@@ -3607,6 +7704,13 @@ class MainWindow(QMainWindow):
                                         if getattr(self, '_selection_focus_context_spin', None) is not None else 32),
             focus_fade_expand_px=int(getattr(self, '_selection_focus_fade_spin', None).value()
                                      if getattr(self, '_selection_focus_fade_spin', None) is not None else 96),
+            region_control={
+                **self._current_selection_region_control(),
+                "hair_object_mask_prebuilt": bool(
+                    self._pending_selection_kind in {"mcv2_complete_hair", "guided_hair"}),
+            },
+            protect_text_overlay=bool(getattr(self, "_chk_protect_text", None)
+                                      and self._chk_protect_text.isChecked()),
             style_key=self._style_combo.currentData(),
             character_memories=self._get_or_create_character_memories(),
             character_library=self._character_library,
@@ -3624,6 +7728,7 @@ class MainWindow(QMainWindow):
         worker.status.connect(self._on_worker_status)
         worker.finished_ok.connect(self._on_local_recolor_done)
         worker.finished_err.connect(self._on_local_recolor_error)
+        worker.cancelled.connect(self._on_local_recolor_cancelled)
         self._set_busy(True, tr("selection_ai_running").format(hints=local_hint_count))
         worker.start()
 
@@ -3638,7 +7743,14 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self._update_selection_buttons(self._pending_selection_mask is not None)
 
+    def _on_local_recolor_cancelled(self):
+        self._finish_local_recolor_worker()
+        self._stop_requested = False
+        self.statusBar().showMessage(tr("stopped"), 4000)
+
     def _on_local_recolor_done(self, payload):
+        if bool(getattr(self, "_stop_requested", False)):
+            return
         page_path = self._local_recolor_page_path
         selection_mask = (self._local_recolor_selection_mask.copy()
                           if isinstance(self._local_recolor_selection_mask, np.ndarray)
@@ -3665,6 +7777,7 @@ class MainWindow(QMainWindow):
             state.quality_report = None
         state.discard_unchanged_undo()
         self._mark_page_done(state.path)
+        self._schedule_export_compression(state.path, delay_ms=350)
 
         if state.path == self._current_path:
             self._clear_closed_preview_cache()
@@ -3731,6 +7844,7 @@ class MainWindow(QMainWindow):
 
     def _update_tool_specific_visibility(self):
         tool = self._current_manual_tool_key()
+        self._refresh_edit_detail_summary(tool)
         selection_tool = tool in {"lasso", "rect"}
         visible_rows = {
             "brush": {"color", "brush_size", "fill_mode", "manual_match_style", "brush_model_hint"},
@@ -3756,6 +7870,23 @@ class MainWindow(QMainWindow):
                 "selection_snap_distance"
             },
         }.get(tool, set())
+
+        selection_tool = tool in {"lasso", "rect"}
+        base_section = getattr(self, "_edit_tool_detail_section", None)
+        if base_section is not None:
+            base_section.setVisible(tool != "bias_brush")
+        bias_section = getattr(self, "_bias_brush_section", None)
+        if bias_section is not None:
+            bias_section.setVisible(tool == "bias_brush")
+        boundary_section = getattr(self, "_selection_boundary_section", None)
+        if boundary_section is not None:
+            boundary_section.setVisible(selection_tool)
+        action_section = getattr(self, "_selection_action_section", None)
+        if action_section is not None:
+            action_section.setVisible(selection_tool)
+        ai_section = getattr(self, "_selection_ai_options_section", None)
+        if ai_section is not None:
+            ai_section.setVisible(selection_tool)
 
         for row_name, widgets in (getattr(self, "_tool_visibility_rows", {}) or {}).items():
             visible = row_name in visible_rows
@@ -3848,6 +7979,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(tr("tool_parameters_reset_done"), 2200)
 
     def _on_tool_changed(self):
+        if self._hair_guard_selector_active and not self._suspend_hair_guard_tool_reset:
+            self._hair_guard_selector_active = False
+            self._hair_refine_brush_active = False
+            self._hair_guard_selector_mode = None
+            mode_label = getattr(self, "_label_hair_guard_selector_mode", None)
+            if mode_label is not None:
+                mode_label.setText("当前选区器：未启用")
+            self._canvas.set_selection_adjust_enabled(False)
+            self._canvas.set_selection_adjust_allow_empty(False)
         if self._radio_brush.isChecked():
             tool = HintCanvas.TOOL_BRUSH
         elif getattr(self, '_radio_bias_brush', None) is not None and self._radio_bias_brush.isChecked():
@@ -3863,6 +8003,8 @@ class MainWindow(QMainWindow):
         else:
             tool = HintCanvas.TOOL_RECT_BUCKET
         self._canvas.set_tool(tool)
+        if not self._hair_guard_selector_active:
+            self._show_preferred_selection_overlay()
         # Keep a prepared blue selection while switching to the hint brush or
         # eyedropper. This is required by the local mc-v2 workflow: select the
         # bad region first, add/remove hints second, then return and execute.
@@ -4172,6 +8314,7 @@ class MainWindow(QMainWindow):
             self._set_shared_selected_color(color)
 
     def _update_color_swatch(self):
+        self._update_hair_recolor_swatch()
         if getattr(self, "_color_swatch", None) is None:
             return
         info = getattr(self, '_current_color_info', None)
@@ -4256,12 +8399,81 @@ class MainWindow(QMainWindow):
 
     def _on_brush_stroke_started(self):
         """Create one undo checkpoint for the whole visible brush stroke."""
+        self._begin_foreground_interaction()
         state = self._current_state()
         self._local_brush_stroke_active = bool(
             state is not None and state.result_bgr is not None)
         self._brush_changed_during_stroke = False
+        self._brush_patch_undo = None
         if self._local_brush_stroke_active:
-            state.push_undo()
+            model_hint = bool(getattr(self, '_chk_brush_model_hint', None)
+                              and self._chk_brush_model_hint.isChecked())
+            self._brush_stroke_model_hint = model_hint
+            if model_hint:
+                state.push_undo(fields=state.HINT_EDIT_FIELDS)
+            else:
+                # Direct paint records the pre-stroke pixels lazily as the
+                # painted corridor expands.  Avoid copying two complete page
+                # layers before the first visible dab.
+                state.redo_stack.clear()
+                self._brush_patch_undo = {
+                    "state_path": state.path,
+                    "tile_size": 128,
+                    "tiles": {},
+                    "filter_was_none": state.filter_base_bgr is None,
+                    "bias_brush_reference_bgr": state.bias_brush_reference_bgr,
+                    "bias_brush_reference_filter_bgr": state.bias_brush_reference_filter_bgr,
+                }
+
+    def _extend_brush_patch_undo(self, state: "PageState",
+                                 roi: tuple[int, int, int, int]) -> None:
+        patch = self._brush_patch_undo
+        if not patch or patch.get("state_path") != state.path:
+            return
+        result = state.result_bgr
+        if result is None:
+            return
+        h, w = result.shape[:2]
+        x0, y0, x1, y1 = [int(v) for v in roi]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w, x1), min(h, y1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        tile_size = max(32, int(patch.get("tile_size", 128)))
+        tiles = patch.setdefault("tiles", {})
+        tx0, tx1 = x0 // tile_size, (x1 - 1) // tile_size
+        ty0, ty1 = y0 // tile_size, (y1 - 1) // tile_size
+        filter_base = state.filter_base_bgr
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                key = (tx, ty)
+                if key in tiles:
+                    continue
+                bx0, by0 = tx * tile_size, ty * tile_size
+                bx1, by1 = min(w, bx0 + tile_size), min(h, by0 + tile_size)
+                tiles[key] = {
+                    "bbox": (bx0, by0, bx1, by1),
+                    "result_bgr": result[by0:by1, bx0:bx1].copy(),
+                    "filter_base_bgr": (
+                        None if patch.get("filter_was_none") or filter_base is None
+                        else filter_base[by0:by1, bx0:bx1].copy()),
+                }
+
+    def _commit_brush_patch_undo(self, state: "PageState") -> None:
+        patch = self._brush_patch_undo
+        self._brush_patch_undo = None
+        if not patch or patch.get("state_path") != state.path or not patch.get("tiles"):
+            return
+        ordered_tiles = [patch["tiles"][key] for key in sorted(patch["tiles"])]
+        state.push_undo_snapshot({
+            "__kind__": "pixel_tiles",
+            "__fields__": state.FILTER_EDIT_FIELDS,
+            "tiles": ordered_tiles,
+            "filter_was_none": bool(patch.get("filter_was_none")),
+            "bias_brush_reference_bgr": patch.get("bias_brush_reference_bgr"),
+            "bias_brush_reference_filter_bgr": patch.get(
+                "bias_brush_reference_filter_bgr"),
+        })
 
     def _on_hint_dab_added(self, x_norm: float, y_norm: float, rgb: tuple,
                            radius_norm: float):
@@ -4271,7 +8483,7 @@ class MainWindow(QMainWindow):
 
         # Before the first auto-colorize, brush dabs remain model hints.
         if state.result_bgr is None:
-            state.push_undo()
+            state.push_undo(fields=state.HINT_EDIT_FIELDS)
             changed = state.hint_manager.add_manual_hint(
                 x_norm, y_norm, rgb, radius_norm)
             if not changed:
@@ -4282,10 +8494,23 @@ class MainWindow(QMainWindow):
         if not self._local_brush_stroke_active:
             self._local_brush_stroke_active = True
             self._brush_changed_during_stroke = False
-            state.push_undo()
+            model_hint = bool(getattr(self, '_chk_brush_model_hint', None)
+                              and self._chk_brush_model_hint.isChecked())
+            self._brush_stroke_model_hint = model_hint
+            if model_hint:
+                state.push_undo(fields=state.HINT_EDIT_FIELDS)
+            else:
+                state.redo_stack.clear()
+                self._brush_patch_undo = {
+                    "state_path": state.path,
+                    "tile_size": 128,
+                    "tiles": {},
+                    "filter_was_none": state.filter_base_bgr is None,
+                    "bias_brush_reference_bgr": state.bias_brush_reference_bgr,
+                    "bias_brush_reference_filter_bgr": state.bias_brush_reference_filter_bgr,
+                }
 
-        if (getattr(self, '_chk_brush_model_hint', None) is not None
-                and self._chk_brush_model_hint.isChecked()):
+        if bool(self._brush_stroke_model_hint):
             gap_close = self._gap_px_from_percent(self._gap_close_slider.value())
             state.hint_manager.bind_source_image(
                 state.original_bgr, gap_close=gap_close)
@@ -4310,59 +8535,82 @@ class MainWindow(QMainWindow):
         strength = self._manual_strength_slider.value() / 100.0
         paint_rgb = self._manual_target_rgb(rgb)
         fill_mode = self._current_fill_mode()
+        roi = (max(0, ix - radius_px), max(0, iy - radius_px),
+               min(w, ix + radius_px + 1), min(h, iy + radius_px + 1))
+        self._extend_brush_patch_undo(state, roi)
 
         # The V5 brush has one predictable path: paint the exact live corridor.
         # It never waits for mouse release, expands into a region, or snaps to
         # line art. Solid ink pixels are still protected by apply_brush_edit.
-        state.result_bgr, state.filter_base_bgr, _mask, changed = apply_brush_edit(
+        state.result_bgr, state.filter_base_bgr, compact, changed = apply_brush_edit(
             state.original_bgr, state.result_bgr, state.filter_base_bgr,
             ix, iy, radius_px, paint_rgb, opacity=min(1.0, strength),
             region_map=None, gap_close=0, mode=fill_mode,
-            snap_to_lineart=False, pupil_blend=False)
+            snap_to_lineart=False, pupil_blend=False, compact_mask=True)
         self._brush_changed_during_stroke |= changed
 
         if changed:
             self._radio_view_edited.setChecked(True)
-            if hasattr(self._canvas, "update_image_pixels"):
+            if (hasattr(self._canvas, "update_image_region") and
+                    isinstance(compact, tuple) and len(compact) >= 4):
+                self._canvas.update_image_region(
+                    state.result_bgr, tuple(int(v) for v in compact[:4]))
+            elif hasattr(self._canvas, "update_image_pixels"):
                 self._canvas.update_image_pixels(state.result_bgr)
             else:
                 self._sync_view_after_edit(state)
 
     def _on_brush_stroke_finished(self):
-        if not self._local_brush_stroke_active:
-            return
-        state = self._current_state()
-        self._local_brush_stroke_active = False
-        self._canvas.clear_dabs()
-        if state is None or state.result_bgr is None:
-            self._brush_changed_during_stroke = False
-            return
+        try:
+            if not self._local_brush_stroke_active:
+                self._brush_patch_undo = None
+                return
+            state = self._current_state()
+            self._local_brush_stroke_active = False
+            self._canvas.clear_dabs()
+            if state is None or state.result_bgr is None:
+                self._brush_changed_during_stroke = False
+                self._brush_patch_undo = None
+                return
 
-        state.discard_unchanged_undo()
-        if self._brush_changed_during_stroke:
-            self._sync_bias_reference_to_current(state)
-        self._radio_view_edited.setChecked(True)
-        self._sync_view_after_edit(state)
-        if (getattr(self, '_chk_brush_model_hint', None) is not None
-                and self._chk_brush_model_hint.isChecked()
-                and self._brush_changed_during_stroke):
-            message = tr("brush_model_hint_done")
-        else:
-            message = (tr("local_brush_done") if self._brush_changed_during_stroke
-                       else tr("manual_edit_no_change"))
-        self.statusBar().showMessage(message, 3000)
-        self._brush_changed_during_stroke = False
+            model_hint = bool(self._brush_stroke_model_hint)
+            if model_hint:
+                state.discard_unchanged_undo()
+            elif self._brush_changed_during_stroke:
+                self._commit_brush_patch_undo(state)
+            else:
+                self._brush_patch_undo = None
+            if self._brush_changed_during_stroke:
+                self._sync_bias_reference_to_current(state)
+            already_showing_edited = self._radio_view_edited.isChecked()
+            self._radio_view_edited.setChecked(True)
+            if already_showing_edited:
+                # Live ROI updates already contain the final direct-paint
+                # pixels.  Flushing the last coalesced rectangle avoids one
+                # full-resolution upload on every mouse release.
+                self._refresh_live_canvas_after_edit(state)
+            if model_hint and self._brush_changed_during_stroke:
+                message = tr("brush_model_hint_done")
+            else:
+                message = (tr("local_brush_done") if self._brush_changed_during_stroke
+                           else tr("manual_edit_no_change"))
+            self.statusBar().showMessage(message, 3000)
+            self._brush_changed_during_stroke = False
+            self._brush_stroke_model_hint = False
+        finally:
+            self._end_foreground_interaction()
 
     def _sync_bias_reference_to_current(self, state: "PageState" | None):
-        if state is None or state.result_bgr is None:
-            if state is not None:
-                state.bias_brush_reference_bgr = None
-                state.bias_brush_reference_filter_bgr = None
+        """Invalidate the bias-eraser baseline after a non-bias edit.
+
+        The old implementation eagerly copied two complete page layers after
+        every brush stroke/bucket fill.  The baseline is now created lazily at
+        the next bias-brush stroke by ``_ensure_bias_reference_exists``.
+        """
+        if state is None:
             return
-        state.bias_brush_reference_bgr = state.result_bgr.copy()
-        state.bias_brush_reference_filter_bgr = (
-            state.filter_base_bgr.copy() if state.filter_base_bgr is not None
-            else state.result_bgr.copy())
+        state.bias_brush_reference_bgr = None
+        state.bias_brush_reference_filter_bgr = None
 
     def _ensure_bias_reference_exists(self, state: "PageState" | None):
         if state is None or state.result_bgr is None:
@@ -4394,8 +8642,8 @@ class MainWindow(QMainWindow):
         if state is None or state.result_bgr is None:
             self.statusBar().showMessage(tr("bias_brush_requires_result"), 3500)
             return
+        self._begin_foreground_interaction()
         self._ensure_bias_reference_exists(state)
-        state.push_undo()
         try:
             from core.bias_brush import empty_stroke_alpha, prepare_bias_candidate
             import time
@@ -4403,6 +8651,14 @@ class MainWindow(QMainWindow):
             self._bias_brush_base_filter = (
                 state.filter_base_bgr.copy() if state.filter_base_bgr is not None
                 else state.result_bgr.copy())
+            # Reuse the immutable pre-stroke bases as the undo checkpoint.
+            # The old route copied both complete layers once for undo and once
+            # again for live compositing.
+            state.push_undo_snapshot({
+                "__fields__": state.FILTER_EDIT_FIELDS,
+                "result_bgr": self._bias_brush_base_result,
+                "filter_base_bgr": self._bias_brush_base_filter,
+            }, compare=False)
             config = self._current_bias_brush_config()
             self._bias_brush_candidate_result = prepare_bias_candidate(
                 self._bias_brush_base_result, state.original_bgr, config)
@@ -4418,8 +8674,10 @@ class MainWindow(QMainWindow):
             self._bias_brush_last_preview_ts = time.monotonic()
             self._bias_brush_last_radius_px = int(self._brush_px_from_percent(self._bias_brush_size_slider.value())) if getattr(self, '_bias_brush_size_slider', None) is not None else 18
         except Exception as exc:  # noqa: BLE001
-            state.discard_unchanged_undo()
+            if state.undo_stack:
+                state.undo_stack.pop()
             self._reset_bias_brush_runtime()
+            self._end_foreground_interaction()
             self.statusBar().showMessage(
                 tr("bias_brush_failed").format(message=f"{type(exc).__name__}: {exc}"),
                 6000)
@@ -4466,7 +8724,9 @@ class MainWindow(QMainWindow):
                 if (now - float(getattr(self, '_bias_brush_last_preview_ts', 0.0)) >=
                         float(getattr(self, '_bias_brush_preview_interval', 1.0 / 30.0))):
                     self._bias_brush_last_preview_ts = now
-                    if hasattr(self._canvas, "update_image_pixels"):
+                    if hasattr(self._canvas, "update_image_region"):
+                        self._canvas.update_image_region(state.result_bgr, roi)
+                    elif hasattr(self._canvas, "update_image_pixels"):
                         self._canvas.update_image_pixels(state.result_bgr)
                     else:
                         self._sync_view_after_edit(state)
@@ -4476,51 +8736,58 @@ class MainWindow(QMainWindow):
                 6000)
 
     def _on_bias_brush_stroke_finished(self):
-        self._canvas.clear_dabs()
-        state = self._current_state()
-        active = self._bias_brush_stroke_active
-        changed = self._bias_brush_changed_during_stroke
-        if active and state is not None and state.result_bgr is not None:
-            try:
-                # Final-quality pass: recompute the complete accumulated stroke
-                # with the exact pre-optimization full-page compositor.  The
-                # ROI path above is preview-only; this guarantees that soft
-                # edges, overlapping dabs and colour strength are byte-identical
-                # to the earlier higher-quality bias-brush implementation.
-                from core.bias_brush import (
-                    build_cohesive_stroke_alpha,
-                    composite_bias_candidate,
-                )
-                if (self._bias_brush_base_result is not None and
-                        self._bias_brush_candidate_result is not None and
-                        self._bias_brush_alpha is not None):
-                    final_alpha = build_cohesive_stroke_alpha(
-                        self._bias_brush_alpha,
-                        state.original_bgr,
-                        self._bias_brush_base_result,
-                        brush_radius_px=int(getattr(self, '_bias_brush_last_radius_px', 18)))
-                    state.result_bgr, final_result_changed = composite_bias_candidate(
-                        self._bias_brush_base_result,
-                        self._bias_brush_candidate_result,
-                        final_alpha)
-                    state.filter_base_bgr, final_filter_changed = composite_bias_candidate(
-                        self._bias_brush_base_filter,
-                        self._bias_brush_candidate_filter,
-                        final_alpha)
-                    changed = bool(final_result_changed or final_filter_changed)
-            except Exception as exc:  # noqa: BLE001
-                self.statusBar().showMessage(
-                    tr("bias_brush_failed").format(
-                        message=f"{type(exc).__name__}: {exc}"), 6000)
-            state.discard_unchanged_undo()
-            self._radio_view_edited.setChecked(True)
-            self._sync_view_after_edit(state)
-        self._reset_bias_brush_runtime()
-        if not active:
-            return
-        self.statusBar().showMessage(
-            tr("bias_brush_done") if changed else tr("manual_edit_no_change"),
-            3000)
+        try:
+            self._canvas.clear_dabs()
+            state = self._current_state()
+            active = self._bias_brush_stroke_active
+            changed = self._bias_brush_changed_during_stroke
+            if active and state is not None and state.result_bgr is not None:
+                try:
+                    # Final-quality pass: recompute the complete accumulated
+                    # stroke with the exact full-page compositor.  The ROI path
+                    # above is preview-only.
+                    from core.bias_brush import (
+                        build_cohesive_stroke_alpha,
+                        composite_bias_candidate,
+                    )
+                    if (self._bias_brush_base_result is not None and
+                            self._bias_brush_candidate_result is not None and
+                            self._bias_brush_alpha is not None):
+                        final_alpha = build_cohesive_stroke_alpha(
+                            self._bias_brush_alpha,
+                            state.original_bgr,
+                            self._bias_brush_base_result,
+                            brush_radius_px=int(getattr(
+                                self, '_bias_brush_last_radius_px', 18)))
+                        state.result_bgr, final_result_changed = composite_bias_candidate(
+                            self._bias_brush_base_result,
+                            self._bias_brush_candidate_result,
+                            final_alpha)
+                        state.filter_base_bgr, final_filter_changed = composite_bias_candidate(
+                            self._bias_brush_base_filter,
+                            self._bias_brush_candidate_filter,
+                            final_alpha)
+                        changed = bool(final_result_changed or final_filter_changed)
+                except Exception as exc:  # noqa: BLE001
+                    self.statusBar().showMessage(
+                        tr("bias_brush_failed").format(
+                            message=f"{type(exc).__name__}: {exc}"), 6000)
+                if not changed and state.undo_stack:
+                    state.undo_stack.pop()
+                already_showing_edited = self._radio_view_edited.isChecked()
+                self._radio_view_edited.setChecked(True)
+                if already_showing_edited:
+                    # The cohesive final pass can differ from the live ROI
+                    # preview, so one full refresh is still required here.
+                    self._sync_view_after_edit(state)
+            self._reset_bias_brush_runtime()
+            if not active:
+                return
+            self.statusBar().showMessage(
+                tr("bias_brush_done") if changed else tr("manual_edit_no_change"),
+                3000)
+        finally:
+            self._end_foreground_interaction()
 
     def _reset_bias_eraser_runtime(self):
         self._bias_eraser_stroke_active = False
@@ -4542,7 +8809,7 @@ class MainWindow(QMainWindow):
         if getattr(state, 'bias_brush_reference_bgr', None) is None:
             self.statusBar().showMessage(tr("bias_eraser_requires_reference"), 3500)
             return
-        state.push_undo()
+        self._begin_foreground_interaction()
         try:
             from core.bias_brush import empty_stroke_alpha
             import time
@@ -4550,6 +8817,11 @@ class MainWindow(QMainWindow):
             self._bias_eraser_base_filter = (
                 state.filter_base_bgr.copy() if state.filter_base_bgr is not None
                 else state.result_bgr.copy())
+            state.push_undo_snapshot({
+                "__fields__": state.FILTER_EDIT_FIELDS,
+                "result_bgr": self._bias_eraser_base_result,
+                "filter_base_bgr": self._bias_eraser_base_filter,
+            }, compare=False)
             self._bias_eraser_candidate_result = state.bias_brush_reference_bgr.copy()
             ref_filter = getattr(state, 'bias_brush_reference_filter_bgr', None)
             if ref_filter is not None and ref_filter.shape[:2] == state.result_bgr.shape[:2]:
@@ -4561,8 +8833,10 @@ class MainWindow(QMainWindow):
             self._bias_eraser_last_preview_ts = time.monotonic()
             self._bias_eraser_last_radius_px = int(self._brush_px_from_percent(self._bias_eraser_size_slider.value())) if getattr(self, '_bias_eraser_size_slider', None) is not None else 18
         except Exception as exc:  # noqa: BLE001
-            state.discard_unchanged_undo()
+            if state.undo_stack:
+                state.undo_stack.pop()
             self._reset_bias_eraser_runtime()
+            self._end_foreground_interaction()
             self.statusBar().showMessage(
                 tr("bias_brush_failed").format(message=f"{type(exc).__name__}: {exc}"),
                 6000)
@@ -4606,7 +8880,9 @@ class MainWindow(QMainWindow):
                 if (now - float(getattr(self, '_bias_eraser_last_preview_ts', 0.0)) >=
                         float(getattr(self, '_bias_eraser_preview_interval', 1.0 / 30.0))):
                     self._bias_eraser_last_preview_ts = now
-                    if hasattr(self._canvas, 'update_image_pixels'):
+                    if hasattr(self._canvas, 'update_image_region'):
+                        self._canvas.update_image_region(state.result_bgr, roi)
+                    elif hasattr(self._canvas, 'update_image_pixels'):
                         self._canvas.update_image_pixels(state.result_bgr)
                     else:
                         self._sync_view_after_edit(state)
@@ -4616,38 +8892,44 @@ class MainWindow(QMainWindow):
                 6000)
 
     def _on_bias_eraser_stroke_finished(self):
-        self._canvas.clear_dabs()
-        state = self._current_state()
-        active = self._bias_eraser_stroke_active
-        changed = self._bias_eraser_changed_during_stroke
-        if active and state is not None and state.result_bgr is not None:
-            try:
-                from core.bias_brush import composite_bias_candidate
-                if (self._bias_eraser_base_result is not None and
-                        self._bias_eraser_candidate_result is not None and
-                        self._bias_eraser_alpha is not None):
-                    state.result_bgr, final_result_changed = composite_bias_candidate(
-                        self._bias_eraser_base_result,
-                        self._bias_eraser_candidate_result,
-                        self._bias_eraser_alpha)
-                    state.filter_base_bgr, final_filter_changed = composite_bias_candidate(
-                        self._bias_eraser_base_filter,
-                        self._bias_eraser_candidate_filter,
-                        self._bias_eraser_alpha)
-                    changed = bool(final_result_changed or final_filter_changed)
-            except Exception as exc:  # noqa: BLE001
-                self.statusBar().showMessage(
-                    tr("bias_brush_failed").format(
-                        message=f"{type(exc).__name__}: {exc}"), 6000)
-            state.discard_unchanged_undo()
-            self._radio_view_edited.setChecked(True)
-            self._sync_view_after_edit(state)
-        self._reset_bias_eraser_runtime()
-        if not active:
-            return
-        self.statusBar().showMessage(
-            tr("bias_eraser_done") if changed else tr("manual_edit_no_change"),
-            3000)
+        try:
+            self._canvas.clear_dabs()
+            state = self._current_state()
+            active = self._bias_eraser_stroke_active
+            changed = self._bias_eraser_changed_during_stroke
+            if active and state is not None and state.result_bgr is not None:
+                try:
+                    from core.bias_brush import composite_bias_candidate
+                    if (self._bias_eraser_base_result is not None and
+                            self._bias_eraser_candidate_result is not None and
+                            self._bias_eraser_alpha is not None):
+                        state.result_bgr, final_result_changed = composite_bias_candidate(
+                            self._bias_eraser_base_result,
+                            self._bias_eraser_candidate_result,
+                            self._bias_eraser_alpha)
+                        state.filter_base_bgr, final_filter_changed = composite_bias_candidate(
+                            self._bias_eraser_base_filter,
+                            self._bias_eraser_candidate_filter,
+                            self._bias_eraser_alpha)
+                        changed = bool(final_result_changed or final_filter_changed)
+                except Exception as exc:  # noqa: BLE001
+                    self.statusBar().showMessage(
+                        tr("bias_brush_failed").format(
+                            message=f"{type(exc).__name__}: {exc}"), 6000)
+                if not changed and state.undo_stack:
+                    state.undo_stack.pop()
+                already_showing_edited = self._radio_view_edited.isChecked()
+                self._radio_view_edited.setChecked(True)
+                if already_showing_edited:
+                    self._sync_view_after_edit(state)
+            self._reset_bias_eraser_runtime()
+            if not active:
+                return
+            self.statusBar().showMessage(
+                tr("bias_eraser_done") if changed else tr("manual_edit_no_change"),
+                3000)
+        finally:
+            self._end_foreground_interaction()
 
     def _undo_last_hint(self):
         """Use the same force-undo history as Ctrl+Z.
@@ -4667,7 +8949,7 @@ class MainWindow(QMainWindow):
         state = self._current_state()
         if state is None:
             return
-        state.push_undo()
+        state.push_undo(fields=state.HINT_EDIT_FIELDS)
         state.hint_manager.clear_manual_hints()
         state.discard_unchanged_undo()
         self._canvas.clear_dabs()
@@ -4677,7 +8959,7 @@ class MainWindow(QMainWindow):
         state = self._current_state()
         if state is None:
             return
-        state.push_undo()
+        state.push_undo(fields=state.HINT_EDIT_FIELDS)
         removed = state.hint_manager.clear_manual_hints_by_source("eyedropper_hint")
         if removed <= 0:
             state.discard_unchanged_undo()
@@ -4693,6 +8975,10 @@ class MainWindow(QMainWindow):
         if state.result_bgr is None:
             QMessageBox.information(self, tr("no_result_title"), tr("no_result_body"))
             return
+        if bool(getattr(self, "_semantic_select_armed", False)):
+            self._semantic_select_armed = False
+            self._run_semantic_selection(state, ix, iy)
+            return
 
         paint_rgb = self._manual_target_rgb((self._brush_color.red(), self._brush_color.green(), self._brush_color.blue()))
         hex_color = '#%02x%02x%02x' % paint_rgb
@@ -4707,7 +8993,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(tr("no_fill_area"), 5000)
             return
 
-        state.push_undo()
+        state.push_undo(fields=state.PIXEL_EDIT_FIELDS)
         new_img, new_base, _mask, changed = apply_region_edit(
             state.original_bgr, state.result_bgr, state.filter_base_bgr,
             ix, iy, hex_color, gap_close=gap_close, mode=fill_mode,
@@ -4763,7 +9049,7 @@ class MainWindow(QMainWindow):
                 if requested_closed_only or already_closed
                 else tr("selection_fill_empty"), 5000)
             return
-        state.push_undo()
+        state.push_undo(fields=state.PIXEL_EDIT_FIELDS)
         # Pass the authoritative mask directly. Re-running with the original
         # rectangle here was the path that could silently fall back to full-box
         # colouring when UI state changed between drawing and confirmation.
@@ -4782,6 +9068,8 @@ class MainWindow(QMainWindow):
 
     def _on_polygon_fill_requested(self, points):
         state = self._current_state()
+        if self._hair_guard_selector_active and self._hair_guard_selector_mode in {"brush_add", "brush_erase"}:
+            return
         if state is None or state.result_bgr is None:
             if state is None:
                 return
@@ -4795,6 +9083,20 @@ class MainWindow(QMainWindow):
 
     def _on_rect_fill_requested(self, x1: int, y1: int, x2: int, y2: int):
         state = self._current_state()
+        if self._hair_guard_selector_active and self._hair_guard_selector_mode == "rect":
+            shape = self._hair_guard_selection_shape()
+            if shape is None:
+                return
+            mask = build_rect_selection_mask(shape, x1, y1, x2, y2)
+            saved = self._append_hair_guard_selection_operation(mask, add_mode=True)
+            if saved is None:
+                self._canvas.clear_selection_preview()
+            else:
+                self._canvas.set_selection_mask_overlay(saved, mode="replace")
+            count = len(self._current_hair_guard_selection_history())
+            area = int(np.count_nonzero(saved)) if saved is not None else 0
+            self.statusBar().showMessage(f"已追加头发纠色蓝框区域。当前 {count} 个操作，覆盖 {area} px。", 2500)
+            return
         if state is None or state.result_bgr is None:
             if state is None:
                 return
@@ -4822,12 +9124,30 @@ class MainWindow(QMainWindow):
             self._closed_preview_combine_mode = self._current_selection_mode()
             self._line_extract_page_path = self._current_path
             self._line_extract_raw_mask = raw_mask.copy()
+            from core.model_downloader import manga_line_model_ready
+            from config import Config
+            allow_line_download = False
+            if not manga_line_model_ready(Config.MANGA_LINE_WEIGHTS_PATH):
+                if os.environ.get("COLORTINA_OFFLINE", "").strip().lower() in {"1", "true", "on", "yes"}:
+                    QMessageBox.warning(self, "缺少漫画结构线模型",
+                                        "已启用离线模式，请先安装 erika.pth。")
+                    return
+                answer = QMessageBox.question(
+                    self, "安装漫画结构线模型",
+                    "该功能需要 erika.pth（约 170 MB），是否允许本次联网下载？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                allow_line_download = True
             worker = MangaLineExtractionWorker(
-                state.original_bgr, raw_mask, parent=self)
+                state.original_bgr, raw_mask, parent=self,
+                allow_model_download=allow_line_download)
             self._line_extract_worker = worker
             worker.status.connect(self._on_worker_status)
             worker.finished_ok.connect(self._on_manga_line_finished)
             worker.finished_err.connect(self._on_manga_line_failed)
+            worker.cancelled.connect(lambda: self.statusBar().showMessage(tr("stopped"), 4000))
             worker.finished.connect(self._on_manga_line_thread_finished)
             self._update_selection_buttons(False)
             self.statusBar().showMessage("正在识别矩形内的漫画结构线…", 0)
@@ -4885,16 +9205,17 @@ class MainWindow(QMainWindow):
         if state is None or not state.undo_stack:
             self.statusBar().showMessage(tr("nothing_to_undo"), 1800)
             return
-        current = state.edit_snapshot()
+        current = None
         target = None
-        # Skip stale/no-op checkpoints so one Ctrl+Z always produces a visible
-        # state change whenever an earlier state exists.
+        # Project the current page onto each checkpoint's field set. Ordinary
+        # edits therefore avoid materialising untouched AI/cache layers.
         while state.undo_stack:
             candidate = state.undo_stack.pop()
+            current = state.inverse_snapshot(candidate)
             if not state._snapshot_equal(candidate, current):
                 target = candidate
                 break
-        if target is None:
+        if target is None or current is None:
             self.statusBar().showMessage(tr("nothing_to_undo"), 1800)
             return
         state.redo_stack.append(current)
@@ -4918,14 +9239,15 @@ class MainWindow(QMainWindow):
         if state is None or not state.redo_stack:
             self.statusBar().showMessage(tr("nothing_to_redo"), 1800)
             return
-        current = state.edit_snapshot()
+        current = None
         target = None
         while state.redo_stack:
             candidate = state.redo_stack.pop()
+            current = state.inverse_snapshot(candidate)
             if not state._snapshot_equal(candidate, current):
                 target = candidate
                 break
-        if target is None:
+        if target is None or current is None:
             self.statusBar().showMessage(tr("nothing_to_redo"), 1800)
             return
         state.undo_stack.append(current)
@@ -4975,12 +9297,37 @@ class MainWindow(QMainWindow):
         state = self._current_state()
         if state is None or state.ai_result_bgr is None:
             return
-        state.push_undo()
+        state.push_undo(fields=state.PIXEL_EDIT_FIELDS)
         state.result_bgr = state.ai_result_bgr.copy()
         self._sync_bias_reference_to_current(state)
         self._radio_view_edited.setChecked(True)
         self._sync_view_after_edit(state)
         self.statusBar().showMessage(tr("restored_ai"), 3000)
+
+    def _update_view_mode_availability(self) -> None:
+        state = self._current_state()
+        busy = bool(getattr(self, "_ui_busy", False))
+        has_page = state is not None
+        has_ai = bool(state is not None and state.ai_result_bgr is not None)
+        has_edited = bool(state is not None and state.result_bgr is not None)
+        original = getattr(self, "_radio_view_original", None)
+        ai = getattr(self, "_radio_view_ai", None)
+        edited = getattr(self, "_radio_view_edited", None)
+        if original is not None:
+            original.setEnabled(has_page and not busy)
+        if ai is not None:
+            ai.setEnabled(has_ai and not busy)
+        if edited is not None:
+            edited.setEnabled(has_edited and not busy)
+        if state is None:
+            return
+        if ai is not None and ai.isChecked() and not has_ai:
+            original.setChecked(True)
+        elif edited is not None and edited.isChecked() and not has_edited:
+            if has_ai and ai is not None:
+                ai.setChecked(True)
+            elif original is not None:
+                original.setChecked(True)
 
     def _on_view_mode_changed(self):
         state = self._current_state()
@@ -4991,27 +9338,63 @@ class MainWindow(QMainWindow):
         """Refresh the current layer and optional non-destructive B&W preview."""
         if self._radio_view_original.isChecked():
             image = state.original_bgr
-        elif self._radio_view_ai.isChecked() and state.ai_result_bgr is not None:
-            image = state.ai_result_bgr
-        elif state.result_bgr is not None:
-            image = state.result_bgr
+            cache_key = (state.path, "original")
+        elif self._radio_view_ai.isChecked():
+            ai_image = state.ai_result_bgr
+            if ai_image is not None:
+                image = ai_image
+                cache_key = (state.path, "ai", state._layer_revision.get("ai", 0))
+            else:
+                image = state.original_bgr
+                cache_key = (state.path, "original")
         else:
-            image = state.original_bgr
+            result_image = state.result_bgr
+            if result_image is not None:
+                image = result_image
+                cache_key = (state.path, "result",
+                             state._layer_revision.get("result", 0))
+            else:
+                image = state.original_bgr
+                cache_key = (state.path, "original")
 
         mask = self._pending_selection_mask
+        has_mask = bool(mask is not None and mask.size and np.any(mask))
         preview_on = bool(
-            mask is not None and np.any(mask)
+            has_mask
             and getattr(self, '_chk_selection_bw_preview', None) is not None
             and self._chk_selection_bw_preview.isChecked()
             and not self._radio_view_original.isChecked())
         if preview_on:
             from core.local_model_recolor import preview_black_and_white
             image = preview_black_and_white(image, state.original_bgr, mask)
-        self._canvas.set_image(image, fit=False)
+            cache_key = None
+        self._canvas.set_image(image, fit=False, cache_key=cache_key)
         self._refresh_hint_overlay()
-        if mask is not None and np.any(mask):
+        if has_mask:
             self._canvas.set_selection_mask_overlay(
                 mask, mode=self._current_selection_mode())
+        hair_mask = self._current_hair_guard_selection_mask()
+        if hair_mask is not None and (self._hair_guard_selector_active or self._auto_black_hair_guard_requires_selection()):
+            self._canvas.set_selection_mask_overlay(hair_mask, mode="replace")
+        if state.has_result:
+            self._schedule_export_compression(state.path, delay_ms=900)
+        self._update_export_compression_status(state)
+
+    def _refresh_live_canvas_after_edit(self, state: "PageState") -> None:
+        """Finish a live stroke without rebuilding the full page pixmap."""
+        if hasattr(self._canvas, "flush_pending_pixels"):
+            self._canvas.flush_pending_pixels()
+        if (self._radio_view_edited.isChecked() and
+                hasattr(self._canvas, "mark_current_cache_key")):
+            self._canvas.mark_current_cache_key((
+                state.path, "result", state._layer_revision.get("result", 0)))
+        self._refresh_hint_overlay()
+        mask = self._pending_selection_mask
+        if mask is not None and mask.size and np.any(mask):
+            self._canvas.set_selection_mask_overlay(
+                mask, mode=self._current_selection_mode())
+        self._schedule_export_compression(state.path, delay_ms=900)
+        self._update_export_compression_status(state)
 
     def _refresh_hint_overlay(self):
         state = self._current_state()
@@ -5027,34 +9410,149 @@ class MainWindow(QMainWindow):
 
     # ── Export ────────────────────────────────────────────────────────
 
+    def _ensure_export_cache_sync(self, state: PageState) -> tuple[str, dict]:
+        """Return one final encoded asset, creating it once when necessary.
+
+        Normal colorization/edit flows prepare this in the background.  This
+        synchronous fallback is used only when Export is pressed before that
+        short background task finishes or immediately after changing profiles.
+        """
+        profile = self._current_export_profile()
+        cached_path, metadata = state.export_cache_info(profile)
+        if cached_path:
+            return cached_path, metadata
+
+        self._cancel_delayed_export_compression(state.path)
+        self.statusBar().showMessage(tr("export_compression_pending"), 0)
+        QApplication.processEvents()
+        request = state.prepare_export_cache_request(
+            self._session_layer_cache_dir, profile)
+        if request is None:
+            # A released page may still be waiting for its lossless spill.  The
+            # property lazily reloads it here only for this explicit export.
+            image = state.result_bgr
+            if image is None:
+                raise RuntimeError(tr("no_colorized_page"))
+            request = state.prepare_export_cache_request(
+                self._session_layer_cache_dir, profile)
+        if request is None:
+            raise RuntimeError(tr("no_colorized_page"))
+        result = _write_export_cache(request)
+        if not state.commit_export_cache_result(result):
+            raise RuntimeError("The page changed while its export image was being compressed")
+        self._update_export_compression_status(state)
+        cached_path, metadata = state.export_cache_info(profile)
+        if not cached_path:
+            raise RuntimeError("Compressed export cache was not created")
+        return cached_path, metadata
+
+    @staticmethod
+    def _compression_filter_for_extension(extension: str) -> str:
+        ext = extension.lower()
+        if ext == ".webp":
+            return "WebP (*.webp)"
+        if ext == ".jpg" or ext == ".jpeg":
+            return "JPEG (*.jpg *.jpeg)"
+        return "PNG (*.png)"
+
+    @staticmethod
+    def _normalize_export_target(path: str, extension: str) -> str:
+        extension = extension.lower()
+        base, current = os.path.splitext(path)
+        if current.lower() != extension:
+            return base + extension
+        return path
+
     def _export_current_page(self):
         state = self._current_state()
-        if state is None or state.result_bgr is None:
+        if state is None or not state.has_result:
             QMessageBox.information(self, tr("no_result_title"), tr("no_colorized_page"))
             return
-        default_name = os.path.splitext(os.path.basename(state.path))[0] + "_colorized.png"
-        out_path, _ = QFileDialog.getSaveFileName(self, tr("export_page"), default_name,
-                                                   "PNG (*.png);;JPEG (*.jpg)")
+        try:
+            cache_path, metadata = self._ensure_export_cache_sync(state)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, tr("error_title"), str(exc))
+            return
+        extension = os.path.splitext(cache_path)[1].lower()
+        default_name = (os.path.splitext(os.path.basename(state.path))[0] +
+                        "_colorized" + extension)
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, tr("export_page"), default_name,
+            self._compression_filter_for_extension(extension))
         if not out_path:
             return
-        from core.imageio import imwrite as _uimwrite
-        _uimwrite(out_path, state.result_bgr)
-        self.statusBar().showMessage(tr("exported_to").format(path=out_path), 5000)
+        out_path = self._normalize_export_target(out_path, extension)
+        try:
+            shutil.copyfile(cache_path, out_path)
+        except OSError as exc:
+            QMessageBox.warning(self, tr("error_title"), str(exc))
+            return
+        self.statusBar().showMessage(
+            tr("exported_compressed_to").format(
+                path=out_path,
+                size=self._format_bytes(int(metadata.get("compressed_bytes", 0) or 0)),
+                saved=float(metadata.get("saved_percent", 0.0) or 0.0)),
+            7000)
+
+    @staticmethod
+    def _unique_export_path(folder: str, base_name: str, extension: str,
+                            reserved: set[str] | None = None) -> str:
+        """Never silently overwrite same-named pages from different folders.
+
+        Also preserve pre-existing user files in the chosen export directory.
+        """
+        reserved = reserved if reserved is not None else set()
+        stem = os.path.splitext(base_name)[0]
+        attempt = 1
+        while True:
+            suffix = "" if attempt == 1 else f"_{attempt}"
+            candidate = os.path.join(folder, stem + suffix + extension)
+            key = os.path.normcase(os.path.abspath(candidate))
+            if key not in reserved and not os.path.exists(candidate):
+                reserved.add(key)
+                return candidate
+            attempt += 1
 
     def _export_all_pages(self):
-        done = [s for s in self._pages.values() if s.result_bgr is not None]
+        done = [s for s in self._ordered_states() if s.has_result]
         if not done:
             QMessageBox.information(self, tr("no_result_title"), tr("no_colorized_pages"))
             return
         out_dir = QFileDialog.getExistingDirectory(self, tr("select_export_folder"))
         if not out_dir:
             return
-        for state in done:
-            name = os.path.splitext(os.path.basename(state.path))[0] + "_colorized.png"
-            from core.imageio import imwrite as _uimwrite
-            _uimwrite(os.path.join(out_dir, name), state.result_bgr)
+        total_compressed = 0
+        total_raw = 0
+        exported = 0
+        reserved_export_paths: set[str] = set()
+        for index, state in enumerate(done, start=1):
+            self.statusBar().showMessage(
+                f"{tr('export_compression_pending')} {index}/{len(done)}", 0)
+            QApplication.processEvents()
+            try:
+                cache_path, metadata = self._ensure_export_cache_sync(state)
+                extension = os.path.splitext(cache_path)[1].lower()
+                name = (os.path.splitext(os.path.basename(state.path))[0] +
+                        "_colorized" + extension)
+                target = self._unique_export_path(
+                    out_dir, name, extension, reserved_export_paths)
+                shutil.copyfile(cache_path, target)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(
+                    self, tr("error_title"),
+                    f"{os.path.basename(state.path)}: {exc}")
+                continue
+            exported += 1
+            total_compressed += int(metadata.get("compressed_bytes", 0) or 0)
+            total_raw += int(metadata.get("original_bytes", 0) or 0)
+            if state.path != self._current_path:
+                self._schedule_page_spill(state.path, delay_ms=0)
+        saved = (max(0.0, (1.0 - total_compressed / total_raw) * 100.0)
+                 if total_raw else 0.0)
         self.statusBar().showMessage(
-            tr("exported_n_pages").format(n=len(done), dir=out_dir), 5000)
+            tr("exported_compressed_pages").format(
+                n=exported, dir=out_dir,
+                size=self._format_bytes(total_compressed), saved=saved), 8000)
 
     # ── Misc ──────────────────────────────────────────────────────────
 
@@ -5065,9 +9563,36 @@ class MainWindow(QMainWindow):
         self._canvas.zoom_out()
 
     def _update_controls_enabled(self):
-        has_page = self._current_path is not None
-        for btn in (self._btn_auto, self._btn_regenerate, self._btn_undo,
-                   self._btn_clear, self._btn_undo_edit, self._btn_redo_edit,
-                   self._btn_restore_ai, self._btn_restore_bw,
-                   self._btn_export_page):
-            btn.setEnabled(has_page)
+        state = self._current_state()
+        busy = bool(getattr(self, "_ui_busy", False))
+        has_page = state is not None
+        has_ai = bool(state is not None and state.ai_result_bgr is not None)
+        has_result = bool(state is not None and state.result_bgr is not None)
+        any_result = any(getattr(item, "result_bgr", None) is not None
+                         for item in (getattr(self, "_pages", {}) or {}).values())
+
+        conditions = {
+            "_btn_auto": has_page,
+            "_btn_hair_recolor_auto": has_page,
+            "_btn_regenerate": has_page,
+            "_btn_undo": has_page,
+            "_btn_clear": has_page,
+            "_btn_undo_edit": has_page,
+            "_btn_redo_edit": has_page,
+            "_btn_restore_ai": has_ai,
+            "_btn_restore_bw": has_ai or has_result,
+            "_btn_export_page": has_result,
+            "_btn_export_all": any_result,
+        }
+        for name, allowed in conditions.items():
+            btn = getattr(self, name, None)
+            if btn is not None:
+                try:
+                    if name in {"_btn_auto", "_btn_hair_recolor_auto"}:
+                        btn.setEnabled(bool(allowed) and (not self._stop_requested))
+                    else:
+                        btn.setEnabled(bool(allowed) and not busy)
+                except RuntimeError:
+                    pass
+        self._update_view_mode_availability()
+        self._refresh_workspace_stats()

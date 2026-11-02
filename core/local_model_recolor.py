@@ -42,6 +42,42 @@ def normalize_selection_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.nda
     return np.where(work > 0, 255, 0).astype(np.uint8)
 
 
+
+
+def _hair_object_limit_from_selection(mask: np.ndarray) -> np.ndarray:
+    """Turn an editable hair fragment into a loose instance boundary.
+
+    The user selection remains negative guidance, but complete-object recovery
+    needs room to cross highlight cuts, the face/hand occluder and lettering. A
+    convex envelope plus a bounded margin provides that room without reopening
+    the entire manga page to same-colour panels and neighbouring characters.
+    """
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not np.any(binary):
+        return binary
+    h, w = binary.shape
+    yy, xx = np.where(binary > 0)
+    points = np.column_stack([xx, yy]).astype(np.int32)
+    limit = np.zeros_like(binary)
+    if len(points) >= 3:
+        hull = cv2.convexHull(points)
+        cv2.fillConvexPoly(limit, hull, 1)
+    else:
+        limit = binary.copy()
+    margin = max(36, min(180, int(round(max(h, w) * 0.090))))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (margin * 2 + 1, margin * 2 + 1))
+    limit = cv2.dilate(limit, kernel, iterations=1)
+    return np.where(limit > 0, 255, 0).astype(np.uint8)
+
+
+def _selection_seed(mask: np.ndarray) -> tuple[int, int]:
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    iy, ix = np.unravel_index(int(np.argmax(distance)), distance.shape)
+    return int(ix), int(iy)
+
+
 def inward_feather_alpha(mask: np.ndarray, radius: int = 4) -> np.ndarray:
     """Build alpha that is zero outside and feathers only *inside* selection."""
     binary = np.where(mask > 0, 1, 0).astype(np.uint8)
@@ -85,6 +121,39 @@ def preview_black_and_white(current_bgr: np.ndarray, original_bgr: np.ndarray,
     active = mask > 0
     out[active] = original_bgr[active]
     return out
+
+
+
+def restore_selection_to_original(original_bgr: np.ndarray,
+                                  result_bgr: np.ndarray,
+                                  filter_base_bgr: np.ndarray | None,
+                                  selection_mask: np.ndarray):
+    """Commit a local B/W restore on visible and filter-base layers.
+
+    ``ai_result_bgr`` is intentionally not touched: undo and 'restore AI'
+    must still be available. Pixels outside the selected mask are byte exact.
+    """
+    if original_bgr is None or result_bgr is None:
+        raise ValueError("original and current colour layers are required")
+    shape = result_bgr.shape[:2]
+    mask = normalize_selection_mask(selection_mask, shape)
+    if not np.any(mask):
+        base = filter_base_bgr if (filter_base_bgr is not None and
+                                   filter_base_bgr.shape == result_bgr.shape) else result_bgr
+        return result_bgr.copy(), base.copy(), 0
+    original = _ensure_3ch_uint8(original_bgr)
+    if original.shape[:2] != shape:
+        original = cv2.resize(original, (shape[1], shape[0]),
+                              interpolation=cv2.INTER_AREA)
+    base = filter_base_bgr if (filter_base_bgr is not None and
+                               filter_base_bgr.shape == result_bgr.shape) else result_bgr
+    edited = result_bgr.copy()
+    base_edited = base.copy()
+    selected = mask > 0
+    edited[selected] = original[selected]
+    base_edited[selected] = original[selected]
+    changed = int(np.count_nonzero(np.any(result_bgr != edited, axis=2)))
+    return edited, base_edited, changed
 
 
 def _ensure_3ch_uint8(image: np.ndarray) -> np.ndarray:
@@ -365,6 +434,8 @@ def recolor_selection_with_model(
         focus_outside_mode: str = "fade_white",
         focus_context_expand_px: int = 32,
         focus_fade_expand_px: int = 96,
+        region_control: dict | None = None,
+        protect_text_overlay: bool = True,
         colorize_fn: Callable | None = None,
         colorize_kwargs: dict | None = None) -> LocalModelRecolorResult:
     """Run mc-v2 on a selection-focused full page and composite only the selection."""
@@ -380,14 +451,50 @@ def recolor_selection_with_model(
     # inference. Generated output is resized only at the final compositing step
     # when a legacy/upscaled current layer has a different shape.
     original = _ensure_3ch_uint8(original_bgr)
+    from core.mcv2_region_control import (
+        RegionControlSettings, control_payload, enforce_region_color,
+        expand_black_hair_control_mask, expand_black_hair_merge_mask,
+        is_black_like_rgb,
+    )
+    control_cfg = RegionControlSettings.from_any(region_control)
+    control_mask = normalize_selection_mask(mask, original.shape[:2])
+    current_for_control = np.asarray(current_result_bgr)
+    if current_for_control.shape[:2] != original.shape[:2]:
+        current_for_control = cv2.resize(
+            current_for_control, (original.shape[1], original.shape[0]),
+            interpolation=cv2.INTER_AREA)
+    control_mask_diagnostics = {"enabled": False, "added_pixels": 0}
+    hair_object_diagnostics = {"enabled": False, "added_pixels": 0}
+    black_control = bool(
+        control_cfg.enabled and is_black_like_rgb(control_cfg.target_rgb))
+    if (black_control and control_cfg.complete_hair_object
+            and not control_cfg.hair_object_mask_prebuilt):
+        from core.mcv2_semantic_selection import build_complete_hair_object_mask
+        seed = _selection_seed(control_mask)
+        rough_limit = _hair_object_limit_from_selection(control_mask)
+        complete_mask, hair_object_diagnostics = build_complete_hair_object_mask(
+            original, current_for_control, control_mask, seed,
+            limit_mask=rough_limit, use_line_regions=True,
+            max_ratio=float(control_cfg.hair_object_max_ratio))
+        if complete_mask is not None and np.any(complete_mask):
+            control_mask = normalize_selection_mask(
+                complete_mask, original.shape[:2])
+    if black_control and bool(control_cfg.expand_control_mask):
+        control_mask, control_mask_diagnostics = expand_black_hair_control_mask(
+            current_for_control, original, control_mask, control_cfg)
+    elif black_control:
+        control_mask_diagnostics = {"enabled": False, "added_pixels": 0,
+                                    "disabled_by_default": True}
+
     focus_input = build_focus_inference_image(
-        original, mask,
+        original, control_mask,
         context_expand_px=focus_context_expand_px,
         fade_expand_px=focus_fade_expand_px,
         outside_mode=focus_outside_mode)
+    runtime_control = control_payload(control_cfg, control_mask)
 
     local_hints = filtered_hint_manager(
-        hint_manager, mask, margin_px=hint_margin_px,
+        hint_manager, control_mask, margin_px=hint_margin_px,
         only_selection_hints=only_selection_hints,
         classic_point_hints=classic_point_hints)
     local_hints.bind_source_image(original, gap_close=max(0, int(gap_close)))
@@ -397,6 +504,7 @@ def recolor_selection_with_model(
         from pipeline import colorize_page
         colorize_fn = colorize_page
     kwargs = dict(colorize_kwargs or {})
+    kwargs.setdefault("protect_text", bool(protect_text_overlay))
     # Keep local-selection fixes isolated from the ordinary whole-page pipeline.
     # Custom colour bias remains a first-class feature, but for local recolor we
     # apply it in this module *after* the manual-hint lock so the yellow-fix
@@ -413,6 +521,7 @@ def recolor_selection_with_model(
         "learn_identity": False,
         "return_filter_base": True,
         "hint_render_mode": ("legacy" if classic_point_hints else "mixed"),
+        "region_control": runtime_control,
     })
     payload = colorize_fn(focus_input, **kwargs)
     if isinstance(payload, tuple) and len(payload) == 2:
@@ -428,9 +537,9 @@ def recolor_selection_with_model(
     manual_lock_pixels = 0
     if not classic_point_hints and local_hints.manual_hints:
         generated_full, manual_lock_pixels = apply_manual_hint_color_lock(
-            generated_full, original, mask, local_hints, strength=1.0)
+            generated_full, original, control_mask, local_hints, strength=1.0)
         generated_filter_base, _ = apply_manual_hint_color_lock(
-            generated_filter_base, original, mask, local_hints, strength=1.0)
+            generated_filter_base, original, control_mask, local_hints, strength=1.0)
 
     custom_bias_pixels = 0
     if custom_bias_cfg and bool(custom_bias_cfg.get("enabled")):
@@ -457,17 +566,74 @@ def recolor_selection_with_model(
             np.any(generated_full != generated_full_before_local_post, axis=2)
         ))
 
+    merge_mask = normalize_selection_mask(control_mask, shape)
+    merge_mask_diagnostics = {"enabled": False, "added_pixels": 0}
+    if (runtime_control is not None and is_black_like_rgb(control_cfg.target_rgb)
+            and bool(control_cfg.expand_merge_mask)):
+        generated_for_merge = np.asarray(generated_full)
+        if generated_for_merge.shape[:2] != shape:
+            generated_for_merge = cv2.resize(
+                generated_for_merge, (shape[1], shape[0]),
+                interpolation=cv2.INTER_AREA)
+        merge_mask, merge_mask_diagnostics = expand_black_hair_merge_mask(
+            current_result_bgr, generated_for_merge, merge_mask, control_cfg)
+    elif runtime_control is not None and is_black_like_rgb(control_cfg.target_rgb):
+        merge_mask_diagnostics = {"enabled": False, "added_pixels": 0,
+                                  "disabled_by_default": True}
+
+    post_control_mask = normalize_selection_mask(
+        merge_mask, np.asarray(generated_full).shape[:2])
+    region_lock_diagnostics = {"pixels": 0, "mean_delta": 0.0}
+    if runtime_control is not None:
+        generated_full, region_lock_diagnostics = enforce_region_color(
+            generated_full, original, post_control_mask, control_cfg)
+        generated_filter_base, _ = enforce_region_color(
+            generated_filter_base, original, post_control_mask, control_cfg)
+
     ai_base = (current_ai_result_bgr if current_ai_result_bgr is not None
                else current_result_bgr)
     filter_base = (current_filter_base_bgr if current_filter_base_bgr is not None
                    else current_result_bgr)
+    # A strong explicit region command must reach the complete selection
+    # boundary.  Reusing the ordinary inward blend here reintroduces a rim of
+    # the old mc-v2 colour (typically orange around commanded black hair).
+    # The semantic selector already aligns/refines the boundary, so command
+    # mode uses a hard local composite while ordinary AI recolour retains the
+    # user's feather setting.
+    strong_black_command = bool(
+        runtime_control is not None and is_black_like_rgb(control_cfg.target_rgb))
+    merge_feather = (0 if strong_black_command or
+                     (runtime_control is not None and
+                      control_cfg.final_color_lock >= 0.75) else int(feather))
     merged_result = merge_inside_selection(
-        current_result_bgr, generated_full, mask, feather)
-    merged_ai = merge_inside_selection(ai_base, generated_full, mask, feather)
+        current_result_bgr, generated_full, merge_mask, merge_feather)
+    merged_ai = merge_inside_selection(
+        ai_base, generated_full, merge_mask, merge_feather)
     merged_filter = merge_inside_selection(
-        filter_base, generated_filter_base, mask, feather)
+        filter_base, generated_filter_base, merge_mask, merge_feather)
+
+    # Region colour enforcement deliberately runs after style/watercolour and
+    # image-filter processing.  Restore lettering once more *after* that lock so
+    # logical hair beneath text does not turn glyphs or caption paper into the
+    # commanded colour.  Outside-selection pixels are restored byte-for-byte.
+    text_overlay_pixels = 0
+    if protect_text_overlay:
+        from core.text_guard import protect_text_regions
+        before_text = merged_result.copy()
+        merged_result = protect_text_regions(
+            merged_result, original, use_fallback=True, vicinity_mask=merge_mask)
+        merged_ai = protect_text_regions(
+            merged_ai, original, use_fallback=True, vicinity_mask=merge_mask)
+        merged_filter = protect_text_regions(
+            merged_filter, original, use_fallback=True, vicinity_mask=merge_mask)
+        merged_result[merge_mask == 0] = current_result_bgr[merge_mask == 0]
+        merged_ai[merge_mask == 0] = ai_base[merge_mask == 0]
+        merged_filter[merge_mask == 0] = filter_base[merge_mask == 0]
+        text_overlay_pixels = int(np.count_nonzero(
+            np.any(merged_result != before_text, axis=2) & (merge_mask > 0)))
+
     changed_pixels = int(np.count_nonzero(
-        np.any(merged_result != current_result_bgr, axis=2) & (mask > 0)))
+        np.any(merged_result != current_result_bgr, axis=2) & (merge_mask > 0)))
 
     diagnostics = dict(getattr(local_hints, "last_diagnostics", {}) or {})
     diagnostics.update({
@@ -479,6 +645,7 @@ def recolor_selection_with_model(
         "local_only_selection_hints": bool(only_selection_hints),
         "local_classic_point_hints": bool(classic_point_hints),
         "local_feather_px": int(feather),
+        "local_effective_merge_feather_px": int(merge_feather),
         "local_changed_pixels": int(changed_pixels),
         "local_manual_color_lock_pixels": int(manual_lock_pixels),
         "local_manual_color_lock_enabled": bool(
@@ -488,6 +655,41 @@ def recolor_selection_with_model(
         "local_focus_outside_mode": str(focus_outside_mode or "none"),
         "local_focus_context_expand_px": int(focus_context_expand_px),
         "local_focus_fade_expand_px": int(focus_fade_expand_px),
+        "local_region_control_enabled": bool(runtime_control is not None),
+        "local_region_control_target_rgb": tuple(control_cfg.target_rgb),
+        "local_region_control_hint_opacity": float(control_cfg.hint_opacity),
+        "local_region_control_feature_gain": float(control_cfg.feature_gain),
+        "local_region_control_deep_strength": float(control_cfg.deep_strength),
+        "local_region_control_middle_strength": float(control_cfg.middle_strength),
+        "local_region_control_shallow_strength": float(control_cfg.shallow_strength),
+        "local_region_control_final_lock": float(control_cfg.final_color_lock),
+        "local_region_control_lock_pixels": int(region_lock_diagnostics.get("pixels", 0)),
+        "local_region_control_adapter": bool(control_cfg.use_adapter),
+        "local_region_control_source_bias_strength": float(control_cfg.source_bias_strength),
+        "local_region_control_generator_hint_rgb": tuple(
+            control_cfg.generator_hint_rgb or control_cfg.target_rgb),
+        "local_region_control_neutralize_chroma": float(control_cfg.neutralize_chroma),
+        "local_region_control_warm_suppression": float(control_cfg.warm_suppression),
+        "local_complete_hair_object_enabled": bool(
+            black_control and control_cfg.complete_hair_object),
+        "local_complete_hair_object_prebuilt": bool(
+            control_cfg.hair_object_mask_prebuilt),
+        "local_complete_hair_object_pixels": int(np.count_nonzero(control_mask)),
+        "local_complete_hair_object_added_pixels": int(
+            hair_object_diagnostics.get("added_pixels", 0)),
+        "local_complete_hair_object_removed_pixels": int(
+            hair_object_diagnostics.get("removed_visible_pixels", 0)),
+        "local_complete_hair_object_diagnostics": dict(hair_object_diagnostics),
+        "local_region_control_pre_model_added_pixels": int(
+            control_mask_diagnostics.get("added_pixels", 0)),
+        "local_region_control_merge_added_pixels": int(
+            merge_mask_diagnostics.get("added_pixels", 0)),
+        "local_region_control_expand_control_mask": bool(control_cfg.expand_control_mask),
+        "local_region_control_expand_merge_mask": bool(control_cfg.expand_merge_mask),
+        "local_region_control_effective_pixels": int(np.count_nonzero(merge_mask)),
+        "local_text_overlay_protected": bool(protect_text_overlay),
+        "local_text_overlay_pixels": int(text_overlay_pixels),
+        "local_post_style_region_protection": bool(runtime_control is not None),
     })
     return LocalModelRecolorResult(
         result_bgr=merged_result,

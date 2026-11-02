@@ -20,7 +20,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from core.masks import combined_neutral_mask
+from core.masks import combined_neutral_mask, lineart_mask, bubble_mask, gutter_mask, screentone_mask
 from core.presets import StylePreset
 
 
@@ -30,6 +30,194 @@ def _to_gray(img: np.ndarray) -> np.ndarray:
     return img
 
 
+
+
+def _panel_masks_from_gray(source_gray: np.ndarray) -> list[np.ndarray]:
+    """Return coarse per-panel boolean masks for page-local environment balance."""
+    try:
+        from core.panel_detector import detect_panels
+        panels = detect_panels(source_gray, style="manga", min_area_ratio=0.03)
+    except Exception:
+        panels = []
+    h, w = source_gray.shape[:2]
+    if not panels:
+        mask = np.ones((h, w), np.uint8)
+        return [mask.astype(bool)]
+    out = []
+    for p in panels:
+        x1 = max(0, int(getattr(p, 'x', 0)))
+        y1 = max(0, int(getattr(p, 'y', 0)))
+        x2 = min(w, x1 + int(getattr(p, 'width', w)))
+        y2 = min(h, y1 + int(getattr(p, 'height', h)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        mask = np.zeros((h, w), np.uint8)
+        mask[y1:y2, x1:x2] = 1
+        out.append(mask.astype(bool))
+    return out or [np.ones((h, w), np.uint8).astype(bool)]
+
+
+def _apply_inkwash_balance(a: np.ndarray, b: np.ndarray, source_gray: np.ndarray,
+                           style: StylePreset,
+                           role_masks: dict[str, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Suppress background hue drift and patchiness for pale ink-wash presets.
+
+    The goal is to keep character colours readable while preventing large
+    screentone / low-information background regions from drifting into murky
+    green-cyan casts or splitting into unrelated hue patches.
+    """
+    guard = float(getattr(style, 'background_neutral_guard', 0.0) or 0.0)
+    tone_keep = float(getattr(style, 'preserve_screentones', 0.0) or 0.0)
+    hue_stabilize = float(getattr(style, 'hue_stabilize', 0.0) or 0.0)
+    chroma_cap = float(getattr(style, 'background_chroma_cap', 0.0) or 0.0)
+    if guard <= 1e-4 and tone_keep <= 1e-4 and hue_stabilize <= 1e-4:
+        return a, b
+
+    g = source_gray.astype(np.uint8)
+    h, w = g.shape[:2]
+    line = lineart_mask(g, low=max(40, int(getattr(style, 'black_threshold', 24)) - 2), dilate=1)
+    bubble = bubble_mask(g, white_thr=min(245, int(getattr(style, 'white_threshold', 221)) + 6))
+    gutter = gutter_mask(g, white_thr=242)
+    screen = screentone_mask(g, tile=max(24, min(h, w) // 28 or 24))
+
+    neutral_block = line | bubble | gutter
+    person = np.zeros((h, w), np.float32)
+    if role_masks is not None:
+        person = np.clip(role_masks.get('person', np.zeros((h, w), np.float32)).astype(np.float32), 0.0, 1.0)
+    env_like = (~neutral_block) & (g > max(12, int(getattr(style, 'black_threshold', 24)) + 2)) & (g < min(245, int(getattr(style, 'white_threshold', 221)) - 2))
+    # Unknown / background pixels.  Strongest protection applies to screentone-heavy
+    # areas and pixels outside the detected person coverage.
+    bg_weight = np.clip((1.0 - person) * 0.85 + screen.astype(np.float32) * 0.55, 0.0, 1.0)
+    bg_mask = env_like & (bg_weight > 0.12)
+    if not np.any(bg_mask):
+        return a, b
+
+    # Preserve grayscale screentone structure: reduce the freedom to inject a new
+    # hue into regular halftone texture while leaving character regions alone.
+    if tone_keep > 1e-4 and np.any(screen):
+        screen_alpha = np.clip(tone_keep * 0.42, 0.0, 0.55) * screen.astype(np.float32) * np.clip(1.0 - person, 0.0, 1.0)
+        a *= (1.0 - screen_alpha)
+        b *= (1.0 - screen_alpha)
+
+    # Work panel-by-panel so one strongly coloured panel background does not tint
+    # another panel's low-information shadows.
+    panel_masks = _panel_masks_from_gray(g) if bool(getattr(style, 'panel_aware_environment', False)) else [np.ones((h, w), bool)]
+
+    chroma = np.sqrt(a * a + b * b).astype(np.float32)
+    med_a_full = float(np.median(a[bg_mask])) if np.any(bg_mask) else 0.0
+    med_b_full = float(np.median(b[bg_mask])) if np.any(bg_mask) else 0.0
+    for panel_mask in panel_masks:
+        local = bg_mask & panel_mask
+        if np.count_nonzero(local) < max(96, (h * w) // 700):
+            continue
+        local_chroma = chroma[local]
+        local_cap = float(chroma_cap) if chroma_cap > 1e-4 else max(7.0, float(np.percentile(local_chroma, 68)) if local_chroma.size else 7.0)
+        # Use restrained, already-low-chroma environment pixels as the neutral target.
+        seed = local & ((chroma <= max(5.5, local_cap * 0.75)) | screen)
+        if np.count_nonzero(seed) < max(24, np.count_nonzero(local) // 20):
+            seed = local
+        target_a = float(np.median(a[seed])) if np.any(seed) else med_a_full
+        target_b = float(np.median(b[seed])) if np.any(seed) else med_b_full
+
+        local_weight = np.clip(bg_weight * panel_mask.astype(np.float32), 0.0, 1.0)
+        pull = np.clip(guard * (0.45 + 0.55 * screen.astype(np.float32)) * local_weight, 0.0, 0.88)
+        a = a * (1.0 - pull) + target_a * pull
+        b = b * (1.0 - pull) + target_b * pull
+
+        # Hard cap excessive chroma in uncertain background regions, but preserve
+        # the panel-local neutral target instead of forcing every page toward 0.
+        da = a - target_a
+        db = b - target_b
+        delta = np.sqrt(da * da + db * db) + 1e-4
+        over = (delta > local_cap) & local
+        if np.any(over):
+            ratio = (local_cap / delta[over]).astype(np.float32)
+            a_over = target_a + da[over] * ratio
+            b_over = target_b + db[over] * ratio
+            a[over] = a_over
+            b[over] = b_over
+
+    # Stabilize hue inside screentone / background regions without flattening
+    # line art: blend with a small median-filter estimate of local AB.
+    if hue_stabilize > 1e-4:
+        a_u8 = np.clip(a + 128.0, 0, 255).astype(np.uint8)
+        b_u8 = np.clip(b + 128.0, 0, 255).astype(np.uint8)
+        a_med = cv2.medianBlur(a_u8, 5).astype(np.float32) - 128.0
+        b_med = cv2.medianBlur(b_u8, 5).astype(np.float32) - 128.0
+        smooth_alpha = np.clip(hue_stabilize * ((screen.astype(np.float32) * 0.70) + (bg_weight * 0.35)), 0.0, 0.65)
+        smooth_alpha *= (~line).astype(np.float32)
+        a = a * (1.0 - smooth_alpha) + a_med * smooth_alpha
+        b = b * (1.0 - smooth_alpha) + b_med * smooth_alpha
+
+    # Final explicit suppression for the typical failure mode reported by users:
+    # pale inkwash backgrounds drifting toward dirty green / cyan.  This acts
+    # only on background-like pixels; characters keep their own chroma floors.
+    green_sup = float(getattr(style, 'green_cast_suppression', 0.0) or 0.0)
+    cyan_sup = float(getattr(style, 'cyan_cast_suppression', 0.0) or 0.0)
+    if green_sup > 1e-4 or cyan_sup > 1e-4:
+        env_target_a = float(getattr(style, 'background_target_a', 0.0) or 0.0)
+        env_target_b = float(getattr(style, 'background_target_b', 0.0) or 0.0)
+        # derive a page-local neutral background anchor from very low-chroma,
+        # non-character pixels so we avoid forcing every page to a fixed tint.
+        low_chroma = np.sqrt(a * a + b * b) <= max(4.0, float(getattr(style, 'background_chroma_cap', 0.0) or 4.0))
+        seed = bg_mask & low_chroma
+        if np.count_nonzero(seed) >= max(24, (h * w) // 5000):
+            env_target_a = 0.45 * env_target_a + 0.55 * float(np.median(a[seed]))
+            env_target_b = 0.45 * env_target_b + 0.55 * float(np.median(b[seed]))
+        suppress_weight = np.clip(bg_weight * (0.65 + 0.35 * screen.astype(np.float32)), 0.0, 1.0)
+        # suppress green cast: negative a values below target are pulled upward.
+        if green_sup > 1e-4:
+            green_gap = np.maximum(0.0, (env_target_a - a))
+            green_alpha = np.clip((green_gap / 10.0) * green_sup * suppress_weight, 0.0, 0.92)
+            a = a * (1.0 - green_alpha) + env_target_a * green_alpha
+        # suppress cyan/blue cast: very negative b values are pulled toward a
+        # slightly warm neutral background.  Positive warm pages are preserved.
+        if cyan_sup > 1e-4:
+            cyan_gap = np.maximum(0.0, (env_target_b - b))
+            cyan_alpha = np.clip((cyan_gap / 10.0) * cyan_sup * suppress_weight, 0.0, 0.88)
+            b = b * (1.0 - cyan_alpha) + env_target_b * cyan_alpha
+        # Hard safety clamp: background-like pixels should not remain strongly
+        # green or cyan after correction.
+        hard = bg_mask & (~line)
+        if np.any(hard):
+            min_a = env_target_a - max(1.8, 2.2 * (1.0 - green_sup))
+            min_b = env_target_b - max(1.8, 2.4 * (1.0 - cyan_sup))
+            a[hard] = np.maximum(a[hard], min_a)
+            b[hard] = np.maximum(b[hard], min_b)
+
+        # Final extra pass for low-detail / plane-like background areas such as
+        # walls, sky, ceilings, white room backgrounds and architectural fills.
+        # These are the regions where a faint green residue is most noticeable.
+        plane_neutralize = float(getattr(style, 'low_detail_bg_neutralize', 0.0) or 0.0)
+        plane_cap = float(getattr(style, 'low_detail_bg_chroma_cap', 0.0) or 0.0)
+        if plane_neutralize > 1e-4:
+            gx = cv2.Sobel(g.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(g.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+            grad = cv2.magnitude(gx, gy)
+            grad_blur = cv2.GaussianBlur(grad, (5, 5), 0)
+            # Low-detail means weak edges/texture or weak regular screentone; keep
+            # this away from detected character zones and strong ink.
+            detail_thresh = float(np.percentile(grad_blur, 45)) if grad_blur.size else 8.0
+            low_detail = grad_blur <= max(6.0, detail_thresh)
+            brightish = g >= max(72, int(getattr(style, 'black_threshold', 24)) + 34)
+            plane_mask = bg_mask & low_detail & brightish & (~line) & (person < 0.14)
+            if np.any(plane_mask):
+                plane_weight = np.clip(plane_neutralize * (0.55 + 0.45 * suppress_weight), 0.0, 0.92)
+                plane_alpha = plane_weight * plane_mask.astype(np.float32)
+                a = a * (1.0 - plane_alpha) + env_target_a * plane_alpha
+                b = b * (1.0 - plane_alpha) + env_target_b * plane_alpha
+                if plane_cap <= 1e-4:
+                    plane_cap = max(3.8, float(getattr(style, 'background_chroma_cap', 0.0) or 0.0) * 0.82)
+                da = a - env_target_a
+                db = b - env_target_b
+                delta = np.sqrt(da * da + db * db) + 1e-4
+                over_plane = plane_mask & (delta > plane_cap)
+                if np.any(over_plane):
+                    ratio = (plane_cap / delta[over_plane]).astype(np.float32)
+                    a[over_plane] = env_target_a + da[over_plane] * ratio
+                    b[over_plane] = env_target_b + db[over_plane] * ratio
+
+    return a.astype(np.float32), b.astype(np.float32)
 
 
 _CHARACTER_LABELS = {"hair", "skin", "eyes", "clothing"}
@@ -560,6 +748,154 @@ def enforce_character_only_color(colorized_bgr: np.ndarray,
         0, 255).astype(np.uint8)
 
 
+def suppress_non_character_purple(colorized_bgr: np.ndarray,
+                                  source_bw_bgr: np.ndarray,
+                                  context=None,
+                                  strength: float = 0.62) -> np.ndarray:
+    """Reduce accidental purple in scene pixels without recolouring people.
+
+    The mc-v2/style combination can turn neutral water, paper and room
+    surfaces violet.  This guard only acts on pixels outside the detected
+    person/attribute masks, and moves violet toward a restrained warm-neutral
+    wash instead of applying a page-wide hue shift.  Intentional purple
+    clothing remains protected by the person mask and character locks.
+    """
+    if colorized_bgr is None or source_bw_bgr is None:
+        return colorized_bgr
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return colorized_bgr
+    if source_bw_bgr.shape[:2] != colorized_bgr.shape[:2]:
+        source_bw_bgr = cv2.resize(
+            source_bw_bgr, (colorized_bgr.shape[1], colorized_bgr.shape[0]),
+            interpolation=cv2.INTER_AREA)
+    source_gray = _to_gray(source_bw_bgr).astype(np.uint8)
+    roles = _semantic_role_masks(colorized_bgr, source_gray, context=context)
+    # A body bounding box can include nearby water/background.  For this
+    # guard, protect only explicit character attributes so adjacent scenery is
+    # still eligible for correction.
+    person = np.zeros(source_gray.shape, np.float32)
+    for attr in ("hair", "eyes", "skin", "clothing"):
+        person = np.maximum(person, np.clip(
+            roles.get(attr, np.zeros(source_gray.shape, np.float32)), 0.0, 1.0))
+    # In fast mode there is no semantic evidence.  The generic person
+    # fallback intentionally covers the central page for other style work,
+    # but would make this guard a no-op, so only trust it when analysis found
+    # an actual segmentation/character instance.
+    if (context is None or
+            (getattr(context, "segmentation", None) is None and
+             not getattr(context, "character_instances", None))):
+        person = np.zeros_like(person)
+
+    hsv = cv2.cvtColor(colorized_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hue = hsv[..., 0]
+    sat = hsv[..., 1]
+    val = hsv[..., 2]
+    # OpenCV hue is 0..179.  Cover violet/magenta while excluding blue and red.
+    purple = (((hue >= 122.0) & (hue <= 178.0)) &
+              (sat >= 28.0) & (val >= 32.0)).astype(np.float32)
+    # Keep ink, bubbles and page-white stable; the guard is for painted scene
+    # areas only and fades near lineart.
+    drawable = combined_neutral_mask(source_gray, line_dilate=1, blur=2).astype(np.float32)
+    scene = np.clip((1.0 - person) * purple * drawable, 0.0, 1.0)
+    if not np.any(scene > 0.01):
+        return colorized_bgr
+
+    # Desaturate most of the accidental violet and add a small ochre bias so
+    # water/room washes do not read as cold purple.  Do not force a flat hue.
+    alpha = np.clip(scene * strength, 0.0, 1.0)
+    hsv[..., 1] = hsv[..., 1] * (1.0 - alpha * 0.78)
+    hsv[..., 0] = hsv[..., 0] * (1.0 - alpha) + 24.0 * alpha
+    hsv[..., 2] = np.clip(hsv[..., 2] * (1.0 - alpha * 0.04), 0.0, 255.0)
+    out = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return out
+
+
+def harmonize_water_color(colorized_bgr: np.ndarray,
+                          source_bw_bgr: np.ndarray,
+                          context=None,
+                          strength: float = 0.82) -> np.ndarray:
+    """Make separately segmented water areas share one page-local colour.
+
+    The luminance channel is left untouched, so waves, shadows and lineart
+    retain their original structure.  Only the Lab chroma of regions whose
+    semantic label is ``water`` is gently pulled toward the page-wide water
+    median.  If semantic water regions are unavailable this is a no-op.
+    """
+    if colorized_bgr is None or source_bw_bgr is None or context is None:
+        return colorized_bgr
+    seg = getattr(context, "segmentation", None)
+    labels = list(getattr(context, "semantic_labels", []) or [])
+    regions = list(getattr(seg, "regions", []) or []) if seg is not None else []
+    h, w = colorized_bgr.shape[:2]
+    water = np.zeros((h, w), dtype=bool)
+    fallback_water = False
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 0.0:
+        return colorized_bgr
+    source_gray = _to_gray(source_bw_bgr)
+    if source_gray.shape != (h, w):
+        source_gray = cv2.resize(source_gray, (w, h), interpolation=cv2.INTER_AREA)
+    drawable = combined_neutral_mask(source_gray, line_dilate=1, blur=2) > 0.18
+
+    if seg is not None and labels and regions:
+        label_map = cv2.resize(seg.labels.astype(np.int32), (w, h), interpolation=cv2.INTER_NEAREST)
+        for region, value in zip(regions, labels):
+            try:
+                role, confidence = value
+            except Exception:
+                continue
+            if str(role).lower() != "water" or float(confidence) < 0.12:
+                continue
+            water |= label_map == int(region.label_id)
+
+    # Without CLIP, water is often labelled unknown.  Use a conservative
+    # lower-scene fallback: large, light, saturated patches that are outside
+    # explicit character attributes are usually the coloured pool surface.
+    if int(water.sum()) < 32:
+        fallback_water = True
+        hsv = cv2.cvtColor(colorized_bgr, cv2.COLOR_BGR2HSV)
+        roles = _semantic_role_masks(colorized_bgr, source_gray, context=context)
+        protected = np.zeros((h, w), dtype=np.float32)
+        # Clothing is intentionally excluded here: the dark garment in a
+        # bathing scene can overlap the water mask, while its low value keeps
+        # it out of the light-water candidate below.
+        for attr in ("hair", "eyes", "skin"):
+            protected = np.maximum(protected, roles.get(attr, 0.0))
+        lower_scene = np.indices((h, w))[0] >= int(h * 0.52)
+        water = (lower_scene & drawable & (source_gray > 34) &
+                 (hsv[..., 0] >= 45) & (hsv[..., 0] <= 179) &
+                 (hsv[..., 1] > 25) & (hsv[..., 2] > 85) &
+                 (protected < 0.35))
+        water = cv2.morphologyEx(
+            water.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+    if int(water.sum()) < 32:
+        return colorized_bgr
+
+    lab = cv2.cvtColor(colorized_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    valid = water & drawable & (source_gray > 18) & (source_gray < 250)
+    if int(valid.sum()) < 32:
+        return colorized_bgr
+    if fallback_water:
+        # The neutral/warm pool pixels on the same page provide a stable
+        # reference even when the model split the water into purple and green
+        # blobs.  Keep only drawable, moderately bright, low-chroma pixels.
+        low_chroma = (np.sqrt((lab[..., 1] - 128.0) ** 2 +
+                             (lab[..., 2] - 128.0) ** 2) < 28.0)
+        reference = (drawable & low_chroma & (source_gray > 90) &
+                     (source_gray < 235) & (~water))
+        if int(reference.sum()) >= 32:
+            target_ab = np.median(lab[reference, 1:3], axis=0).astype(np.float32)
+        else:
+            target_ab = np.array([137.0, 143.0], dtype=np.float32)
+    else:
+        target_ab = np.median(lab[valid, 1:3], axis=0).astype(np.float32)
+    alpha = (strength * np.clip((source_gray.astype(np.float32) - 18.0) / 80.0, 0.25, 1.0))[..., None]
+    alpha *= valid[..., None].astype(np.float32)
+    lab[..., 1:3] = lab[..., 1:3] * (1.0 - alpha) + target_ab * alpha
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
 def apply_style_grade(colorized_bgr: np.ndarray, source_bw_bgr: np.ndarray,
                       style: StylePreset, context=None) -> np.ndarray:
     """Grade mc-v2's raw colorized output according to `style`.
@@ -713,6 +1049,8 @@ def apply_style_grade(colorized_bgr: np.ndarray, source_bw_bgr: np.ndarray,
     final_keep = np.maximum(keep_mask * tone_fade, keep_override)
     a = a * final_keep
     b = b * final_keep
+
+    a, b = _apply_inkwash_balance(a, b, source_gray, style, role_masks=role_masks)
 
     out_lab = np.dstack([
         np.clip(L_final, 0, 255),

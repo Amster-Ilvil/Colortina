@@ -50,7 +50,7 @@ def _remove_isolated_dots(mask: np.ndarray, min_span: int = 5,
                           min_area: int = 8) -> np.ndarray:
     """Remove tiny round components while retaining thin, elongated strokes."""
     binary = (mask > 0).astype(np.uint8)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if n <= 1:
         return binary * 255
     keep = np.zeros(n, dtype=bool)
@@ -131,7 +131,7 @@ def _repair_short_gaps_native(base_ink: np.ndarray, gray: np.ndarray,
 
     base = (base_ink > 0).astype(np.uint8)
     accepted = np.zeros_like(base, dtype=np.uint8)
-    _n, base_labels, base_stats, _centroids = cv2.connectedComponentsWithStats(base, 8)
+    _n, base_labels, base_stats, _centroids = cv2.connectedComponentsWithStats(base, connectivity=8)
     # A page-level topology budget prevents an extreme slider value from
     # constructing a dense web between screentones/text. Short bridges are
     # evaluated first, so the budget keeps the safest candidates.

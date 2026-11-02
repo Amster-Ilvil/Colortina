@@ -91,7 +91,7 @@ def _face_structure_score(image_bgr: np.ndarray,
     eye_band = ((yy > h * 0.24) & (yy < h * 0.62) &
                 (xx > w * 0.10) & (xx < w * 0.90) & ellipse)
     dark = ((gray < 105) & eye_band).astype(np.uint8)
-    n, _lab, stats, cents = cv2.connectedComponentsWithStats(dark, 8)
+    n, _lab, stats, cents = cv2.connectedComponentsWithStats(dark, connectivity=8)
     comps = []
     for i in range(1, n):
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -327,9 +327,10 @@ def detect_anime_faces(image_bgr: np.ndarray, max_faces: int = 32,
     H, W = image_bgr.shape[:2]
     cascade_path = ensure_anime_face_cascade(allow_download=allow_download)
     if cascade_path is None:
-        if os.environ.get("COLORTINA_ALLOW_GENERIC_HAAR", "").lower() in {
-                "1", "true", "yes"}:
-            return _generic_haar_faces(image_bgr, max_faces)
+        # Offline packaged builds may not have the dedicated anime cascade yet.
+        # For hair recolour / character-scope features, a strict generic Haar
+        # fallback is still better than disabling all face-guided logic.
+        return _generic_haar_faces(image_bgr, max_faces)
         return []
 
     max_dim = max(H, W)
@@ -516,7 +517,7 @@ def sample_reference_face_palette(image_bgr: np.ndarray,
                 (xx > fw * 0.08) & (xx < fw * 0.92))
     iris = eye_band & ~skin & (f_hsv[..., 1] > 38) & \
            (f_hsv[..., 2] > 28) & (f_hsv[..., 2] < 238)
-    n, comps, stats, cents = cv2.connectedComponentsWithStats(iris.astype(np.uint8), 8)
+    n, comps, stats, cents = cv2.connectedComponentsWithStats(iris.astype(np.uint8), connectivity=8)
     candidates = []
     for i in range(1, n):
         area = int(stats[i, cv2.CC_STAT_AREA])

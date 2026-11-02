@@ -33,13 +33,29 @@ def available() -> bool:
 
 def _ensure_session():
     global _session, _tried
+    path = _model_path()
+    # A model can be installed from the new in-app model manager after this
+    # module previously recorded a missing file. Retry automatically when the
+    # file appears instead of requiring an application restart.
+    if _tried and _session is None:
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) >= 1024 * 1024:
+                _tried = False
+        except OSError:
+            pass
     if _tried:
         return _session
     with _lock:
+        path = _model_path()
+        if _tried and _session is None:
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) >= 1024 * 1024:
+                    _tried = False
+            except OSError:
+                pass
         if _tried:
             return _session
         _tried = True
-        path = _model_path()
         if not os.path.isfile(path) or os.path.getsize(path) < 1024 * 1024:
             print("[character_scope] 未找到 isnetis.onnx，"
                   "角色范围回退到启发式估计")
@@ -55,6 +71,15 @@ def _ensure_session():
             print(f"[character_scope] 角色分割模型加载失败（{exc}），回退启发式")
             _session = None
     return _session
+
+
+def reset_session() -> None:
+    """Clear a previous missing/failed model state after model installation."""
+    global _session, _tried
+    with _lock:
+        _session = None
+        _tried = False
+        _mask_cache.clear()
 
 
 def _fingerprint(image_bgr: np.ndarray) -> tuple:

@@ -55,4 +55,10 @@ def migrate_ccproject(data: dict) -> tuple[dict, list[str]]:
             page.setdefault("forced_character_matches", {})
             page.setdefault("diagnostics_file", None)
         notes.append(f"ccproject v{version} -> v2: scene palette and page diagnostics added")
+    if int(out.get("version", 2) or 2) < 3:
+        out["version"] = 3
+        for page in out.get("pages", []):
+            page.setdefault("semantic_hair_positive", None)
+            page.setdefault("semantic_hair_negative", None)
+        notes.append("ccproject v2 -> v3: semantic positive/negative hair scribbles added")
     return out, notes

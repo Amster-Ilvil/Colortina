@@ -68,7 +68,7 @@ def _remove_texture_dots(mask: np.ndarray, confidence: np.ndarray) -> np.ndarray
     high line confidence; compact low-confidence dots are not.
     """
     binary = (mask > 0).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if count <= 1:
         return binary * 255
     keep = np.zeros(count, dtype=bool)

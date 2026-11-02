@@ -5,9 +5,7 @@ Pillow>=10.0
 
 # PyTorch — on Mac this installs the MPS-enabled build automatically,
 # no special index-url needed (unlike CUDA on Linux/Windows).
-# Intel macOS wheels currently top out at torch 2.2.x, which remains
-# compatible with Colortina's mc-v2 inference path.
-torch>=2.2.2
+torch>=2.3
 torchvision>=0.15
 
 # Auto color-hint generation (CLIP zero-shot region labeling)
@@ -30,6 +28,9 @@ PySide6>=6.6
 # and character-scope segmentation (SkyTNT anime-seg). Both features
 # degrade gracefully when the model files are absent.
 onnxruntime>=1.20
+
+# Vendored manga-colorization-v2 denoiser utility imports skimage.io.
+scikit-image>=0.24
 
 # Real-ESRGAN upscaling now uses the vendored torch-only RRDBNet in
 # vendor/realesrgan_min — the fragile realesrgan/basicsr packages are

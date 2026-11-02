@@ -226,7 +226,14 @@ def _emit_tiered_specs(region, seg, gray: np.ndarray, w: int, h: int, tc,
                        *, source: str, semantic: str,
                        character_id: int | None, confidence: float,
                        strength: float) -> list[HintSpec]:
-    mask = seg.labels == int(region.label_id)
+    labels = seg.labels
+    # Region segmentation may run on a bounded working resolution while the
+    # caller keeps the original page-sized grayscale image.  Normalize the
+    # mask to the page before combining it with grayscale gates.
+    if labels.shape[:2] != (h, w):
+        labels = cv2.resize(labels.astype(np.int32), (w, h),
+                            interpolation=cv2.INTER_NEAREST)
+    mask = labels == int(region.label_id)
     if not np.any(mask):
         return []
     distance = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
@@ -235,6 +242,10 @@ def _emit_tiered_specs(region, seg, gray: np.ndarray, w: int, h: int, tc,
     ys, xs = np.nonzero(valid)
     if ys.size == 0:
         px, py = region.interior_point
+        source_h, source_w = seg.labels.shape[:2]
+        if (source_h, source_w) != (h, w):
+            px = float(px) * w / max(1, source_w)
+            py = float(py) * h / max(1, source_h)
         return [HintSpec(px / w, py / h, tc.mid_rgb, _LAYER_RADIUS,
                          strength=strength, source=source,
                          region_id=int(region.label_id), semantic=semantic,

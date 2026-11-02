@@ -1,27 +1,35 @@
-"""Process-wide outbound network lockdown.
+"""Process-wide outbound network lockdown with explicit model-download windows.
 
-Colortina 是纯本地应用：模型权重在本地、推理在本地、页面从不上传。
-本模块在 socket 层拦截一切对外连接（仅放行本机回环地址），任何依赖库
-（huggingface_hub / transformers / gdown / requests / urllib …）都无法
-绕过。这是硬性保证，而不是逐个库设置开关。
-
-默认锁死。只有显式设置环境变量 COLORTINA_ALLOW_NETWORK=1 启动时才放开
-（例如在新机器上首次下载模型权重时），用完即恢复默认。
+Colortina is a local application: pages are never uploaded.  Normal runtime
+blocks all non-loopback connections.  A model download started by an explicit
+user confirmation may temporarily restore the original socket functions only
+for the duration of that download, then the lock is re-installed immediately.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import socket
+import threading
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "0.0.0.0", ""}
+_state_lock = threading.RLock()
 _installed = False
+_download_thread_state = threading.local()
+
+# Preserve the process originals once.  Older implementations captured these
+# inside install_lockdown(), making a confirmed later model download impossible
+# after startup locking.
+_REAL_SOCKET_CONNECT = socket.socket.connect
+_REAL_SOCKET_CONNECT_EX = socket.socket.connect_ex
+_REAL_CREATE_CONNECTION = socket.create_connection
 
 
 class NetworkLockedError(OSError):
     def __init__(self, target: str):
         super().__init__(
             f"网络已锁定：Colortina 拒绝对外连接 ({target})。"
-            "如需临时联网下载模型，请用 COLORTINA_ALLOW_NETWORK=1 启动。")
+            "模型下载必须由界面的明确确认按钮启动。")
 
 
 def _is_loopback(address) -> bool:
@@ -30,34 +38,39 @@ def _is_loopback(address) -> bool:
     except Exception:
         return False
     host = str(host).strip("[]").split("%", 1)[0]
-    if host in _LOOPBACK_HOSTS:
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
         return True
-    if host.startswith("127."):
+    # Unix domain sockets (str/bytes path) are local by definition.  Hostname
+    # strings passed to socket.create_connection are handled there separately.
+    if isinstance(address, bytes):
         return True
-    # Unix domain sockets (str/bytes path) are local by definition.
-    if isinstance(address, (str, bytes)):
+    if isinstance(address, str) and (address.startswith("/") or address.startswith("\0")):
         return True
     return False
 
 
 def network_allowed() -> bool:
-    return os.environ.get("COLORTINA_ALLOW_NETWORK", "0") == "1"
+    # A confirmed model download authorizes *only the calling thread*.
+    # A global depth counter accidentally allowed all worker threads to
+    # transmit data while any download was in progress.
+    return (os.environ.get("COLORTINA_ALLOW_NETWORK", "0") == "1" or
+            getattr(_download_thread_state, "depth", 0) > 0)
+
+
+def lockdown_active() -> bool:
+    return bool(_installed)
 
 
 def required_weights_present(cfg=None) -> bool:
-    """Check the model weights the app needs for its features.
+    """Check the hard-required model used by the startup policy.
 
-    Missing weights are the ONLY sanctioned reason to touch the network:
-    generator (mc-v2), the shared FFDNet denoiser, and the
-    MangaLineExtraction erika model used by rectangle closed-region fill.
+    The denoiser and MangaLine weights are optional features. Treating either
+    one as required made an otherwise runnable local installation appear to
+    need network access on every launch.
     """
     if cfg is None:
         from config import Config as cfg
-    paths = [
-        cfg.GENERATOR_WEIGHTS_PATH,
-        os.path.join(cfg.DENOISER_WEIGHTS_DIR, "net_rgb.pth"),
-        getattr(cfg, "MANGA_LINE_WEIGHTS_PATH", ""),
-    ]
+    paths = [cfg.GENERATOR_WEIGHTS_PATH]
     for path in paths:
         if not path:
             continue
@@ -70,68 +83,102 @@ def required_weights_present(cfg=None) -> bool:
 
 
 def apply_startup_policy(cfg=None) -> str:
-    """没有模型权重才允许联网下载，其它情况一律锁死。
-
-    Returns a short human-readable state string for the startup banner.
-    """
-    if network_allowed():
+    if os.environ.get("COLORTINA_ALLOW_NETWORK", "0") == "1":
         return "已按 COLORTINA_ALLOW_NETWORK=1 放开"
+    install_lockdown()
     if required_weights_present(cfg):
-        install_lockdown()
-        return "开启（完全离线）"
-    return "临时放开：检测到模型权重缺失，仅本次允许下载；下载完成后自动锁定"
+        return "开启（本地模型就绪；仅确认后的下载线程可联网）"
+    return "开启（基础模型缺失；用户确认后才能下载）"
 
 
 def lock_when_weights_ready(cfg=None) -> bool:
-    """Call after any weight download completes: lock as soon as possible."""
-    if network_allowed() or _installed:
+    if os.environ.get("COLORTINA_ALLOW_NETWORK", "0") == "1" or _installed:
         return _installed
     if required_weights_present(cfg):
         install_lockdown()
-        print("[colortina] 模型权重齐全，网络已自动锁定（完全离线）")
+        print("[colortina] 基础模型权重齐全，网络已自动锁定（完全离线）")
     return _installed
 
 
-def install_lockdown() -> bool:
-    """Block all non-loopback outbound connections for this process.
+def _guarded_connect(self, address):
+    if not network_allowed() and not _is_loopback(address):
+        raise NetworkLockedError(repr(address))
+    return _REAL_SOCKET_CONNECT(self, address)
 
-    Returns True when the lock is active, False when the user explicitly
-    allowed network access via COLORTINA_ALLOW_NETWORK=1.
-    """
+
+def _guarded_connect_ex(self, address):
+    if not network_allowed() and not _is_loopback(address):
+        raise NetworkLockedError(repr(address))
+    return _REAL_SOCKET_CONNECT_EX(self, address)
+
+
+def _guarded_create_connection(address, *args, **kwargs):
+    if not network_allowed() and not _is_loopback(address):
+        raise NetworkLockedError(repr(address))
+    return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
+
+
+def install_lockdown() -> bool:
+    """Block all non-loopback outbound connections in normal runtime."""
     global _installed
-    if network_allowed():
-        return False
-    if _installed:
+    with _state_lock:
+        if os.environ.get("COLORTINA_ALLOW_NETWORK", "0") == "1":
+            return False
+        if _installed:
+            return True
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        os.environ["DO_NOT_TRACK"] = "1"
+        socket.socket.connect = _guarded_connect
+        socket.socket.connect_ex = _guarded_connect_ex
+        socket.create_connection = _guarded_create_connection
+        _installed = True
         return True
 
-    # 让各库“自觉”离线，避免它们在被 socket 拦截前反复重试等待。
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-    os.environ["DO_NOT_TRACK"] = "1"
-    os.environ["NO_PROXY"] = "*"
 
-    real_connect = socket.socket.connect
-    real_connect_ex = socket.socket.connect_ex
-    real_create_connection = socket.create_connection
+def remove_lockdown() -> bool:
+    """Restore original sockets. Intended only for confirmed model downloads."""
+    global _installed
+    with _state_lock:
+        if not _installed:
+            return False
+        socket.socket.connect = _REAL_SOCKET_CONNECT
+        socket.socket.connect_ex = _REAL_SOCKET_CONNECT_EX
+        socket.create_connection = _REAL_CREATE_CONNECTION
+        _installed = False
+        return True
 
-    def guarded_connect(self, address):
-        if not _is_loopback(address):
-            raise NetworkLockedError(repr(address))
-        return real_connect(self, address)
 
-    def guarded_connect_ex(self, address):
-        if not _is_loopback(address):
-            raise NetworkLockedError(repr(address))
-        return real_connect_ex(self, address)
+@contextmanager
+def confirmed_model_download_window(label: str = "模型"):
+    """Authorize network connections for only the confirmed download thread.
 
-    def guarded_create_connection(address, *args, **kwargs):
-        if not _is_loopback(address):
-            raise NetworkLockedError(repr(address))
-        return real_create_connection(address, *args, **kwargs)
-
-    socket.socket.connect = guarded_connect
-    socket.socket.connect_ex = guarded_connect_ex
-    socket.create_connection = guarded_create_connection
-    _installed = True
-    return True
+    Keep the socket guards installed throughout the window so unrelated UI,
+    AI and background worker threads remain offline.  Restore environment and
+    per-thread authorization even when a download fails.  Nested windows work.
+    """
+    with _state_lock:
+        was_locked = _installed
+        previous_env = {
+            key: os.environ.get(key)
+            for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+        }
+        _download_thread_state.depth = getattr(_download_thread_state, "depth", 0) + 1
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        os.environ["TRANSFORMERS_OFFLINE"] = "0"
+        print(f"[colortina] 已按用户确认临时开放模型下载线程网络：{label}")
+    try:
+        yield
+    finally:
+        with _state_lock:
+            _download_thread_state.depth = max(
+                0, getattr(_download_thread_state, "depth", 0) - 1)
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            if was_locked and not _installed and os.environ.get("COLORTINA_ALLOW_NETWORK", "0") != "1":
+                install_lockdown()
+            print(f"[colortina] 模型下载线程窗口已关闭：{label}")

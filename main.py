@@ -7,6 +7,23 @@ Run with:
 import os
 import sys
 
+# Configure MPS before any UI import can initialize torch.
+from core.device_runtime import configure_torch_environment
+configure_torch_environment()
+
+
+def _configure_low_disk_runtime():
+    """Keep third-party libraries from creating large user-cache folders."""
+    os.environ.setdefault("PIP_NO_CACHE_DIR", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("DO_NOT_TRACK", "1")
+    if os.environ.get("COLORTINA_ALLOW_CLIP_DOWNLOAD", "0") != "1":
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+_configure_low_disk_runtime()
+
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -14,18 +31,16 @@ from config import Config
 from ui.main_window import MainWindow
 
 
-def _resource_path(*parts: str) -> str:
-    """Resolve bundled assets from source or a PyInstaller build."""
-    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_dir, *parts)
-
-
 def main():
-    # 隐私硬锁：模型权重齐全时，在 socket 层禁止本进程一切对外连接
-    # （仅回环地址放行）——HF 校验、遥测、任何库的联网行为都被物理拦截。
-    # 只有检测到模型权重缺失时才临时放开用于下载，下载完成立即自动锁定。
+    # 启动时始终禁止外联；模型缺失不会放开全局网络。
+    # 仅用户在界面中确认下载后，对该下载线程临时授予网络权限。
     from core.network_lockdown import apply_startup_policy
     print(f"[colortina] 网络锁定: {apply_startup_policy()}")
+    if getattr(sys, "frozen", False):
+        from core.bundled_models import install_bundled_weights
+        seeded = install_bundled_weights(Config.WEIGHTS_DIR)
+        if seeded:
+            print(f"[colortina] 已从安装包部署 {len(seeded)} 个本地模型文件")
     # ── 降本增效: cap worker threads so long batch jobs stay responsive ──
     # OpenCV and PyTorch both default to using EVERY core, which pegs the
     # whole machine (fans, UI stutter, other apps starved) for marginal
@@ -48,13 +63,11 @@ def main():
     app.setApplicationVersion(Config.APP_VERSION)
     app.setOrganizationName("Colortina")
 
-    app_icon = QIcon(_resource_path("assets", "icon.png"))
-    if not app_icon.isNull():
-        app.setWindowIcon(app_icon)
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")
+    if os.path.isfile(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     window = MainWindow()
-    if not app_icon.isNull():
-        window.setWindowIcon(app_icon)
     window.show()
     sys.exit(app.exec())
 

@@ -67,6 +67,15 @@ class HintManager:
     def region_map(self) -> RegionMap | None:
         return self._region_map
 
+    def release_runtime_cache(self) -> None:
+        """Release page-sized analysis maps without deleting saved hints."""
+        self._region_map = None
+        self._source_key = None
+        # These attributes are attached by pipeline.colorize_page for live UI
+        # diagnostics; they are intentionally not serialized.
+        if hasattr(self, "last_page_context"):
+            self.last_page_context = None
+
     def bind_source_image(self, image_bgr: np.ndarray, *, line_low: int = 75,
                           gap_close: int = 4) -> RegionMap:
         key = (id(image_bgr), image_bgr.shape[:2], int(line_low), int(gap_close))

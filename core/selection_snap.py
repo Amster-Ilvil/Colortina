@@ -72,7 +72,7 @@ def _largest_seed(mask: np.ndarray, radius: int) -> np.ndarray:
 
 def _keep_component_touching_seed(candidate: np.ndarray, seed: np.ndarray) -> np.ndarray:
     binary = (candidate > 0).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     if count <= 1:
         return binary
     overlaps = np.bincount(labels[seed > 0].ravel(), minlength=count)

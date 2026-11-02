@@ -14,18 +14,29 @@ never the scene.
 from __future__ import annotations
 
 import cv2
+import time
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QRectF, QPointF
+from PySide6.QtCore import Qt, Signal, QRectF, QPointF, QTimer
 from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QBrush, QPainterPath
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsRectItem
 
 
-def bgr_to_qpixmap(image_bgr: np.ndarray) -> QPixmap:
+def bgr_to_qimage(image_bgr: np.ndarray) -> QImage:
+    image_bgr = np.ascontiguousarray(image_bgr)
+    h, w = image_bgr.shape[:2]
+    bgr_format = getattr(QImage.Format, "Format_BGR888", None)
+    if bgr_format is not None:
+        return QImage(
+            image_bgr.data, w, h, image_bgr.strides[0], bgr_format)
     rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    h, w = rgb.shape[:2]
-    qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888)
-    # .copy() — QImage doesn't own the numpy buffer, and it must outlive it
-    return QPixmap.fromImage(qimg.copy())
+    return QImage(rgb.data, w, h, rgb.strides[0],
+                  QImage.Format.Format_RGB888).copy()
+
+
+def bgr_to_qpixmap(image_bgr: np.ndarray) -> QPixmap:
+    # QPixmap.fromImage takes ownership of its converted backing store; an
+    # additional QImage.copy() duplicated every full-resolution upload.
+    return QPixmap.fromImage(bgr_to_qimage(image_bgr))
 
 
 class HintCanvas(QGraphicsView):
@@ -50,6 +61,7 @@ class HintCanvas(QGraphicsView):
     selection_preview_active = Signal(bool)
     # Emitted when the user manually tweaks the pending blue selection mask: (ix, iy, radius_px, add_mode)
     selection_adjust_dab = Signal(int, int, int, bool)
+    selection_adjust_finished = Signal()
 
     TOOL_BRUSH = "brush"
     TOOL_BIAS_BRUSH = "bias_brush"
@@ -96,13 +108,58 @@ class HintCanvas(QGraphicsView):
         self._selection_adjust_active = False
         self._selection_adjust_add_mode = True
         self._selection_adjust_mode = "add"
+        self._selection_adjust_allow_empty = False
+        # Full-resolution QPixmap uploads are expensive on multi-megapixel
+        # manga pages.  Coalesce rapid brush dabs to one upload per frame.
+        self._pixel_refresh_interval = 1.0 / 24.0
+        self._last_pixel_refresh_ts = 0.0
+        self._pending_pixel_bgr: np.ndarray | None = None
+        self._pending_pixel_roi: tuple[int, int, int, int] | None = None
+        self._pixel_refresh_timer = QTimer(self)
+        self._pixel_refresh_timer.setSingleShot(True)
+        self._pixel_refresh_timer.timeout.connect(self._flush_pending_pixels)
+        # Keep only the immediately previous page/layer pixmap.  This makes
+        # rapid A↔B navigation instant without turning the canvas into another
+        # unbounded full-resolution image cache.
+        self._active_pixmap_cache_key = None
+        self._previous_pixmap_cache_key = None
+        self._previous_pixmap_cache: QPixmap | None = None
+        self._pixmap_cache_byte_limit = 64 * 1024 * 1024
 
     # ── Image display ──────────────────────────────────────────────────
 
-    def set_image(self, image_bgr: np.ndarray, fit: bool = True) -> None:
+    def set_image(self, image_bgr: np.ndarray, fit: bool = True,
+                  cache_key=None) -> None:
+        self._pixel_refresh_timer.stop()
+        self._pending_pixel_bgr = None
+        self._pending_pixel_roi = None
+        self._last_pixel_refresh_ts = time.monotonic()
         self._current_bgr = image_bgr
         self._image_h, self._image_w = image_bgr.shape[:2]
-        pixmap = bgr_to_qpixmap(image_bgr)
+
+        cached = None
+        if (cache_key is not None and cache_key == self._active_pixmap_cache_key and
+                self._pixmap_item is not None and
+                self._pixmap_item.pixmap().size().width() == self._image_w and
+                self._pixmap_item.pixmap().size().height() == self._image_h):
+            cached = self._pixmap_item.pixmap()
+        if (cache_key is not None and cache_key == self._previous_pixmap_cache_key and
+                self._previous_pixmap_cache is not None):
+            cached = self._previous_pixmap_cache
+            self._previous_pixmap_cache = None
+            self._previous_pixmap_cache_key = None
+
+        # Save the outgoing base pixmap only after retrieving the incoming one,
+        # so A→B→A works with a single previous-page slot.
+        if (self._pixmap_item is not None and self._active_pixmap_cache_key is not None and
+                self._active_pixmap_cache_key != cache_key):
+            old = self._pixmap_item.pixmap()
+            estimated = max(0, old.width()) * max(0, old.height()) * 4
+            if estimated <= self._pixmap_cache_byte_limit:
+                self._previous_pixmap_cache_key = self._active_pixmap_cache_key
+                self._previous_pixmap_cache = old
+        pixmap = cached if cached is not None else bgr_to_qpixmap(image_bgr)
+        self._active_pixmap_cache_key = cache_key
 
         self._scene.clear()
         self._dab_items = []
@@ -120,20 +177,107 @@ class HintCanvas(QGraphicsView):
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def update_image_pixels(self, image_bgr: np.ndarray) -> None:
-        """Refresh only the displayed pixels without rebuilding the scene.
-
-        Brush edits use this during a stroke so the recolor is visible
-        immediately. Keeping the scene intact avoids losing mouse capture or
-        temporary overlays while dragging.
-        """
+        """Refresh displayed pixels while coalescing high-frequency brush dabs."""
         if image_bgr is None:
             return
+        self._current_bgr = image_bgr
+        self._active_pixmap_cache_key = None
+        self._pending_pixel_roi = None
+        now = time.monotonic()
+        elapsed = now - float(self._last_pixel_refresh_ts)
+        if elapsed < self._pixel_refresh_interval:
+            self._pending_pixel_bgr = image_bgr
+            if not self._pixel_refresh_timer.isActive():
+                remaining_ms = max(1, int(round(
+                    (self._pixel_refresh_interval - elapsed) * 1000.0)))
+                self._pixel_refresh_timer.start(remaining_ms)
+            return
+        self._apply_image_pixels(image_bgr)
+
+    def update_image_region(self, image_bgr: np.ndarray,
+                            roi: tuple[int, int, int, int] | None) -> None:
+        """Refresh only a changed pixel rectangle during live painting.
+
+        The scene still uses full image coordinates and the authoritative BGR
+        array remains untouched.  Only BGR→QImage conversion and QPixmap paint
+        work are limited to the union of dabs waiting for the next frame.
+        """
+        if image_bgr is None or roi is None:
+            self.update_image_pixels(image_bgr)
+            return
+        h, w = image_bgr.shape[:2]
+        x0, y0, x1, y1 = [int(v) for v in roi]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w, x1), min(h, y1)
+        if x0 >= x1 or y0 >= y1:
+            return
+        self._current_bgr = image_bgr
+        self._active_pixmap_cache_key = None
+        if self._pending_pixel_roi is None:
+            self._pending_pixel_roi = (x0, y0, x1, y1)
+        else:
+            px0, py0, px1, py1 = self._pending_pixel_roi
+            self._pending_pixel_roi = (
+                min(px0, x0), min(py0, y0), max(px1, x1), max(py1, y1))
+        self._pending_pixel_bgr = image_bgr
+        now = time.monotonic()
+        elapsed = now - float(self._last_pixel_refresh_ts)
+        if elapsed >= self._pixel_refresh_interval:
+            self._flush_pending_pixels()
+        elif not self._pixel_refresh_timer.isActive():
+            remaining_ms = max(1, int(round(
+                (self._pixel_refresh_interval - elapsed) * 1000.0)))
+            self._pixel_refresh_timer.start(remaining_ms)
+
+    def flush_pending_pixels(self) -> None:
+        """Immediately apply the coalesced live-paint update, if any."""
+        self._pixel_refresh_timer.stop()
+        self._flush_pending_pixels()
+
+    def mark_current_cache_key(self, cache_key) -> None:
+        """Mark the live-updated pixmap as reusable for page navigation."""
+        if self._pixmap_item is not None:
+            self._active_pixmap_cache_key = cache_key
+
+    def _flush_pending_pixels(self) -> None:
+        image = self._pending_pixel_bgr
+        roi = self._pending_pixel_roi
+        self._pending_pixel_bgr = None
+        self._pending_pixel_roi = None
+        if image is not None:
+            if roi is not None:
+                self._apply_image_region(image, roi)
+            else:
+                self._apply_image_pixels(image)
+
+    def _apply_image_pixels(self, image_bgr: np.ndarray) -> None:
         h, w = image_bgr.shape[:2]
         if self._pixmap_item is None or (w, h) != (self._image_w, self._image_h):
             self.set_image(image_bgr, fit=False)
             return
         self._current_bgr = image_bgr
         self._pixmap_item.setPixmap(bgr_to_qpixmap(image_bgr))
+        self._last_pixel_refresh_ts = time.monotonic()
+
+    def _apply_image_region(self, image_bgr: np.ndarray,
+                            roi: tuple[int, int, int, int]) -> None:
+        h, w = image_bgr.shape[:2]
+        if self._pixmap_item is None or (w, h) != (self._image_w, self._image_h):
+            self.set_image(image_bgr, fit=False)
+            return
+        x0, y0, x1, y1 = roi
+        crop = np.ascontiguousarray(image_bgr[y0:y1, x0:x1])
+        if crop.size == 0:
+            return
+        pixmap = self._pixmap_item.pixmap()
+        painter = QPainter(pixmap)
+        try:
+            painter.drawImage(x0, y0, bgr_to_qimage(crop))
+        finally:
+            painter.end()
+        self._pixmap_item.setPixmap(pixmap)
+        self._current_bgr = image_bgr
+        self._last_pixel_refresh_ts = time.monotonic()
 
     def clear_dabs(self) -> None:
         """Remove the visual brush-dab overlay (call after a re-colorize,
@@ -264,8 +408,13 @@ class HintCanvas(QGraphicsView):
     def set_selection_adjust_mode(self, mode: str) -> None:
         self._selection_adjust_mode = "erase" if str(mode) == "erase" else "add"
 
+    def set_selection_adjust_allow_empty(self, allow: bool) -> None:
+        self._selection_adjust_allow_empty = bool(allow)
+
     def _can_adjust_pending_selection(self) -> bool:
-        return bool(self._selection_adjust_enabled and self._pending_selection_item is not None
+        has_overlay = (self._pending_selection_item is not None or
+                       self._selection_adjust_allow_empty)
+        return bool(self._selection_adjust_enabled and has_overlay
                     and self._tool in (self.TOOL_RECT_BUCKET, self.TOOL_LASSO_BUCKET))
 
     def _emit_selection_adjust_dab(self, ix: int, iy: int) -> None:
@@ -496,6 +645,116 @@ class HintCanvas(QGraphicsView):
         self._pending_selection_item = item
         self.selection_preview_active.emit(True)
 
+    def set_auto_hair_preview_overlay(
+            self,
+            primary_mask: np.ndarray | None,
+            supplemental_mask: np.ndarray | None = None,
+            rejected_thin_mask: np.ndarray | None = None) -> None:
+        """Preview automatic hair-mask layers with distinct colours.
+
+        Blue is the AI-anchored primary hairstyle, green is accepted legacy
+        supplementation, and red is a thin line/shell candidate rejected by the
+        V5.12.3 filter.  Rejected red regions are visual diagnostics only and are
+        never recoloured.
+        """
+        self._clear_selection_overlay()
+        self.clear_debug_overlays()
+
+        def add_mask(mask: np.ndarray | None, color: QColor, z_value: float) -> bool:
+            if mask is None:
+                return False
+            arr = np.asarray(mask)
+            if arr.size == 0 or not np.any(arr):
+                return False
+            if arr.shape[:2] != (self._image_h, self._image_w):
+                arr = cv2.resize(arr.astype(np.uint8),
+                                 (self._image_w, self._image_h),
+                                 interpolation=cv2.INTER_NEAREST)
+            binary = (arr > 0).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return False
+            path = QPainterPath()
+            for contour in contours:
+                if len(contour) < 2:
+                    continue
+                first = contour[0][0]
+                path.moveTo(float(first[0]), float(first[1]))
+                for pt in contour[1:]:
+                    x, y = pt[0]
+                    path.lineTo(float(x), float(y))
+                path.closeSubpath()
+            path.setFillRule(Qt.FillRule.OddEvenFill)
+            item = QGraphicsPathItem(path)
+            item.setPen(QPen(color, 2))
+            item.setBrush(QBrush(QColor(
+                color.red(), color.green(), color.blue(), 42)))
+            item.setZValue(z_value)
+            self._scene.addItem(item)
+            self._debug_items.append(item)
+            return True
+
+        visible = False
+        visible |= add_mask(primary_mask, QColor(0, 150, 245), 19)
+        visible |= add_mask(supplemental_mask, QColor(0, 185, 100), 20)
+        visible |= add_mask(rejected_thin_mask, QColor(225, 70, 70), 21)
+        self.selection_preview_active.emit(bool(visible))
+
+    def set_semantic_mask_preview_overlay(
+            self, hair_mask: np.ndarray | None = None,
+            iris_mask: np.ndarray | None = None,
+            background_mask: np.ndarray | None = None) -> None:
+        """Preview final semantic overwrite masks.
+
+        Blue = hair, magenta = iris, amber = background.  The preview is only
+        diagnostic; final rendering uses binary overwrite rather than these
+        translucent display brushes.
+        """
+        self._clear_selection_overlay()
+        self.clear_debug_overlays()
+
+        def add(mask, color: QColor, z_value: float) -> bool:
+            if mask is None:
+                return False
+            arr = np.asarray(mask)
+            if arr.size == 0 or not np.any(arr):
+                return False
+            if arr.shape[:2] != (self._image_h, self._image_w):
+                arr = cv2.resize(arr.astype(np.uint8),
+                                 (self._image_w, self._image_h),
+                                 interpolation=cv2.INTER_NEAREST)
+            binary = (arr > 0).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return False
+            path = QPainterPath()
+            for contour in contours:
+                if len(contour) < 2:
+                    continue
+                first = contour[0][0]
+                path.moveTo(float(first[0]), float(first[1]))
+                for pt in contour[1:]:
+                    x, y = pt[0]
+                    path.lineTo(float(x), float(y))
+                path.closeSubpath()
+            path.setFillRule(Qt.FillRule.OddEvenFill)
+            item = QGraphicsPathItem(path)
+            item.setPen(QPen(color, 2))
+            item.setBrush(QBrush(QColor(
+                color.red(), color.green(), color.blue(), 36)))
+            item.setZValue(z_value)
+            self._scene.addItem(item)
+            self._debug_items.append(item)
+            return True
+
+        visible = False
+        visible |= add(background_mask, QColor(235, 160, 35), 18)
+        visible |= add(hair_mask, QColor(0, 150, 245), 20)
+        visible |= add(iris_mask, QColor(220, 60, 190), 22)
+        self.selection_preview_active.emit(bool(visible))
+
     def clear_selection_preview(self) -> None:
         self._selection_points = []
         self._selection_start = None
@@ -673,6 +932,7 @@ class HintCanvas(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton) and self._selection_adjust_active:
             self._selection_adjust_active = False
+            self.selection_adjust_finished.emit()
             return
         if event.button() == Qt.MouseButton.LeftButton:
             was_painting = self._painting

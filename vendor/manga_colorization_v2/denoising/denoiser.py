@@ -25,6 +25,8 @@ class FFDNetDenoiser:
         self.weights_dir = _weights_dir
         self.channels = _in_ch
         self.device = torch.device(_device) if isinstance(_device, str) else _device
+        self.available = False
+        self.load_error = None
 
         self.model = FFDNet(num_input_channels=_in_ch)
         self.load_weights()
@@ -33,13 +35,20 @@ class FFDNetDenoiser:
     def load_weights(self):
         weights_name = 'net_rgb.pth' if self.channels == 3 else 'net_gray.pth'
         weights_path = os.path.join(self.weights_dir, weights_name)
+        if not os.path.isfile(weights_path):
+            self.available = False
+            self.load_error = f'missing weights: {weights_path}'
+            self.model = self.model.to(self.device)
+            return
         state_dict = torch.load(weights_path, map_location='cpu',
-                                weights_only=False)
+                                weights_only=True)
         # Weights were saved wrapped in DataParallel; load into the bare model
         # (no DataParallel — it only adds scatter/gather overhead on 1 GPU).
         state_dict = remove_dataparallel_wrapper(state_dict)
         self.model.load_state_dict(state_dict)
         self.model = self.model.to(self.device)
+        self.available = True
+        self.load_error = None
 
     def to(self, device):
         """Move the denoiser between devices (used for CPU parking)."""
@@ -49,6 +58,8 @@ class FFDNetDenoiser:
 
     @torch.no_grad()
     def get_denoised_image(self, imorig, sigma=None, max_edge=1200):
+        if not self.available:
+            return imorig
 
         if sigma is not None:
             cur_sigma = sigma / 255
