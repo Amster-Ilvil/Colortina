@@ -5433,6 +5433,15 @@ class MainWindow(QMainWindow):
                       if not rows[key]["ready"]]
         if ready:
             return True
+        # A missing optional hair parser must never block generator-only use in
+        # offline mode. parse_hair_regions already degrades gracefully when no
+        # parser checkpoint is installed.
+        if os.environ.get("COLORTINA_OFFLINE", "").strip().lower() in {
+                "1", "true", "on", "yes"}:
+            self.statusBar().showMessage(
+                "离线模式：可选 AI 发色解析模型缺失，仍可使用 mc-v2 生成器上色。",
+                7000)
+            return True
         worker = getattr(self, "_hair_model_worker", None)
         if worker is not None and worker.isRunning():
             self.statusBar().showMessage(
@@ -5477,7 +5486,9 @@ class MainWindow(QMainWindow):
         if not models_ready(Config.WEIGHTS_DIR):
             if os.environ.get("COLORTINA_OFFLINE", "").strip().lower() in {"1", "true", "on", "yes"}:
                 QMessageBox.warning(self, "本地模型缺失",
-                    "已启用离线模式。请将 generator.zip 放入模型目录后重试。")
+                    "已启用离线模式。请将 generator.zip 放入以下目录后重试：\n"
+                    f"{Config.GENERATOR_WEIGHTS_PATH}\n\n"
+                    "Windows 便携版可双击 Open_Models_Folder.bat 打开正确位置。")
                 return
             answer = QMessageBox.question(
                 self, "首次安装 mc-v2 模型",
