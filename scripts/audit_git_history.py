@@ -18,6 +18,7 @@ import zipfile
 from collections import Counter
 
 LOCAL_HOME_LOCATIONS: set[tuple[str, int]] = set()
+LOCAL_HOME_BLOBS: set[str] = set()
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ROOT_SOURCE = {"scripts/privacy_audit.py", "scripts/audit_git_history.py"}
@@ -161,7 +162,10 @@ def main() -> int:
         if path.endswith(".b64"):
             categories["historical-encoded-fragment"] += 1
         else:
+            previous = categories["possible-local-home"]
             inspect_data(path, data, categories)
+            if categories["possible-local-home"] > previous:
+                LOCAL_HOME_BLOBS.add(sha)
     archive_entries = 0
     for commit, folder in SNAPSHOTS:
         parts = legacy_segments(commit, folder)
@@ -189,6 +193,8 @@ def main() -> int:
     if LOCAL_HOME_LOCATIONS:
         print("Historical home-path source locations (values redacted):",
               sorted(LOCAL_HOME_LOCATIONS)[:25])
+        print("Historical source blob identifiers (no values):",
+              sorted(LOCAL_HOME_BLOBS)[:25])
     print("Historical archive/coverage notes (counts only):", warnings or "none")
     return 1 if failures else 0
 
