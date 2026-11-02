@@ -1,0 +1,101 @@
+name: Full repository privacy audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".gitignore"
+      - "scripts/privacy_audit.py"
+      - "scripts/audit_git_history.py"
+      - ".github/workflows/full-privacy-audit.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".gitignore"
+      - "scripts/privacy_audit.py"
+      - "scripts/audit_git_history.py"
+      - ".github/workflows/full-privacy-audit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  git-history:
+    name: Full Git history & encoded payload scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch all remote branch refs for a complete reachable history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git fetch --tags origin
+          git branch -a
+      - name: Verify current tracked files
+        run: python scripts/privacy_audit.py
+      - name: Audit all reachable Git blobs and legacy encoded payloads
+        run: python scripts/audit_git_history.py
+
+  released-windows:
+    name: Inspect published Windows ZIP entries and editable source
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download published Windows package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download v5.20.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'Colortina_5.20.0_Windows_x64_CPU.zip' \
+            --dir "$RUNNER_TEMP"
+      - name: Inspect package without extracting personal data
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          from zipfile import ZipFile
+          from collections import Counter
+          sys.path.insert(0, str(Path('.').resolve()))
+          from scripts.audit_git_history import inspect_data
+          package = Path(os.environ['RUNNER_TEMP']) / 'Colortina_5.20.0_Windows_x64_CPU.zip'
+          flags = Counter()
+          sources = 0
+          with ZipFile(package) as z:
+              names = z.namelist()
+              if not any(n.endswith('/app/main.py') for n in names):
+                  flags['missing-source-layout'] += 1
+              if not any(n.endswith('/runtime/python.exe') for n in names):
+                  flags['missing-portable-python'] += 1
+              for item in z.infolist():
+                  n = item.filename.replace('\\', '/')
+                  if item.is_dir():
+                      continue
+                  if re.search(r'(?i)(?:^|/)models/weights/(?!PLACE_GENERATOR_ZIP_HERE\.txt$)', n):
+                      flags['unexpected-packaged-model-file'] += 1
+                  if re.search(r'(?i)(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]+\.(?:ccproject|ccpalette|ccscene|ccstyle|pem|p12|pfx|key))$', n):
+                      flags['sensitive-package-path'] += 1
+                  if re.search(r'(?i)(?:^|/)app/(?:core/|ui/|vendor/|models/|main\.py$|config\.py$|pipeline\.py$)', n):
+                      if item.file_size <= 12 * 1024 * 1024:
+                          inspect_data(n, z.read(item), flags)
+                          sources += 1
+                      else:
+                          flags['large-source-not-scanned'] += 1
+          print(f'Windows package privacy scan: {len(names)} entries, {sources} app sources scanned.')
+          print('Potential exposure categories (counts only):', dict(flags) or 'none')
+          if flags:
+              sys.exit(1)
+          PY
