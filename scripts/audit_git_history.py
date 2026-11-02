@@ -17,6 +17,8 @@ import tarfile
 import zipfile
 from collections import Counter
 
+LOCAL_HOME_LOCATIONS: set[tuple[str, int]] = set()
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ROOT_SOURCE = {"scripts/privacy_audit.py", "scripts/audit_git_history.py"}
 MAX_SCAN = 12 * 1024 * 1024
@@ -74,6 +76,8 @@ def inspect_data(path: str, data: bytes, categories: Counter) -> None:
                 line = data[start:data.find(b"\n", match.end()) if b"\n" in data[match.end():] else len(data)]
                 if b"re.compile" not in line and b"regex" not in line and b"pattern" not in line:
                     categories["possible-local-home"] += 1
+                    line_number = data.count(b"\n", 0, match.start()) + 1
+                    LOCAL_HOME_LOCATIONS.add((path, line_number))
                     break
 
 
@@ -181,6 +185,10 @@ def main() -> int:
     print(f"Git history privacy scan: {seen_blobs} reachable blobs; "
           f"{archive_entries} decoded legacy archive members.")
     print("Potential exposure categories (counts only):", failures or "none")
+    # Source filename and line only; never echo the actual home directory value.
+    if LOCAL_HOME_LOCATIONS:
+        print("Historical home-path source locations (values redacted):",
+              sorted(LOCAL_HOME_LOCATIONS)[:25])
     print("Historical archive/coverage notes (counts only):", warnings or "none")
     return 1 if failures else 0
 
