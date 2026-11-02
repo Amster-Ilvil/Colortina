@@ -87,19 +87,7 @@ jobs:
                   if re.search(r'(?i)(?:^|/)models/weights/(?!PLACE_GENERATOR_ZIP_HERE\.txt$)', n):
                       flags['unexpected-packaged-model-file'] += 1
                   public_ca_cert = n.endswith('/certifi/cacert.pem')
-                  if re.search(r'(?i)(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]+\.(?:ccproject|ccpalette|ccscene|ccstyle|pem|p12|pfx|key))
-                  if re.search(r'(?i)(?:^|/)app/(?:core/|ui/|vendor/|models/|main\.py$|config\.py$|pipeline\.py$)', n):
-                      if item.file_size <= 12 * 1024 * 1024:
-                          inspect_data(n, z.read(item), flags)
-                          sources += 1
-                      else:
-                          flags['large-source-not-scanned'] += 1
-          print(f'Windows package privacy scan: {len(names)} entries, {sources} app sources scanned.')
-          print('Potential exposure categories (counts only):', dict(flags) or 'none')
-          if flags:
-              sys.exit(1)
-          PY
-, n) and not public_ca_cert:
+                  if re.search(r'(?i)(?:^|/)(?:\.env(?:\.[^/]*)?|[^/]+\.(?:ccproject|ccpalette|ccscene|ccstyle|pem|p12|pfx|key))$', n) and not public_ca_cert:
                       flags['sensitive-package-path'] += 1
                   if re.search(r'(?i)(?:^|/)app/(?:core/|ui/|vendor/|models/|main\.py$|config\.py$|pipeline\.py$)', n):
                       if item.file_size <= 12 * 1024 * 1024:
