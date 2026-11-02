@@ -163,7 +163,17 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install -U pip wheel setuptools pyinstaller
-          pip install -r requirements.txt
+          if [[ "$ARCH" == "x86_64" ]]; then
+            # Official macOS Intel PyTorch wheels stopped at 2.2.x. Pin the
+            # compatible NumPy 1.x + torchvision stack only on Intel, leaving
+            # Apple Silicon and Windows free to use newer native builds.
+            grep -vE '^(numpy|opencv-contrib-python|torch|torchvision|transformers)[>=< ]' requirements.txt > /tmp/colortina-intel-requirements.txt
+            pip install 'numpy==1.26.4' 'opencv-contrib-python==4.10.0.84' \
+              'torch==2.2.2' 'torchvision==0.17.2' 'transformers>=4.40,<5'
+            pip install -r /tmp/colortina-intel-requirements.txt
+          else
+            pip install -r requirements.txt
+          fi
       - name: Compile check
         shell: bash
         run: python -m compileall -q core models ui vendor pipeline.py main.py config.py
